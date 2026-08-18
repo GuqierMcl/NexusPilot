@@ -1,0 +1,12 @@
+{
+    "extends": "../../tsconfig.json",
+    "include": [
+        "../../src/types/ipc.ts",
+        "../../src/vite-env.d.ts",
+        "./bun-test-contract.d.ts",
+        "./clickhouse-schema-contract.test.ts",
+        "./clickhouse-schema-create-contract.test.ts",
+        "./clickhouse-schema-change-contract.test.ts"
+    ],
+    "references": []
+}

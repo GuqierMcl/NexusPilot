@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 2,
+  "configId": "nexuspilot-account-production-v3",
+  "displayName": "NIEEX Account",
+  "issuer": "https://auth.nieex.com/oidc",
+  "clientId": "tpg7jhxz09x0y9z5fcav7",
+  "redirectUri": "dev.nexuspilot://auth/callback",
+  "postSignOutRedirectUri": "dev.nexuspilot://auth/signed-out",
+  "identityScopes": [
+    "openid",
+    "profile",
+    "email",
+    "offline_access"
+  ],
+  "cloudResource": {
+    "indicator": "https://api.nexuspilot.dev",
+    "scopes": [
+      "cloud:access"
+    ]
+  }
+}

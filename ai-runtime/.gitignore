@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local runtime data
+ai-runtime-tmp/

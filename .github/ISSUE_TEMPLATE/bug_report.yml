@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a reproducible problem in NexusPilot.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing Issues first. Do not include passwords, API keys, tokens, complete connection strings, or sensitive business data. For security vulnerabilities, follow [SECURITY.md](../../SECURITY.md) instead of opening a public Issue.
+  - type: input
+    id: version
+    attributes:
+      label: NexusPilot version
+      placeholder: "v0.10.1 or commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+      placeholder: "Windows 11, macOS 15, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Desktop workbench
+        - Database connection or driver
+        - SQL editor or data view
+        - AI Runtime
+        - NexusPilot Cloud client
+        - Website
+        - Build or packaging
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest set of steps that reproduces the problem.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and screenshots
+      description: Redact credentials and sensitive data before attaching logs or screenshots.
+    validations:
+      required: false

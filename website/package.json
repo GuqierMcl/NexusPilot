@@ -1,0 +1,39 @@
+{
+  "name": "nexpilot-website",
+  "type": "module",
+  "version": "1.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GuqierMcl/NexusPilot.git",
+    "directory": "website"
+  },
+  "homepage": "https://nexuspilot.dev",
+  "bugs": {
+    "url": "https://github.com/GuqierMcl/NexusPilot/issues"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "icons:databases": "bunx @thesvg/cli add mysql --format svg --variant dark --dir ./public/icons/databases && bunx @thesvg/cli add postgresql redis sqlite oracle clickhouse microsoft-sql-server mongodb pinecone milvus weaviate qdrant chroma neo4j aws-amazon-neptune arangodb elasticsearch --format svg --dir ./public/icons/databases"
+  },
+  "dependencies": {
+    "@astrojs/react": "6.0.2",
+    "@astrojs/starlight": "0.41.6",
+    "@astrojs/tailwind": "^6.0.2",
+    "@tailwindcss/vite": "^4.1.0",
+    "astro": "7.1.6",
+    "lucide-react": "^1.22.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "typescript": "^5.8.0",
+    "wrangler": "^4.110.0"
+  }
+}

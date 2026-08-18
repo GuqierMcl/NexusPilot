@@ -1,0 +1,2 @@
+# SQLx hashes migration files byte-for-byte; keep line endings stable across OSes.
+/src-tauri/migrations/*.sql text eol=lf

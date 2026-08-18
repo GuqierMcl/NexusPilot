@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "../../src/types/ipc.ts",
+    "./bun-test-contract.d.ts",
+    "./sqlExecutionContract.test.ts"
+  ],
+  "references": []
+}

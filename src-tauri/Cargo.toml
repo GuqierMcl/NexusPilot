@@ -1,0 +1,79 @@
+[package]
+name = "NexusPilot"
+version = "0.10.1"
+description = "Rust backend for NexusPilot database management workbench"
+authors = ["GuqierMcl <support@nexuspilot.dev>"]
+license = "Apache-2.0"
+repository = "https://github.com/GuqierMcl/NexusPilot"
+homepage = "https://nexuspilot.dev"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "nexus_pilot_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bigdecimal = "0.4"
+sha2 = "0.10"
+base64 = "0.22"
+bech32 = "0.11"
+chacha20poly1305 = "0.10.1"
+ed25519-dalek = "2.2"
+hkdf = "0.12"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
+openidconnect = { version = "4.0.1", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+subtle = "2"
+tauri-plugin-store = "2"
+tauri-plugin-os = "2"
+tauri-plugin-shell = "2"
+time = "0.3"
+zeroize = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+clickhouse = { version = "0.15.1", default-features = false, features = [
+    "lz4",
+    "rustls-tls-ring",
+    "rustls-tls-native-roots",
+] }
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["sync", "net", "io-util", "time", "rt-multi-thread"] }
+sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-rustls-ring-native-roots", "macros", "postgres", "mysql", "migrate", "sqlite", "bigdecimal", "time"] }
+russh = "0.62.1"
+tauri-plugin-http = "2"
+oracle-rs = "0.1.7"
+deadpool-oracle = "0.1.1"
+tauri-plugin-log = { version = "~2.9.0", features = ["colored"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+tauri-plugin-deep-link = "2"
+url = "2"
+getrandom = { version = "0.3", features = ["std"] }
+keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
+arboard = { version = "3.6", default-features = false }
+tokio-tungstenite = "0.30"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = { version = "2.0.0", features = ["deep-link"] }
+tauri-plugin-updater = "2"
+tauri-plugin-window-state = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

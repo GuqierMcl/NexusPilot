@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest an improvement or new capability for NexusPilot.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing Issues first. Describe the user problem and use case rather than only the proposed implementation.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What would this help you accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or experience you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add examples, mockups, links, or constraints if useful.
+    validations:
+      required: false
