@@ -64,6 +64,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.publish_only != true
     needs: verify
     runs-on: ${{ fromJSON(matrix.runner) }}
+    environment: release
 
     strategy:
       fail-fast: false
