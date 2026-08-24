@@ -12,8 +12,6 @@ dist
 dist-ssr
 src-tauri/binaries/
 *.local
-.env.test
-.env.release.local
 /release/
 /releases/
 
@@ -57,9 +55,13 @@ tmp
 .cloudflare/
 .cache/
 
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
 # Local machine configuration
-.env.local
-.env.*.local
 *.local.json
 *.local.yaml
 *.local.yml
