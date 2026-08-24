@@ -320,7 +320,7 @@ function createPublicVersion({ versionSection, artifacts = [], publicBaseUrl, ta
 
 function requireEnv(name) {
   const value = process.env[name]?.trim();
-  if (!value) throw new Error(`缺少 GitHub Actions secret：${name}`);
+  if (!value) throw new Error(`缺少 GitHub Actions 发布配置：${name}`);
   return value;
 }
 

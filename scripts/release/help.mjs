@@ -68,7 +68,7 @@ ${ci}:
 
   CI 签名使用 repository Actions secrets：TAURI_SIGNING_PRIVATE_KEY 和
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD。自动 publish job 通过 GitHub Environment “release”
-  读取 CI_RELEASE_PUBLIC_BASE_URL 与 CI_RELEASE_S3_* 对象存储 secrets。
+  读取 CI_RELEASE_PUBLIC_BASE_URL、CI_RELEASE_S3_* 对象存储配置与访问凭据。
   本地发布变量模板见 .env.release.example。
 
 ${files}:

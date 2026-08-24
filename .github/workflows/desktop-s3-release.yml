@@ -1,0 +1,274 @@
+name: Desktop S3 Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_only:
+        description: "仅执行发布 job，复用已有 run 的构建 artifacts"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "要发布的 tag，例如 v0.10.0"
+        required: false
+        type: string
+      artifact_run_id:
+        description: "提供构建 artifacts 的 workflow run ID"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: desktop-s3-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify release source
+    if: github.event_name != 'workflow_dispatch' || inputs.publish_only != true
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.12"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check frontend and AI runtime
+        run: |
+          bun run tsc --noEmit
+          bun run ai-runtime:typecheck
+
+      - name: Test CI release publisher
+        run: bun test scripts/github-release
+
+  package:
+    name: Package ${{ matrix.platform }}
+    if: github.event_name != 'workflow_dispatch' || inputs.publish_only != true
+    needs: verify
+    runs-on: ${{ fromJSON(matrix.runner) }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: '["ubuntu-24.04"]'
+            bundles: deb,rpm
+            artifact_name: nexuspilot-linux-x86_64
+
+          - platform: windows-x86_64
+            runner: '["windows-2022"]'
+            bundles: nsis
+            artifact_name: nexuspilot-windows-x86_64
+
+          - platform: darwin-x86_64
+            runner: '["macos-15-intel"]'
+            bundles: dmg,app
+            artifact_name: nexuspilot-darwin-x86_64
+
+          - platform: darwin-aarch64
+            runner: '["macos-14"]'
+            bundles: dmg,app
+            artifact_name: nexuspilot-darwin-aarch64
+
+    env:
+      # 仅在仓库的受保护发布 tag push 中提供；绝不提交私钥文件。
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.12"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            rpm \
+            wget
+
+      - name: Install NSIS when absent
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis --yes --no-progress
+          }
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Linux DEB and RPM packages
+        if: runner.os == 'Linux'
+        run: >-
+          bun run tauri build --bundles ${{ matrix.bundles }}
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Sign Linux package updater payloads
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          while IFS= read -r -d '' package; do
+            bun run tauri signer sign "$package"
+          done < <(find src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.rpm' \) -print0)
+
+      - name: Build signed native installers and updater artifacts
+        if: runner.os != 'Linux'
+        run: bun run tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Upload platform bundle directory
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 14
+          path: src-tauri/target/release/bundle/**
+
+  publish:
+    name: Publish to release object storage
+    needs: package
+    if: >-
+      always() &&
+      ((github.event_name == 'workflow_dispatch' && inputs.publish_only == true) || needs.package.result == 'success')
+    runs-on: ubuntu-24.04
+    environment: release
+
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      CI_RELEASE_PUBLIC_BASE_URL: ${{ vars.CI_RELEASE_PUBLIC_BASE_URL }}
+      CI_RELEASE_S3_ENDPOINT: ${{ vars.CI_RELEASE_S3_ENDPOINT }}
+      CI_RELEASE_S3_REGION: ${{ vars.CI_RELEASE_S3_REGION }}
+      CI_RELEASE_S3_BUCKET: ${{ vars.CI_RELEASE_S3_BUCKET }}
+      CI_RELEASE_S3_PREFIX: ${{ vars.CI_RELEASE_S3_PREFIX }}
+      CI_RELEASE_S3_ACCESS_KEY_ID: ${{ secrets.CI_RELEASE_S3_ACCESS_KEY_ID }}
+      CI_RELEASE_S3_SECRET_ACCESS_KEY: ${{ secrets.CI_RELEASE_S3_SECRET_ACCESS_KEY }}
+      CI_RELEASE_S3_FORCE_PATH_STYLE: ${{ vars.CI_RELEASE_S3_FORCE_PATH_STYLE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.ref }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.12"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download Linux bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: nexuspilot-linux-x86_64
+          path: release-input/nexpilot-linux-x86_64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_only == true && inputs.artifact_run_id || github.run_id }}
+
+      - name: Download Windows bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: nexuspilot-windows-x86_64
+          path: release-input/nexpilot-windows-x86_64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_only == true && inputs.artifact_run_id || github.run_id }}
+
+      - name: Download macOS Intel bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: nexuspilot-darwin-x86_64
+          path: release-input/nexpilot-darwin-x86_64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_only == true && inputs.artifact_run_id || github.run_id }}
+
+      - name: Download macOS Apple Silicon bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: nexuspilot-darwin-aarch64
+          path: release-input/nexpilot-darwin-aarch64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_only == true && inputs.artifact_run_id || github.run_id }}
+
+      - name: Inspect downloaded bundle layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          pwd
+          if [[ -d release-input ]]; then
+            find release-input -maxdepth 8 -print | sort
+          else
+            echo "::error::release-input 目录不存在"
+          fi
+
+      - name: Verify native bundle inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in \
+            nexpilot-linux-x86_64 \
+            nexpilot-windows-x86_64 \
+            nexpilot-darwin-x86_64 \
+            nexpilot-darwin-aarch64; do
+            directory="release-input/${artifact}"
+            if [[ ! -d "$directory" ]]; then
+              echo "::error::缺少下载的 CI Artifact 目录：$directory"
+              exit 1
+            fi
+            if [[ -z "$(find "$directory" -type f -print -quit)" ]]; then
+              echo "::error::CI Artifact 目录为空：$directory"
+              exit 1
+            fi
+          done
+
+      - name: Publish versioned artifacts and current manifests
+        run: bun scripts/github-release/publish.mjs --version "${RELEASE_TAG#v}" --input release-input
