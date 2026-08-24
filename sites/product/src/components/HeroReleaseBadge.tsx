@@ -46,7 +46,7 @@ export function HeroReleaseBadge() {
   }, []);
 
   if (state.status === "error") {
-    return null;
+    return <span className={badgeClassName}>获取失败</span>;
   }
 
   if (state.status === "loading") {
