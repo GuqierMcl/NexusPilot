@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { releaseRegistry } from "../website/src/shared/config/releases";
-import { releaseIndexUrl } from "../website/src/shared/release-registry/client";
+import { releaseRegistry } from "../sites/product/src/shared/config/releases";
+import { releaseIndexUrl } from "../sites/product/src/shared/release-registry/client";
 
 describe("website release config", () => {
     test("keeps the public release index URL in the shared release config", () => {

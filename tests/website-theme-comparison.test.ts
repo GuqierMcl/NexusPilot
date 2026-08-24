@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 describe("website theme comparison hero preview", () => {
     test("uses the interactive screenshot comparison component in the homepage hero", () => {
         const heroSource = readFileSync(
-            "website/src/main-site/components/Hero.astro",
+            "sites/product/src/components/Hero.astro",
             "utf8",
         );
 
@@ -19,19 +19,19 @@ describe("website theme comparison hero preview", () => {
     test("keeps the supplied light and dark screenshots as public website assets", () => {
         expect(
             existsSync(
-                "website/public/screenshots/nexuspilot-workbench-light.png",
+                "sites/product/public/screenshots/nexuspilot-workbench-light.png",
             ),
         ).toBe(true);
         expect(
             existsSync(
-                "website/public/screenshots/nexuspilot-workbench-dark.png",
+                "sites/product/public/screenshots/nexuspilot-workbench-dark.png",
             ),
         ).toBe(true);
     });
 
     test("exposes an accessible draggable range control for the comparison boundary", () => {
         const componentPath =
-            "website/src/main-site/components/ThemeComparisonSlider.tsx";
+            "sites/product/src/components/ThemeComparisonSlider.tsx";
 
         expect(existsSync(componentPath)).toBe(true);
 

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="website/public/logo.svg" alt="NexusPilot" width="120" />
+  <img src="sites/product/public/logo.svg" alt="NexusPilot" width="120" />
 </p>
 
 <h1 align="center">NexusPilot</h1>
@@ -50,7 +50,7 @@
 
 | 深色 | 浅色 |
 |---|---|
-| ![NexusPilot 工作台（深色）](website/public/screenshots/nexuspilot-workbench-dark.png) | ![NexusPilot 工作台（浅色）](website/public/screenshots/nexuspilot-workbench-light.png) |
+| ![NexusPilot 工作台（深色）](sites/product/public/screenshots/nexuspilot-workbench-dark.png) | ![NexusPilot 工作台（浅色）](sites/product/public/screenshots/nexuspilot-workbench-light.png) |
 
 ## 📦 安装
 
@@ -122,8 +122,8 @@ NexusPilot 采用由用户自行配置提供商的模式。你可以在本地 AI
 
 ## 📚 文档
 
-- [官网](https://nexuspilot.dev) —— 产品介绍、下载入口与公开文档
-- [文档](https://nexuspilot.dev/docs/) —— 安装、快速开始、数据库连接与 AI 助手指南
+- [官网](https://nexuspilot.dev) —— 产品介绍、下载入口与发布日志
+- [文档](https://docs.nexuspilot.dev) —— 安装、快速开始、数据库连接与 AI 助手指南
 - [AGENTS.md](./AGENTS.md) —— 面向 AI 编码代理与贡献者的开发规范
 
 ## 🤝 参与贡献

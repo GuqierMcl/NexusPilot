@@ -5,7 +5,7 @@ software and assets included in or used to build NexusPilot remain subject to
 their own licenses and notices.
 
 This document records the license review performed against `bun.lock`,
-`website/bun.lock`, and `src-tauri/Cargo.lock` at NexusPilot `0.10.1`. The lock
+`sites/product/bun.lock`, `sites/docs/bun.lock`, and `src-tauri/Cargo.lock` at NexusPilot `0.10.1`. The lock
 files are the authoritative source for exact dependency versions. SPDX license
 identifiers below link to their canonical license text.
 
@@ -42,7 +42,7 @@ binary distribution.
 ## Database brand icons
 
 Database icons under `src/components/icons/database/generated/` and
-`website/public/icons/databases/` were generated from the
+`sites/product/public/icons/databases/` were generated from the
 [`@thesvg/icons`](https://github.com/glincker/thesvg) registry. The generated
 files are used only to identify compatible database products.
 

@@ -46,7 +46,7 @@ export default defineConfig(async () => ({
         "**/.github/**",
         "**/.vscode/**",
         "**/scripts/**",
-        "**/website/**",
+        "**/sites/**",
       ],
     },
   },

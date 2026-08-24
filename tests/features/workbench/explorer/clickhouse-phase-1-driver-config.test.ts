@@ -109,17 +109,17 @@ describe("ClickHouse Phase 1 driver config", () => {
         expect(formSource).not.toContain("skip TLS");
     });
 
-    test("enables only the desktop connection preview", () => {
+    test("exposes ClickHouse in the desktop picker and public support matrix", () => {
         const pickerSource = readSource(
             "src/features/workbench/explorer/components/SelectDatabaseTypeDialog.tsx",
         );
-        const productSource = readSource("website/src/shared/config/product.ts");
+        const productSource = readSource("sites/product/src/shared/config/product.ts");
 
         expect(pickerSource).toContain('driver: "clickhouse"');
         expect(pickerSource).toContain('displayName: "ClickHouse"');
         expect(pickerSource).toContain('category: "analytics"');
-        expect(pickerSource).toContain('badge: "连接预览"');
+        expect(pickerSource).toContain('badge: "NEW"');
         expect(productSource).toContain('name: "ClickHouse"');
-        expect(productSource).toContain('status: "planned"');
+        expect(productSource).toContain('status: "available"');
     });
 });

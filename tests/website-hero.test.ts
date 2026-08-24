@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 describe("website hero", () => {
     test("renders a remote release version badge instead of static config version", () => {
         const heroSource = readFileSync(
-            "website/src/main-site/components/Hero.astro",
+            "sites/product/src/components/Hero.astro",
             "utf8",
         );
 
@@ -18,7 +18,7 @@ describe("website hero", () => {
     });
 
     test("hero release badge reads the public release index", () => {
-        const badgePath = "website/src/main-site/components/HeroReleaseBadge.tsx";
+        const badgePath = "sites/product/src/components/HeroReleaseBadge.tsx";
 
         expect(existsSync(badgePath)).toBe(true);
 

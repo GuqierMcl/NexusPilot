@@ -1,0 +1,46 @@
+---
+title: NexusPilot 文档
+description: 从安装、第一次连接到浏览对象与数据，开始使用 NexusPilot。
+template: splash
+tableOfContents: false
+hero:
+  title: NexusPilot 文档
+  tagline: 从第一次连接开始，在同一工作台中探索和使用你的数据。
+  image:
+    file: ./_assets/logo.svg
+    alt: NexusPilot 标志
+  actions:
+    - text: 开始阅读
+      link: /introduction/overview/
+      icon: right-arrow
+    - text: 下载 NexusPilot
+      link: https://nexuspilot.dev/#download
+      icon: download
+      variant: secondary
+---
+
+import { Card, CardGrid } from "@docs-site/components/starlight";
+
+<CardGrid>
+  <Card title="概览" icon="open-book" link="/introduction/overview/">
+    了解 NexusPilot 的工作台方式、产品边界和适用场景。
+  </Card>
+  <Card title="安装与更新" icon="download" link="/getting-started/installation/">
+    安装桌面应用、检查版本，并了解安全更新的基本方式。
+  </Card>
+  <Card title="快速开始" icon="right-arrow" link="/getting-started/quick-start/">
+    完成一次连接、对象浏览和查询，建立第一个可用工作区。
+  </Card>
+  <Card title="数据库连接" icon="database" link="/guides/managing-connections/">
+    创建、组织、打开和断开连接，理解连接状态的含义。
+  </Card>
+  <Card title="浏览对象与数据" icon="open-book" link="/guides/browsing-objects-and-data/">
+    从连接树进入对象，在数据视图中查看和处理信息。
+  </Card>
+  <Card title="AI 助手" icon="setting" link="/guides/using-ai-assistant/">
+    在理解工作台上下文的前提下提出问题、执行只读探索，并在需要时完成确认。
+  </Card>
+  <Card title="需要帮助？" icon="document" link="/help/troubleshooting/">
+    查看常见问题和故障排查建议，定位连接与运行问题。
+  </Card>
+</CardGrid>

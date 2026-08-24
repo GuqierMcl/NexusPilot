@@ -1,25 +1,27 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import { product } from "../../../../website/src/shared/config/product";
+import { product } from "../../../../sites/product/src/shared/config/product";
 
 const readSource = (path: string) => readFileSync(path, "utf8");
 
-describe("planned database support", () => {
-    test("lists ClickHouse as planned in the public database matrix", () => {
+describe("public database support", () => {
+    test("lists ClickHouse and Oracle as available in the public database matrix", () => {
         expect(product.databases).toContainEqual({
             name: "ClickHouse",
             type: "列式分析型",
-            status: "planned",
+            status: "available",
+            iconKey: "clickhouse",
         });
         expect(product.databases).toContainEqual({
             name: "Oracle",
             type: "关系型",
             status: "available",
+            iconKey: "oracle",
         });
     });
 
-    test("enables the ClickHouse connection preview in the desktop picker", () => {
+    test("exposes the ClickHouse driver in the desktop picker", () => {
         const source = readSource(
             "src/features/workbench/explorer/components/SelectDatabaseTypeDialog.tsx",
         );
@@ -28,7 +30,7 @@ describe("planned database support", () => {
         expect(source).toContain('displayName: "ClickHouse"');
         expect(source).toContain('driver: "clickhouse", displayName: "ClickHouse"');
         expect(source).toContain('iconKey: "clickhouse"');
-        expect(source).toContain('badge: "连接预览"');
+        expect(source).toContain('badge: "NEW"');
         expect(iconSource).toContain("clickhouse: ClickHouseIcon");
     });
 });

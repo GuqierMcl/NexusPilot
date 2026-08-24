@@ -1,0 +1,24 @@
+---
+import {
+  DATABASE_ICON_FILES,
+  type DatabaseIconKey,
+} from "../shared/config/product";
+
+interface Props {
+  iconKey: DatabaseIconKey;
+}
+
+const { iconKey } = Astro.props;
+const iconFile = DATABASE_ICON_FILES[iconKey];
+---
+
+<span class="database-brand-icon" aria-hidden="true">
+  <img
+    src={`/icons/databases/${iconFile}.svg`}
+    alt=""
+    width="24"
+    height="24"
+    loading="lazy"
+    decoding="async"
+  />
+</span>

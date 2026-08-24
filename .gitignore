@@ -32,3 +32,72 @@ src-tauri/binaries/
 latest.json
 
 tmp
+
+# Personal AI coding-agent state
+.codex/
+.claude/
+.opencode/
+.kilo/
+.windsurf/
+.continue/
+.agents/
+
+# Personal AI collaboration records
+.ai-local/
+.ai-private/
+.personal/
+.private/
+.worklogs/
+.scratch/
+.transcripts/
+.prompts/
+
+# Local tool and deployment state
+.wrangler/
+.cloudflare/
+.cache/
+
+# Local machine configuration
+.env.local
+.env.*.local
+*.local.json
+*.local.yaml
+*.local.yml
+*.local.toml
+*.local.conf
+*.local.config
+
+# Local integration and credential helpers
+.mcp.json
+.mcp.local.json
+connections.local.json
+connection-profiles.local.json
+auth.local.json
+oauth.local.json
+tokens.local.json
+secrets.local.json
+proxy.local.json
+tunnel.local.json
+
+# Local development artifacts
+screenshots-local/
+captures-local/
+exports-local/
+audit-local/
+scan-local/
+reports-local/
+coverage-local/
+release-preview/
+staging-local/
+
+# Personal task records
+TODO.local.md
+TODO.private.md
+TASKS.local.md
+TASKS.private.md
+PLAN.local.md
+PLAN.private.md
+CHECKLIST.local.md
+CHECKLIST.private.md
+REVIEW.local.md
+REVIEW.private.md

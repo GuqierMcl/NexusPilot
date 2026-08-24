@@ -1,0 +1,49 @@
+---
+import { BookOpen, Download as DownloadIcon } from "lucide-react";
+import { product } from "../shared/config/product";
+import { site } from "../shared/config/site";
+import { HeroReleaseBadge } from "./HeroReleaseBadge";
+import { ThemeComparisonSlider } from "./ThemeComparisonSlider";
+---
+
+<section id="top" class="hero-shell relative overflow-hidden">
+  <div class="relative mx-auto max-w-6xl px-6 pb-24 pt-28 text-center">
+    <!-- Brand: Logo + wordmark -->
+    <div class="relative mb-6 flex flex-col items-center justify-center gap-3 sm:flex-row sm:gap-5">
+      <img src="/logo.svg" alt="NexusPilot" class="relative h-28 w-28 sm:h-36 sm:w-36 lg:h-48 lg:w-48" />
+      <img src="/wordmark.svg" alt="NexusPilot" class="relative h-auto w-[62vw] max-w-[16rem] object-contain invert sm:h-20 sm:w-auto sm:max-w-none lg:h-28" />
+      <HeroReleaseBadge client:load />
+    </div>
+
+    <!-- Heading -->
+    <h1 class="relative mx-auto mb-5 max-w-[19rem] text-3xl font-bold leading-tight text-white sm:max-w-3xl sm:text-4xl md:text-5xl lg:text-[3.5rem]">
+      {product.tagline}
+    </h1>
+
+    <!-- Subtitle -->
+    <p class="relative mx-auto mb-10 max-w-[19rem] text-sm leading-relaxed text-zinc-500 sm:max-w-xl sm:text-base md:text-lg">
+      {product.summary}
+    </p>
+
+    <!-- CTA -->
+    <div class="mb-16 flex flex-col items-center justify-center gap-3 sm:flex-row">
+      <a
+        href="#download"
+        class="inline-flex h-11 items-center gap-2.5 rounded-lg px-7 text-sm font-medium text-white shadow-lg shadow-indigo-500/20 transition-all hover:shadow-indigo-500/30"
+        style="background: var(--brand-gradient)"
+      >
+        <DownloadIcon className="h-4 w-4 shrink-0" aria-hidden="true" />
+        {product.heroPrimaryCta}
+      </a>
+      <a
+        href={site.docsUrl}
+        class="inline-flex h-11 items-center gap-2.5 rounded-lg border border-white/[0.08] bg-white/[0.03] px-7 text-sm font-medium text-zinc-400 transition-all hover:bg-white/[0.06] hover:text-white"
+      >
+        <BookOpen className="h-4 w-4 shrink-0" aria-hidden="true" />
+        {product.heroSecondaryCta}
+      </a>
+    </div>
+
+    <ThemeComparisonSlider client:load />
+  </div>
+</section>

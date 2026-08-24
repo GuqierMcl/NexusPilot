@@ -241,7 +241,9 @@ Rust backend
 
 ## 4. Contribution Guidelines
 
-- Public documentation lives on the website docs site (`website/` Starlight); design/architecture docs are not part of this repository.
+- Public web applications are split into `sites/product/` (the product website at `nexuspilot.dev`) and `sites/docs/` (the Starlight documentation renderer at `docs.nexuspilot.dev`). They must build independently and must not import each other's source files.
+- Public documentation source lives under `docs/guides/`. The `sites/docs/` application loads that directory directly through Astro's Content Loader; do not create a second Markdown source tree inside the site package.
+- The current files in `docs/guides/` were migrated from the former combined website as an initial public baseline. Broader reconstruction of the authoritative `docs/` knowledge base remains a separate documentation change; do not import private internal documentation wholesale.
 - Before changing AI SDK (`ai` / `@ai-sdk/*`) behavior, consult the official AI SDK docs: <https://ai-sdk.dev/llms.txt>
 - When adding a new database driver:
   - Frontend: update `DbDriver`, add payload interface, register `driver-configs/`, sync IPC metadata types

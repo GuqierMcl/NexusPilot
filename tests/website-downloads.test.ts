@@ -1,16 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import { formatBundleLabel } from "../website/src/shared/release-registry/format";
+import { formatBundleLabel } from "../sites/product/src/shared/release-registry/format";
 import {
     resolveReleaseDownloads,
     sortReleaseDownloads,
-} from "../website/src/shared/release-registry/downloads";
+} from "../sites/product/src/shared/release-registry/downloads";
 import type {
     PublicReleaseDownload,
     PublicReleaseIndex,
     PublicReleaseVersion,
-} from "../website/src/shared/release-registry/types";
+} from "../sites/product/src/shared/release-registry/types";
 
 const readWebsiteFile = (path: string) => readFileSync(path, "utf8");
 
@@ -103,7 +103,7 @@ describe("website downloads", () => {
 
     test("homepage download panel is not tied to Windows-only copy or a single artifact", () => {
         const downloadPanel = readWebsiteFile(
-            "website/src/main-site/components/DownloadPanel.tsx",
+            "sites/product/src/components/DownloadPanel.tsx",
         );
 
         expect(downloadPanel).not.toContain("下载最新 Windows 安装包");

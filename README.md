@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="website/public/logo.svg" alt="NexusPilot" width="120" />
+  <img src="sites/product/public/logo.svg" alt="NexusPilot" width="120" />
 </p>
 
 <h1 align="center">NexusPilot</h1>
@@ -50,7 +50,7 @@ English | [简体中文](./README.zh-CN.md)
 
 | Dark | Light |
 |---|---|
-| ![NexusPilot workbench (dark)](website/public/screenshots/nexuspilot-workbench-dark.png) | ![NexusPilot workbench (light)](website/public/screenshots/nexuspilot-workbench-light.png) |
+| ![NexusPilot workbench (dark)](sites/product/public/screenshots/nexuspilot-workbench-dark.png) | ![NexusPilot workbench (light)](sites/product/public/screenshots/nexuspilot-workbench-light.png) |
 
 ## 📦 Installation
 
@@ -122,8 +122,8 @@ NexusPilot uses a bring-your-own-provider model. Configure a supported provider 
 
 ## 📚 Documentation
 
-- [Website](https://nexuspilot.dev) — product site, downloads, and public documentation
-- [Documentation](https://nexuspilot.dev/docs/) — installation, quick start, database connections, and AI assistant guides
+- [Website](https://nexuspilot.dev) — product overview, downloads, and release history
+- [Documentation](https://docs.nexuspilot.dev) — installation, quick start, database connections, and AI assistant guides
 - [AGENTS.md](./AGENTS.md) — coding guidelines for AI agents and contributors
 
 ## 🤝 Contributing

@@ -1,22 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import { product } from "../website/src/shared/config/product";
+import { product } from "../sites/product/src/shared/config/product";
 import {
     openSource,
     publicSourceLinks,
-} from "../website/src/shared/config/navigation";
+} from "../sites/product/src/shared/config/navigation";
 
 const readWebsiteFile = (path: string) => readFileSync(path, "utf8");
 
 describe("website user-facing copy", () => {
     test("release pages avoid implementation and storage jargon", () => {
-        const releasePage = readWebsiteFile("website/src/pages/releases.astro");
+        const releasePage = readWebsiteFile("sites/product/src/pages/releases.astro");
         const docsReleasePage = readWebsiteFile(
-            "website/src/content/docs/docs/releases/index.mdx",
+            "docs/guides/releases/index.mdx",
         );
         const releaseHistory = readWebsiteFile(
-            "website/src/shared/components/ReleaseHistory.tsx",
+            "sites/product/src/shared/components/ReleaseHistory.tsx",
         );
         const combined = `${releasePage}\n${docsReleasePage}\n${releaseHistory}`;
 
@@ -51,7 +51,7 @@ describe("website user-facing copy", () => {
 
     test("homepage download panel keeps release notes behind a deliberate link", () => {
         const downloadPanel = readWebsiteFile(
-            "website/src/main-site/components/DownloadPanel.tsx",
+            "sites/product/src/components/DownloadPanel.tsx",
         );
 
         expect(downloadPanel).not.toContain("latestVersion.sections");
@@ -62,7 +62,7 @@ describe("website user-facing copy", () => {
 
     test("release history does not repeat version summaries above the notes", () => {
         const releaseHistory = readWebsiteFile(
-            "website/src/shared/components/ReleaseHistory.tsx",
+            "sites/product/src/shared/components/ReleaseHistory.tsx",
         );
 
         expect(releaseHistory).not.toContain("version.summary");
@@ -70,7 +70,7 @@ describe("website user-facing copy", () => {
 
     test("homepage download hint is visually subdued", () => {
         const downloadPanel = readWebsiteFile(
-            "website/src/main-site/components/DownloadPanel.tsx",
+            "sites/product/src/components/DownloadPanel.tsx",
         );
 
         expect(downloadPanel).toContain("download-panel-hint");
@@ -81,10 +81,10 @@ describe("website user-facing copy", () => {
 
     test("public open-source entry points use the formal NexusPilot repository", () => {
         const openSourcePage = readWebsiteFile(
-            "website/src/content/docs/docs/project/open-source-plan.md",
+            "docs/guides/project/open-source-plan.md",
         );
         const contributingPage = readWebsiteFile(
-            "website/src/content/docs/docs/project/contributing.md",
+            "docs/guides/project/contributing.md",
         );
         const combined = `${openSourcePage}\n${contributingPage}`;
 

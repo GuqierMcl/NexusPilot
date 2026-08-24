@@ -6,7 +6,7 @@ const readWebsiteFile = (path: string) => readFileSync(path, "utf8");
 describe("website visual refresh", () => {
     test("places the theme comparison inside a product stage instead of bare page chrome", () => {
         const componentSource = readWebsiteFile(
-            "website/src/main-site/components/ThemeComparisonSlider.tsx",
+            "sites/product/src/components/ThemeComparisonSlider.tsx",
         );
 
         expect(componentSource).toContain("theme-comparison-stage");
@@ -16,16 +16,16 @@ describe("website visual refresh", () => {
 
     test("uses shared section band styles across the homepage", () => {
         const featuresSource = readWebsiteFile(
-            "website/src/main-site/components/Features.astro",
+            "sites/product/src/components/Features.astro",
         );
         const databaseSource = readWebsiteFile(
-            "website/src/main-site/components/DatabaseMatrix.astro",
+            "sites/product/src/components/DatabaseMatrix.astro",
         );
         const downloadSource = readWebsiteFile(
-            "website/src/main-site/components/Download.astro",
+            "sites/product/src/components/Download.astro",
         );
         const stylesSource = readWebsiteFile(
-            "website/src/main-site/styles/global.css",
+            "sites/product/src/styles/global.css",
         );
 
         expect(featuresSource).toContain("section-band section-band-features");
@@ -38,7 +38,7 @@ describe("website visual refresh", () => {
 
     test("removes the old discrete orb decoration from the homepage hero", () => {
         const heroSource = readWebsiteFile(
-            "website/src/main-site/components/Hero.astro",
+            "sites/product/src/components/Hero.astro",
         );
 
         expect(heroSource).toContain("hero-shell");

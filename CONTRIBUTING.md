@@ -2,7 +2,7 @@
 
 Thank you for your interest in NexusPilot. Contributions are welcome for the desktop database workbench, AI Runtime, database integrations, documentation, and user-facing website.
 
-NexusPilot is prepared from a private source repository into a separate public repository. The public repository contains the open-source desktop client and its public website; private Cloud server code and internal design records are maintained separately.
+NexusPilot is prepared from a private source repository into a separate public repository. The public repository contains the open-source desktop client, product website, and documentation site; private Cloud server code and internal design records are maintained separately.
 
 ## Before you start
 
@@ -49,7 +49,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 bun run build
 ```
 
-When changing the public website, also run the website's documented install and build commands from `website/`.
+When changing a public site, install its dependencies and run its documented build command from `sites/product/` or `sites/docs/`. Documentation source belongs in `docs/guides/`, while rendering and deployment code belongs in `sites/docs/`. When a change affects shared navigation or public links, verify both sites with `bun run sites:build` from the repository root.
 
 If a check cannot be run locally, explain why in the Pull Request and include the checks that were run instead.
 
@@ -81,7 +81,7 @@ Common types include `feat`, `fix`, `docs`, `test`, `refactor`, and `chore`.
 Please include:
 
 - What changed and why.
-- The affected area: frontend, Rust backend, AI Runtime, website, or shared contracts.
+- The affected area: frontend, Rust backend, AI Runtime, product site, documentation site, or shared contracts.
 - Tests and verification commands that were run.
 - Screenshots or recordings for meaningful UI changes.
 - Any follow-up work or known limitations.
