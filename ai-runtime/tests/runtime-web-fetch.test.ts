@@ -521,6 +521,56 @@ describe("web_fetch executor", () => {
     });
   });
 
+  test("extracts visible HTML text with a parser and ignores hidden content", async () => {
+    const result = await executeWebFetch(
+      { url: "https://example.com/safe-preview" },
+      {
+        now: () => 1,
+        resolveAddress: publicResolver,
+        fetch: async () =>
+          response(`
+            <html>
+              <head><title>Parser &amp; Safety</title></head>
+              <body>
+                <script>globalThis.pwned = true</script >
+                <style>body { display: none }</style >
+                <noscript>hidden fallback</noscript>
+                <template>hidden template</template>
+                <p>Hello <strong>world</strong>.</p>
+              </body>
+            </html>
+          `),
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.output?.data.title).toBe("Parser & Safety");
+    expect(result.output?.data.preview).toBe("Hello world.");
+    expect(result.output?.data.preview).not.toContain("globalThis.pwned");
+    expect(result.output?.data.preview).not.toContain("display: none");
+    expect(result.output?.data.preview).not.toContain("hidden fallback");
+    expect(result.output?.data.preview).not.toContain("hidden template");
+    expect(result.output?.data.preview).not.toContain("<strong>");
+  });
+
+  test("keeps tag-like text intact for non-HTML responses", async () => {
+    const result = await executeWebFetch(
+      { url: "https://example.com/plain-text" },
+      {
+        now: () => 1,
+        resolveAddress: publicResolver,
+        fetch: async () =>
+          response("Use <script> literally & keep it.", {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+          }),
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.output?.data.preview).toBe("Use <script> literally & keep it.");
+    expect(result.output?.data.title).toBe("example.com");
+  });
+
   test("truncates large responses without storing full body", async () => {
     const result = await executeWebFetch(
       { url: "https://example.com/large", maxBytes: 8 },

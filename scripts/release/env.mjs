@@ -81,16 +81,39 @@ export function loadEnvFile(filePath = ".env.release.local") {
   return parseEnvContent(readFileSync(resolvedPath, "utf8"));
 }
 
-export function maskSecret(value) {
-  if (!value) {
-    return "";
+const RELEASE_SECRET_ENV_KEYS = [
+  "TAURI_SIGNING_PRIVATE_KEY",
+  "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+  "RELEASE_S3_ACCESS_KEY_ID",
+  "RELEASE_S3_SECRET_ACCESS_KEY",
+  "CI_RELEASE_S3_ACCESS_KEY_ID",
+  "CI_RELEASE_S3_SECRET_ACCESS_KEY",
+];
+
+export function redactReleaseSecrets(value, env = {}) {
+  const secrets = new Set();
+
+  for (const key of RELEASE_SECRET_ENV_KEYS) {
+    const secret = env[key];
+    if (typeof secret !== "string") {
+      continue;
+    }
+
+    const trimmed = secret.trim();
+    if (secret.length >= 4) {
+      secrets.add(secret);
+    }
+    if (trimmed.length >= 4) {
+      secrets.add(trimmed);
+    }
   }
 
-  if (value.length <= 6) {
-    return "***";
-  }
-
-  return `${value.slice(0, 3)}***${value.slice(-3)}`;
+  return [...secrets]
+    .sort((left, right) => right.length - left.length)
+    .reduce(
+      (redacted, secret) => redacted.split(secret).join("<已脱敏>"),
+      String(value),
+    );
 }
 
 export function hasReleaseConfigValue(value) {
@@ -137,6 +160,7 @@ export function resolveReleaseConfig(env = {}) {
 
 export function getMaskedConfigSummary(config) {
   const missing = (value) => (hasReleaseConfigValue(value) ? value : "<缺失>");
+  const sensitive = (value) => (hasReleaseConfigValue(value) ? "<已配置>" : "<缺失>");
 
   return {
     outputDir: config.outputDir,
@@ -146,14 +170,14 @@ export function getMaskedConfigSummary(config) {
       region: config.s3.region,
       bucket: missing(config.s3.bucket),
       prefix: config.s3.prefix,
-      accessKeyId: hasReleaseConfigValue(config.s3.accessKeyId) ? maskSecret(config.s3.accessKeyId) : "<缺失>",
-      secretAccessKey: hasReleaseConfigValue(config.s3.secretAccessKey) ? maskSecret(config.s3.secretAccessKey) : "<缺失>",
+      accessKeyId: sensitive(config.s3.accessKeyId),
+      secretAccessKey: sensitive(config.s3.secretAccessKey),
       forcePathStyle: config.s3.forcePathStyle,
     },
     updater: config.updater,
     signing: {
-      privateKey: hasReleaseConfigValue(config.signing.privateKey) ? "<已配置>" : "<缺失>",
-      privateKeyPassword: hasReleaseConfigValue(config.signing.privateKeyPassword) ? "<已配置>" : "<缺失>",
+      privateKey: sensitive(config.signing.privateKey),
+      privateKeyPassword: sensitive(config.signing.privateKeyPassword),
     },
   };
 }

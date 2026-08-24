@@ -1,5 +1,8 @@
 #!/usr/bin/env bun
 
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { getHelpText } from "./release/help.mjs";
 import {
   build,
@@ -9,6 +12,21 @@ import {
   prepare,
   publish,
 } from "./release/commands.mjs";
+import { loadEnvFile, redactReleaseSecrets } from "./release/env.mjs";
+
+const releaseEnvPath = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  ".env.release.local",
+);
+
+function loadReleaseRedactionEnv() {
+  try {
+    return { ...process.env, ...loadEnvFile(releaseEnvPath) };
+  } catch {
+    return process.env;
+  }
+}
 
 const [command = "help", ...args] = process.argv.slice(2);
 
@@ -54,6 +72,7 @@ async function main() {
 try {
   await main();
 } catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(redactReleaseSecrets(message, loadReleaseRedactionEnv()));
   process.exit(1);
 }

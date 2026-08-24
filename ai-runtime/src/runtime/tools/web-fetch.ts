@@ -4,6 +4,7 @@ import * as https from "node:https";
 import type { IncomingHttpHeaders } from "node:http";
 import { isIP } from "node:net";
 import { Readable } from "node:stream";
+import { parse, type DefaultTreeAdapterMap } from "parse5";
 import { z } from "zod";
 import type { ToolErrorCode, ToolResult } from "../core/types";
 import type { NetworkAccessScope } from "../../settings/contracts";
@@ -218,8 +219,11 @@ export async function executeWebFetch(
     const maxBytes = input.maxBytes ?? WEB_FETCH_DEFAULT_MAX_BYTES;
     const { text, bytesRead, truncated } = await readBoundedText(response, maxBytes);
     const finalUrlText = finalUrl.toString();
-    const title = extractTitle(text) ?? finalUrl.hostname;
-    const preview = normalizePreview(text).slice(0, maxBytes);
+    const parsedContent = isHtmlContentType(contentType)
+      ? parseHtmlPreview(text)
+      : { preview: normalizeTextPreview(text) };
+    const title = parsedContent.title ?? finalUrl.hostname;
+    const preview = parsedContent.preview.slice(0, maxBytes);
     const completed = now();
 
     return {
@@ -922,7 +926,7 @@ function parseIpv4MappedIpv6(hostname: string): string | null {
 }
 
 function isSupportedContentType(contentType: string): boolean {
-  const type = contentType.split(";")[0]?.trim().toLowerCase();
+  const type = baseContentType(contentType);
   return Boolean(
     type &&
       (type.startsWith("text/") ||
@@ -930,6 +934,15 @@ function isSupportedContentType(contentType: string): boolean {
         type === "application/xml" ||
         type === "application/xhtml+xml"),
   );
+}
+
+function baseContentType(contentType: string): string | undefined {
+  return contentType.split(";")[0]?.trim().toLowerCase() || undefined;
+}
+
+function isHtmlContentType(contentType: string): boolean {
+  const type = baseContentType(contentType);
+  return type === "text/html" || type === "application/xhtml+xml";
 }
 
 async function readBoundedText(
@@ -1001,17 +1014,138 @@ function concatBytes(chunks: Uint8Array[], totalBytes: number): Uint8Array {
   return output;
 }
 
-function extractTitle(text: string): string | undefined {
-  return /<title[^>]*>([^<]+)<\/title>/i.exec(text)?.[1]?.replace(/\s+/g, " ").trim();
+type HtmlNode = DefaultTreeAdapterMap["node"];
+type HtmlElement = DefaultTreeAdapterMap["element"];
+type HtmlTextNode = DefaultTreeAdapterMap["textNode"];
+
+interface ParsedHtmlPreview {
+  title?: string;
+  preview: string;
 }
 
-function normalizePreview(text: string): string {
-  return text
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+const HIDDEN_HTML_ELEMENTS = new Set(["script", "style", "noscript", "template"]);
+const TEXT_BOUNDARY_HTML_ELEMENTS = new Set([
+  "address",
+  "article",
+  "aside",
+  "blockquote",
+  "body",
+  "br",
+  "dd",
+  "details",
+  "dialog",
+  "div",
+  "dl",
+  "dt",
+  "fieldset",
+  "figcaption",
+  "figure",
+  "footer",
+  "form",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "header",
+  "hr",
+  "li",
+  "main",
+  "nav",
+  "ol",
+  "p",
+  "pre",
+  "section",
+  "summary",
+  "table",
+  "tbody",
+  "td",
+  "tfoot",
+  "th",
+  "thead",
+  "tr",
+  "ul",
+]);
+
+function parseHtmlPreview(text: string): ParsedHtmlPreview {
+  const document = parse(text);
+  const titleElement = findHtmlElement(document, "title");
+  const bodyElement = findHtmlElement(document, "body");
+
+  return {
+    title: titleElement ? normalizeTextPreview(extractHtmlText(titleElement)) || undefined : undefined,
+    preview: bodyElement ? normalizeTextPreview(extractHtmlText(bodyElement)) : "",
+  };
+}
+
+function findHtmlElement(node: HtmlNode, tagName: string): HtmlElement | undefined {
+  if (isHtmlElement(node) && node.tagName.toLowerCase() === tagName) {
+    return node;
+  }
+
+  if (!("childNodes" in node)) {
+    return undefined;
+  }
+
+  for (const child of node.childNodes) {
+    const match = findHtmlElement(child, tagName);
+    if (match) {
+      return match;
+    }
+  }
+
+  return undefined;
+}
+
+function extractHtmlText(node: HtmlNode): string {
+  const chunks: string[] = [];
+  appendHtmlText(node, chunks);
+  return chunks.join("");
+}
+
+function appendHtmlText(node: HtmlNode, chunks: string[]): void {
+  if (isHtmlTextNode(node)) {
+    chunks.push(node.value);
+    return;
+  }
+
+  if (isHtmlElement(node)) {
+    const tagName = node.tagName.toLowerCase();
+    if (HIDDEN_HTML_ELEMENTS.has(tagName)) {
+      return;
+    }
+
+    const addsBoundary = TEXT_BOUNDARY_HTML_ELEMENTS.has(tagName);
+    if (addsBoundary) {
+      chunks.push(" ");
+    }
+    for (const child of node.childNodes) {
+      appendHtmlText(child, chunks);
+    }
+    if (addsBoundary) {
+      chunks.push(" ");
+    }
+    return;
+  }
+
+  if ("childNodes" in node) {
+    for (const child of node.childNodes) {
+      appendHtmlText(child, chunks);
+    }
+  }
+}
+
+function isHtmlElement(node: HtmlNode): node is HtmlElement {
+  return "tagName" in node;
+}
+
+function isHtmlTextNode(node: HtmlNode): node is HtmlTextNode {
+  return "value" in node;
+}
+
+function normalizeTextPreview(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function errorResult<T>(

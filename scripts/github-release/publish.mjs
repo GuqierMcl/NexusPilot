@@ -18,6 +18,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { redactReleaseSecrets } from "../release/env.mjs";
+
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const product = "NexusPilot";
 const channel = "stable";
@@ -746,7 +748,7 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
-    console.error(formatS3Error(error));
+    console.error(redactReleaseSecrets(formatS3Error(error), process.env));
     process.exit(1);
   });
 }
