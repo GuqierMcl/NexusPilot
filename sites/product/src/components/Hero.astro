@@ -1,6 +1,7 @@
 ---
-import { BookOpen, Download as DownloadIcon } from "lucide-react";
+import { BookOpen, Download as DownloadIcon, ShieldCheck } from "lucide-react";
 import { product } from "../shared/config/product";
+import { repository } from "../shared/config/repository";
 import { site } from "../shared/config/site";
 import { HeroReleaseBadge } from "./HeroReleaseBadge";
 import { ThemeComparisonSlider } from "./ThemeComparisonSlider";
@@ -26,7 +27,7 @@ import { ThemeComparisonSlider } from "./ThemeComparisonSlider";
     </p>
 
     <!-- CTA -->
-    <div class="mb-16 flex flex-col items-center justify-center gap-3 sm:flex-row">
+    <div class="mb-5 flex flex-col items-center justify-center gap-3 sm:flex-row">
       <a
         href="#download"
         class="inline-flex h-11 items-center gap-2.5 rounded-lg px-7 text-sm font-medium text-white shadow-lg shadow-indigo-500/20 transition-all hover:shadow-indigo-500/30"
@@ -43,6 +44,16 @@ import { ThemeComparisonSlider } from "./ThemeComparisonSlider";
         {product.heroSecondaryCta}
       </a>
     </div>
+
+    <a
+      href={repository.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      class="relative mb-16 inline-flex items-center gap-2 text-xs text-zinc-500 transition-colors hover:text-zinc-300"
+    >
+      <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+      Desktop 与本地 AI Runtime 已采用 Apache-2.0 开源
+    </a>
 
     <ThemeComparisonSlider client:load />
   </div>

@@ -6,6 +6,7 @@ This package contains the product website deployed to <https://nexuspilot.dev>.
 
 - product positioning, brand presentation, and feature overview;
 - supported-database presentation;
+- open-source repository discovery and community entry points;
 - screenshots, downloads, and release history;
 - product-site SEO, static assets, and Cloudflare configuration.
 

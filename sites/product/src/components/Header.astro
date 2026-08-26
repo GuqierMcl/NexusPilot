@@ -1,5 +1,7 @@
 ---
 import { mainNavLinks } from "../shared/config/navigation";
+import { repositoryBadges } from "../shared/config/repository";
+import ShieldBadge from "./ShieldBadge.astro";
 ---
 
 <header
@@ -11,7 +13,7 @@ import { mainNavLinks } from "../shared/config/navigation";
       <!-- <img src="/wordmark.svg" alt="NexusPilot" class="h-5 w-auto invert" /> -->
     </a>
 
-    <ul class="absolute left-1/2 hidden -translate-x-1/2 items-center gap-8 md:flex">
+    <ul class="absolute left-1/2 hidden -translate-x-1/2 items-center gap-6 md:flex lg:gap-8">
       {mainNavLinks.map((link) => (
         <li>
           <a
@@ -23,5 +25,13 @@ import { mainNavLinks } from "../shared/config/navigation";
         </li>
       ))}
     </ul>
+
+    <div class="ml-auto flex shrink-0 items-center">
+      <ShieldBadge
+        badge={repositoryBadges.stars}
+        loading="eager"
+        class="rounded"
+      />
+    </div>
   </nav>
 </header>

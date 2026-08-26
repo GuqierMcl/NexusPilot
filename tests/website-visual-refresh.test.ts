@@ -21,6 +21,9 @@ describe("website visual refresh", () => {
         const databaseSource = readWebsiteFile(
             "sites/product/src/components/DatabaseMatrix.astro",
         );
+        const openSourceSource = readWebsiteFile(
+            "sites/product/src/components/OpenSource.astro",
+        );
         const downloadSource = readWebsiteFile(
             "sites/product/src/components/Download.astro",
         );
@@ -29,10 +32,12 @@ describe("website visual refresh", () => {
         );
 
         expect(featuresSource).toContain("section-band section-band-features");
+        expect(openSourceSource).toContain("section-band section-band-open-source");
         expect(databaseSource).toContain("section-band section-band-databases");
         expect(downloadSource).toContain("section-band section-band-download");
         expect(stylesSource).toContain(".section-band");
         expect(stylesSource).toContain(".feature-item");
+        expect(stylesSource).toContain(".open-source-stage");
         expect(stylesSource).toContain(".database-pill");
     });
 

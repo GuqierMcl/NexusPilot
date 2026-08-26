@@ -1,5 +1,6 @@
 ---
 import { site } from "../shared/config/site";
+import { repository } from "../shared/config/repository";
 
 interface Props {
   title?: string;
@@ -11,6 +12,18 @@ const {
   description = site.description,
 } = Astro.props;
 const canonicalUrl = new URL(Astro.url.pathname, site.url).toString();
+const structuredData = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: site.name,
+  description,
+  url: site.url,
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: ["Windows", "macOS", "Linux"],
+  codeRepository: repository.url,
+  license: repository.licenseUrl,
+  sameAs: [repository.url],
+};
 ---
 
 <!doctype html>
@@ -29,6 +42,13 @@ const canonicalUrl = new URL(Astro.url.pathname, site.url).toString();
     <meta property="og:image" content={site.ogImage} />
 
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://img.shields.io" />
+    <link rel="dns-prefetch" href="//img.shields.io" />
+
+    <script
+      type="application/ld+json"
+      set:html={JSON.stringify(structuredData)}
+    />
 
     <!-- Fonts: Geist + JetBrains Mono -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />

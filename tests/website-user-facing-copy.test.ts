@@ -3,9 +3,16 @@ import { readFileSync } from "node:fs";
 
 import { product } from "../sites/product/src/shared/config/product";
 import {
+    footerLinks,
+    mainNavLinks,
     openSource,
     publicSourceLinks,
 } from "../sites/product/src/shared/config/navigation";
+import {
+    repository,
+    repositoryBadges,
+} from "../sites/product/src/shared/config/repository";
+import { site } from "../sites/product/src/shared/config/site";
 
 const readWebsiteFile = (path: string) => readFileSync(path, "utf8");
 
@@ -90,16 +97,47 @@ describe("website user-facing copy", () => {
 
         expect(openSource.status).toBe("public");
         expect(openSource.repositoryHref).toBe(
-            "https://github.com/GuqierMcl/NexusPilot",
+            repository.url,
         );
         expect(openSource.issuesHref).toBe(
-            "https://github.com/GuqierMcl/NexusPilot/issues",
+            repository.issuesUrl,
         );
         expect(publicSourceLinks.map((link) => link.label)).toEqual([
             "GitHub",
             "Issues",
+            "参与贡献",
+            "Apache-2.0",
+            "安全报告",
         ]);
+        expect(repositoryBadges.stars.src).toContain(
+            "https://img.shields.io/github/stars/GuqierMcl/NexusPilot",
+        );
+        expect(repositoryBadges.forks.src).toContain(
+            "https://img.shields.io/github/forks/GuqierMcl/NexusPilot",
+        );
+        expect(repositoryBadges.license.src).toContain(
+            "https://img.shields.io/github/license/GuqierMcl/NexusPilot",
+        );
         expect(combined).not.toContain("当前仓库尚未开放");
         expect(combined).not.toContain("项目开放后");
+    });
+
+    test("all product-site documentation entry points use docs.nexuspilot.dev", () => {
+        const heroSource = readWebsiteFile(
+            "sites/product/src/components/Hero.astro",
+        );
+        const notFoundSource = readWebsiteFile(
+            "sites/product/src/pages/404.astro",
+        );
+
+        expect(site.docsUrl).toBe("https://docs.nexuspilot.dev");
+        expect(mainNavLinks.find((link) => link.label === "文档")?.href).toBe(
+            site.docsUrl,
+        );
+        expect(footerLinks.find((link) => link.label === "文档")?.href).toBe(
+            site.docsUrl,
+        );
+        expect(heroSource).toContain("href={site.docsUrl}");
+        expect(notFoundSource).toContain("href={site.docsUrl}");
     });
 });

@@ -13,12 +13,12 @@ const links = [...footerLinks, ...publicSourceLinks];
       <span class="ml-1 text-xs text-zinc-600">© {currentYear}</span>
     </div>
 
-    <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
+    <nav class="flex flex-wrap items-center gap-x-5 gap-y-2" aria-label="页脚导航">
       {links.map((link) => (
         <a href={link.href} class="text-xs text-zinc-500 hover:text-white">
           {link.label}
         </a>
       ))}
-    </div>
+    </nav>
   </div>
 </footer>

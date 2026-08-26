@@ -157,6 +157,46 @@ body {
     linear-gradient(250deg, rgba(52, 211, 153, 0.07), transparent 52%);
 }
 
+.section-band-open-source {
+  background:
+    linear-gradient(180deg, #090c12 0%, #0c1020 52%, #090c12 100%),
+    linear-gradient(115deg, rgba(99, 102, 241, 0.09), transparent 48%),
+    linear-gradient(250deg, rgba(34, 211, 238, 0.07), transparent 54%);
+}
+
+.open-source-stage {
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  border-radius: 1rem;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.015)),
+    rgba(9, 9, 11, 0.58);
+  box-shadow:
+    0 30px 70px -48px rgba(0, 0, 0, 0.94),
+    0 24px 70px -54px rgba(99, 102, 241, 0.52);
+}
+
+.open-source-repository-card {
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 0.8rem;
+  background: rgba(9, 9, 11, 0.72);
+  box-shadow: 0 22px 60px -42px rgba(0, 0, 0, 0.9);
+}
+
+.open-source-repository-icon {
+  display: inline-flex;
+  flex: 0 0 2rem;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid rgba(99, 102, 241, 0.22);
+  border-radius: 0.55rem;
+  background: rgba(99, 102, 241, 0.09);
+  color: rgba(199, 210, 254, 0.88);
+}
+
 .section-band-download {
   background:
     linear-gradient(180deg, #09090b 0%, #0d0f19 55%, #09090b 100%),

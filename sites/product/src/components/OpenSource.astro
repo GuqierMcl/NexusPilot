@@ -1,0 +1,84 @@
+---
+import { ArrowUpRight, FileText } from "lucide-react";
+
+import {
+  repository,
+  repositoryBadges,
+} from "../shared/config/repository";
+import { site } from "../shared/config/site";
+import ShieldBadge from "./ShieldBadge.astro";
+
+const publicAreas = [
+  "桌面工作台",
+  "Rust 数据库引擎",
+  "本地 AI Runtime",
+  "官网与公开文档",
+];
+---
+
+<section id="open-source" class="section-band section-band-open-source">
+  <div class="relative mx-auto max-w-5xl px-6">
+    <div class="open-source-stage grid gap-10 p-6 md:p-8 lg:grid-cols-[minmax(0,1fr)_minmax(21rem,0.82fr)] lg:items-center lg:gap-12">
+      <div>
+        <p class="section-kicker">OPEN SOURCE</p>
+        <h2 class="section-title">核心工作台，公开构建</h2>
+        <p class="mt-5 max-w-2xl text-sm leading-7 text-zinc-400 md:text-base">
+          NexusPilot 的桌面工作台、Rust 数据库引擎和本地 AI Runtime
+          已在 GitHub 以 Apache License 2.0 开源。你可以检查实现、提交问题，
+          或参与下一种数据库驱动的建设。
+        </p>
+
+        <ul class="mt-6 flex flex-wrap gap-2" aria-label="公开仓库包含的项目区域">
+          {publicAreas.map((area) => (
+            <li class="rounded-md border border-white/[0.07] bg-white/[0.03] px-3 py-1.5 font-mono text-[11px] text-zinc-500">
+              {area}
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div class="open-source-repository-card">
+        <div class="flex items-center gap-3 border-b border-white/[0.07] px-5 py-4">
+          <span class="open-source-repository-icon">
+            <FileText className="h-4 w-4" aria-hidden="true" />
+          </span>
+          <div class="min-w-0">
+            <p class="font-mono text-[10px] uppercase tracking-[0.16em] text-zinc-600">
+              GitHub repository
+            </p>
+            <p class="mt-1 truncate font-mono text-sm text-zinc-200">
+              {repository.slug}
+            </p>
+          </div>
+        </div>
+
+        <div class="flex flex-wrap gap-2 px-5 py-5">
+          <ShieldBadge badge={repositoryBadges.stars} />
+          <ShieldBadge badge={repositoryBadges.forks} />
+          <ShieldBadge badge={repositoryBadges.license} />
+          <ShieldBadge badge={repositoryBadges.lastCommit} />
+        </div>
+
+        <div class="flex flex-col gap-2 border-t border-white/[0.07] px-5 py-4 sm:flex-row">
+          <a
+            href={repository.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="inline-flex h-10 items-center justify-center gap-2 rounded-lg px-4 text-sm font-medium text-white shadow-lg shadow-indigo-500/15 transition-all hover:shadow-indigo-500/25"
+            style="background: var(--brand-gradient)"
+          >
+            <FileText className="h-4 w-4" aria-hidden="true" />
+            查看 GitHub 仓库
+          </a>
+          <a
+            href={`${site.docsUrl}/project/contributing/`}
+            class="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-white/[0.08] bg-white/[0.03] px-4 text-sm font-medium text-zinc-400 transition-all hover:bg-white/[0.06] hover:text-white"
+          >
+            参与贡献
+            <ArrowUpRight className="h-4 w-4" aria-hidden="true" />
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

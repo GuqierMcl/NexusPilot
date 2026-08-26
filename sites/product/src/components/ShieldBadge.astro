@@ -1,0 +1,37 @@
+---
+import type { RepositoryBadge } from "../shared/config/repository";
+
+interface Props {
+  badge: RepositoryBadge;
+  loading?: "eager" | "lazy";
+  class?: string;
+}
+
+const {
+  badge,
+  loading = "lazy",
+  class: className = "",
+} = Astro.props;
+---
+
+<a
+  href={badge.href}
+  target="_blank"
+  rel="noopener noreferrer"
+  aria-label={badge.ariaLabel}
+  class:list={[
+    "inline-flex min-h-5 items-center transition-opacity hover:opacity-80 focus-visible:rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-400",
+    className,
+  ]}
+>
+  <img
+    src={badge.src}
+    alt={badge.alt}
+    height="20"
+    loading={loading}
+    decoding="async"
+    referrerpolicy="no-referrer"
+    class="block h-5 max-w-full"
+  />
+</a>
+
