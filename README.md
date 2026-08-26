@@ -124,6 +124,10 @@ NexusPilot uses a bring-your-own-provider model. Configure a supported provider 
 
 - [Website](https://nexuspilot.dev) — product overview, downloads, and release history
 - [Documentation](https://docs.nexuspilot.dev) — installation, quick start, database connections, and AI assistant guides
+- [Public knowledge base](./docs/README.md) — authoritative architecture, contracts, product intent, ADRs, and contributor guides
+- [Architecture overview](./docs/architecture/overview.md) — system boundaries and component ownership
+- [Contributor development guides](./docs/development/README.md) — implementation, testing, extension, and release guidance
+- [Contracts](./docs/contracts/README.md) — IPC and public Desktop-to-Cloud compatibility boundaries
 - [AGENTS.md](./AGENTS.md) — coding guidelines for AI agents and contributors
 
 ## 🤝 Contributing

@@ -242,8 +242,10 @@ Rust backend
 ## 4. Contribution Guidelines
 
 - Public web applications are split into `sites/product/` (the product website at `nexuspilot.dev`) and `sites/docs/` (the Starlight documentation renderer at `docs.nexuspilot.dev`). They must build independently and must not import each other's source files.
-- Public documentation source lives under `docs/guides/`. The `sites/docs/` application loads that directory directly through Astro's Content Loader; do not create a second Markdown source tree inside the site package.
-- The current files in `docs/guides/` were migrated from the former combined website as an initial public baseline. Broader reconstruction of the authoritative `docs/` knowledge base remains a separate documentation change; do not import private internal documentation wholesale.
+- `docs/README.md` is the public knowledge entry point. `docs/guides/` is the only documentation-site content source; `docs/development/` contains contributor implementation guides; `docs/architecture/` describes current system facts; `docs/contracts/` defines stable or frozen protocols; `docs/ai-runtime/` owns Runtime design; and `docs/adr/` records accepted decisions.
+- The `sites/docs/` application loads only `docs/guides/**/*.{md,mdx}` through Astro's Content Loader. Do not create a second Markdown source tree inside the site package and do not widen the loader to scan all of `docs/`.
+- Personal AI plans, prompts, transcripts, worklogs, private design diaries, and scratch records must not be committed. Rewrite reusable conclusions into the appropriate authoritative document instead of copying collaboration records; `docs/superpowers/` is explicitly excluded.
+- User behavior changes must update `docs/guides/` when externally visible. Architecture, contract, AI Runtime, and contributor-workflow changes must update their authoritative documents in the same pull request.
 - Before changing AI SDK (`ai` / `@ai-sdk/*`) behavior, consult the official AI SDK docs: <https://ai-sdk.dev/llms.txt>
 - When adding a new database driver:
   - Frontend: update `DbDriver`, add payload interface, register `driver-configs/`, sync IPC metadata types
@@ -251,6 +253,15 @@ Rust backend
   - Rust engine: add `DriverProfile`, concrete driver implementation, and `DriverRegistry` factory branch
 - Engine IPC must go through `apiInvoke()` (not raw `invoke`) for proper error toasts.
 - See `CONTRIBUTING.md` for the development setup and PR workflow.
+
+### Documentation entry points
+
+- Public knowledge base: `docs/README.md`
+- Current architecture: `docs/architecture/overview.md`
+- Stable contracts: `docs/contracts/README.md`
+- AI Runtime design: `docs/ai-runtime/README.md`
+- Contributor implementation guides: `docs/development/README.md`
+- Product intent and support boundaries: `docs/product/README.md`
 
 ### Commit Convention
 

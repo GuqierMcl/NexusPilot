@@ -124,6 +124,10 @@ NexusPilot 采用由用户自行配置提供商的模式。你可以在本地 AI
 
 - [官网](https://nexuspilot.dev) —— 产品介绍、下载入口与发布日志
 - [文档](https://docs.nexuspilot.dev) —— 安装、快速开始、数据库连接与 AI 助手指南
+- [公开权威知识库](./docs/README.md) —— 架构、契约、产品边界、ADR 与贡献者指南
+- [架构概览](./docs/architecture/overview.md) —— 系统边界与组件职责
+- [贡献者开发指南](./docs/development/README.md) —— 实现、测试、扩展与发布指引
+- [契约](./docs/contracts/README.md) —— IPC 与 Desktop-to-Cloud 公共兼容边界
 - [AGENTS.md](./AGENTS.md) —— 面向 AI 编码代理与贡献者的开发规范
 
 ## 🤝 参与贡献

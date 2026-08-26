@@ -49,6 +49,7 @@ tmp
 .scratch/
 .transcripts/
 .prompts/
+/docs/superpowers/
 
 # Local tool and deployment state
 .wrangler/
