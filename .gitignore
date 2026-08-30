@@ -104,3 +104,17 @@ CHECKLIST.local.md
 CHECKLIST.private.md
 REVIEW.local.md
 REVIEW.private.md
+# >>> Comet managed project state >>>
+!/.comet/
+/.comet/*
+!/.comet/config.yaml
+# <<< Comet managed project state <<<
+
+# Personal project-local AI tooling
+# Keep these rules after the Comet-managed block so local state stays ignored.
+/.codegraph/
+/.comet/
+/.cursor/
+/.zcode/
+/docs/openspec/
+/skills-lock.json
