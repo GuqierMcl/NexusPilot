@@ -1,8 +1,8 @@
 export const site = {
   name: "NexusPilot",
-  title: "NexusPilot - AI Native 数据库管理平台",
+  title: "NexusPilot - AI Native 多数据库工作台",
   description:
-    "NexusPilot 是 AI Native 数据库管理平台，面向多数据库支持、AI 原生数据库支持和 AI 智能助手工作流。",
+    "NexusPilot 是面向开发者和数据团队的 AI Native 多数据库桌面工作台，支持自然语言数据探索、引擎原生对象管理和经过审批的智能体工具执行。",
   url: "https://nexuspilot.dev",
   docsUrl: "https://docs.nexuspilot.dev",
   defaultLocale: "zh-CN",

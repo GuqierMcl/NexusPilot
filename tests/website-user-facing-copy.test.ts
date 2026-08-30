@@ -39,21 +39,95 @@ describe("website user-facing copy", () => {
         }
     });
 
-    test("homepage positioning and features describe a professional user-facing product", () => {
-        expect(product.summary).not.toContain(
-            "跨平台桌面应用，围绕多数据库支持、AI 原生数据库支持和 AI 智能助手构建统一的数据工作台。",
-        );
-        expect(product.summary).toContain("专业数据工作台");
-        expect(product.features).toHaveLength(6);
+    test("homepage positioning leads with concrete AI-native capabilities", () => {
+        expect(product.summary).toContain("AI Native 多数据库工作台");
+        expect(product.summary).toContain("自然语言");
+        expect(product.summary).toContain("引擎原生对象");
+        expect(product.summary).toContain("受控工具");
+        expect(product.features).toHaveLength(8);
 
         expect(product.features.map((feature) => feature.title)).toEqual([
-            "原生驾驭每一种数据形态",
-            "让 AI 成为懂数据的副驾",
-            "NexusPilot Cloud，跨设备仍由你掌控",
-            "每一次变更，都经得起验证",
-            "从连接到洞察，一气呵成",
-            "安全，从边界开始",
+            "自然语言数据智能体",
+            "受控的智能体工具执行",
+            "多数据源连接与对象探索",
+            "面向引擎的查询与操作工作区",
+            "数据内容查看与安全变更",
+            "引擎原生对象管理",
+            "自选模型与本地 AI Runtime",
+            "端到端加密的跨设备同步",
         ]);
+
+        const featureTitles = product.features.map((feature) => feature.title).join("\n");
+        expect(featureTitles).not.toMatch(/SQL|表格|表结构/);
+        expect(product.features[0]?.description).toContain("Ask、Query 和 Agent");
+        expect(product.features[1]?.description).toContain("驱动能力");
+    });
+
+    test("website and bilingual READMEs share the engine-neutral capability model", () => {
+        const featuresSource = readWebsiteFile(
+            "sites/product/src/components/Features.astro",
+        );
+        const chineseReadme = readWebsiteFile("README.zh-CN.md");
+        const englishReadme = readWebsiteFile("README.md");
+
+        expect(featuresSource).toContain("核心功能");
+        expect(chineseReadme).toContain("## ✨ 核心功能");
+        expect(englishReadme).toContain("## ✨ Core Capabilities");
+
+        for (const feature of product.features) {
+            expect(chineseReadme).toContain(`**${feature.title}**`);
+        }
+
+        for (const title of [
+            "Natural-language data agent",
+            "Controlled agent tool execution",
+            "Multi-source connections and object exploration",
+            "Engine-aware query and operation workspaces",
+            "Data inspection and safe mutations",
+            "Engine-native object management",
+            "Bring-your-own models with a local AI Runtime",
+            "End-to-end encrypted device sync",
+        ]) {
+            expect(englishReadme).toContain(`**${title}**`);
+        }
+
+        expect(`${chineseReadme}\n${englishReadme}`).not.toContain("RAG 检索测试");
+    });
+
+    test("README database matrices expose data models and AI tool integration", () => {
+        const chineseReadme = readWebsiteFile("README.zh-CN.md");
+        const englishReadme = readWebsiteFile("README.md");
+        const englishDataModels: Record<string, string> = {
+            MySQL: "Relational",
+            PostgreSQL: "Relational",
+            Redis: "Key-value",
+            Oracle: "Relational",
+            SQLite: "Relational",
+            ClickHouse: "Columnar analytics",
+        };
+
+        expect(chineseReadme).toContain(
+            "| 数据库 | 数据形态 | AI 工具接入 | 状态 |",
+        );
+        expect(englishReadme).toContain(
+            "| Database | Data model | AI tool integration | Status |",
+        );
+
+        for (const database of product.databases.filter(
+            (item) => item.status === "available",
+        )) {
+            expect(chineseReadme).toContain(
+                `| **${database.name}** | ${database.type} | ✅ 已接入 | ✅ 支持 |`,
+            );
+            expect(englishReadme).toContain(
+                `| **${database.name}** | ${englishDataModels[database.name]} | ✅ Integrated | ✅ Supported |`,
+            );
+        }
+
+        expect(chineseReadme).toContain("不表示所有读写和管理操作均已开放");
+        expect(englishReadme).toContain(
+            "not that every read, write, or management operation is enabled",
+        );
     });
 
     test("homepage download panel keeps release notes behind a deliberate link", () => {

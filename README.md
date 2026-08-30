@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Talk to your databases in natural language.</b><br/>
-  An AI-native, cross-platform database workbench for developers and data teams.
+  An AI-native, cross-platform workbench grounded in real connections, engine-native objects, and data results.
 </p>
 
 <p align="center">
@@ -19,32 +19,33 @@
 
 English | [简体中文](./README.zh-CN.md)
 
-**NexusPilot** brings multi-source connections, structure browsing, query editing, and AI-assisted analysis into one efficient desktop environment. It is built on **Tauri v2**, **React 19**, and **Rust**, with a local **AI Runtime** sidecar powered by **Bun + Elysia + the Vercel AI SDK**.
+**NexusPilot** is a multi-database workbench for developers and data teams. Its agent works from real connection state, engine-native objects, and data results to explore different data models in natural language and act through controlled workbench tools. It is built on **Tauri v2**, **React 19**, and **Rust**, with a local **AI Runtime** sidecar powered by **Bun + Elysia + the Vercel AI SDK**.
 
 ---
 
-## ✨ Features
+## ✨ Core Capabilities
 
-- **Every data shape, one workbench** — connect to relational, key-value, and analytics engines and interact with each one the way its engine actually works, instead of forcing everything into a single table UI.
-- **An AI copilot that knows your data** — the assistant explores, writes SQL, and analyzes based on the connections you have open, real object structures, and real query results. It reaches the workbench through restricted tools, not guesses.
-- **Changes you can verify** — AI-initiated SQL and Redis writes pass risk analysis and approval; table and native schema changes show previews before execution and re-check remote state for critical operations.
-- **Capability-driven, engine-native** — NexusPilot adapts to the capabilities of each database engine and stays read-only when a semantic is unknown or cannot be verified safely.
-- **From connection to insight** — drill from the connection tree into database objects, run and save queries in context-aware SQL tabs, and continue in the data grid or AI conversation — all in one workspace.
-- **Security from the boundary** — the native desktop app owns your database connections; a separate local AI Runtime owns all LLM credentials. The frontend never holds or calls LLM APIs directly.
-- **NexusPilot Cloud** — sync saved connections and folders across authorized devices with end-to-end encryption, device authorization, and Recovery Key recovery. Cloud stores encrypted assets rather than plaintext connection credentials, and the desktop workbench remains fully usable without Cloud.
+- **Natural-language data agent** — use Ask, Query, and Agent modes to describe data questions or multi-step tasks in natural language. The agent works from real connection state, engine-native objects, and data results to query, explore, explain, and operate on data according to each source's capabilities.
+- **Controlled agent tool execution** — the agent uses data sources through restricted workbench tools instead of opening hidden connections outside the application. Every operation is checked against driver capabilities, resource type, and risk level; SQL and Redis writes currently use risk analysis and approval flows, with strong confirmation for high-risk actions.
+- **Multi-source connections and object exploration** — manage relational, key-value, and analytics sources in one connection tree, with more data models designed to fit the same capability system. Each engine exposes its own object hierarchy and available operations instead of being forced into one table abstraction.
+- **Engine-aware query and operation workspaces** — use interaction surfaces adapted to each source. Current workflows include context-aware query editing, multi-statement results, saved queries, and Redis Key, typed-value, and TTL operations; new sources can add native workflows without pretending to be SQL or tables.
+- **Data inspection and safe mutations** — inspect content through views appropriate to the current resource. Reading, filtering, paging, and mutation entry points follow source and resource capabilities; supported writes use previews, stable identity, preconditions, or transactions to reduce accidental and concurrent overwrites.
+- **Engine-native object management** — inspect and manage the objects and structures each source actually owns. Current relational drivers provide table inspection, structured design, and DDL previews, while ClickHouse adds native workflows for databases, tables, views, projections, and data-skipping indexes.
+- **Bring-your-own models with a local AI Runtime** — manage providers, models, and credentials in the local AI Runtime, synchronize the models.dev catalog, and configure custom OpenAI-compatible providers. The agent reuses workbench connections through a controlled bridge; the frontend never stores LLM credentials, and the workbench remains usable without AI.
+- **End-to-end encrypted device sync** — use NexusPilot Cloud to synchronize saved connections and folders across authorized devices, with device authorization, conflict handling, and Recovery Key recovery. Cloud stores ciphertext rather than plaintext credentials, while the local workbench and AI Runtime remain independently usable.
 
 ## 🗄️ Supported Databases
 
-| Database | Status |
-|---|---|
-| **PostgreSQL** | ✅ Supported |
-| **MySQL** | ✅ Supported |
-| **SQLite** | ✅ Supported |
-| **Redis** | ✅ Supported |
-| **ClickHouse** | ✅ Supported |
-| **Oracle** | ✅ Supported |
+| Database | Data model | AI tool integration | Status |
+|---|---|---|---|
+| **PostgreSQL** | Relational | ✅ Integrated | ✅ Supported |
+| **MySQL** | Relational | ✅ Integrated | ✅ Supported |
+| **SQLite** | Relational | ✅ Integrated | ✅ Supported |
+| **Redis** | Key-value | ✅ Integrated | ✅ Supported |
+| **ClickHouse** | Columnar analytics | ✅ Integrated | ✅ Supported |
+| **Oracle** | Relational | ✅ Integrated | ✅ Supported |
 
-> This table lists supported connection drivers. Available operations may vary by database engine, server version, permissions, and the capability model reported at runtime.
+> This matrix describes the public availability of connection drivers; it does not imply identical operations across database engines. “AI tool integration” means the AI Runtime can use the driver’s currently registered connection, object, or data tools through the workbench connection runtime—not that every read, write, or management operation is enabled. Exact capabilities depend on the engine, server version, connection permissions, and runtime capability model.
 
 ## 📸 Screenshots
 
