@@ -47,6 +47,7 @@ export default defineConfig(async () => ({
         "**/.vscode/**",
         "**/scripts/**",
         "**/sites/**",
+        "**/docs/**",
       ],
     },
   },

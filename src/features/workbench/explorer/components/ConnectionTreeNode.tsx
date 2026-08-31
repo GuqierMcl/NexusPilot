@@ -16,6 +16,11 @@ import {
     ContextMenuSeparator,
     ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import {
+    HoverCard,
+    HoverCardContent,
+    HoverCardTrigger,
+} from "@/components/ui/hover-card";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { buildExplorerNodeActionSet } from "@/features/workbench/explorer/actions";
@@ -25,6 +30,8 @@ import type {
     ExplorerNodeActionHandlers,
 } from "@/features/workbench/explorer/actions";
 import { buildSavedQueryGroupForRemoteNode } from "@/features/workbench/explorer/savedQueryNodes";
+import { buildConnectionHoverCardModel } from "@/features/workbench/explorer/connection-hover-card";
+import { ConnectionHoverCardContent } from "@/features/workbench/explorer/components/ConnectionHoverCardContent";
 import { ExplorerNodeIcon } from "@/features/workbench/explorer/components/ExplorerNodeIcon";
 import { ExplorerNodeProperties } from "@/features/workbench/explorer/components/ExplorerNodeProperties";
 import { getConnectionNodeLabelClassName } from "@/features/workbench/explorer/components/explorerNodeLabel";
@@ -534,28 +541,55 @@ export function ConnectionTreeNode({
         );
     }
 
-    const baseRenderedRow = (
+    const contextMenuContent = (
+        <ContextMenuContent>
+            <div className="px-1.5 py-1 text-xs font-medium text-muted-foreground">
+                {actionSet.label}
+            </div>
+            {actionSet.groups.map((group, index) => (
+                <ContextMenuGroup key={group.id}>
+                    {index > 0 && <ContextMenuSeparator />}
+                    {group.label ? (
+                        <ContextMenuLabel>{group.label}</ContextMenuLabel>
+                    ) : null}
+                    {group.actions.map(renderAction)}
+                </ContextMenuGroup>
+            ))}
+        </ContextMenuContent>
+    );
+    const hoverRenderedRow = node.type === "connection" ? (
+        <ContextMenu>
+            <HoverCard>
+                <HoverCardTrigger
+                    delay={280}
+                    closeDelay={120}
+                    render={<ContextMenuTrigger render={rowRoot} />}
+                />
+                <HoverCardContent
+                    side="right"
+                    align="start"
+                    sideOffset={8}
+                    className="w-80 p-0"
+                >
+                    <ConnectionHoverCardContent
+                        model={buildConnectionHoverCardModel(
+                            node.connection,
+                            driverConfig?.displayName ?? node.connection.driver,
+                        )}
+                    />
+                </HoverCardContent>
+            </HoverCard>
+            {contextMenuContent}
+        </ContextMenu>
+    ) : (
         <ContextMenu>
             <ContextMenuTrigger render={rowRoot} />
-            <ContextMenuContent>
-                <div className="px-1.5 py-1 text-xs font-medium text-muted-foreground">
-                    {actionSet.label}
-                </div>
-                {actionSet.groups.map((group, index) => (
-                    <ContextMenuGroup key={group.id}>
-                        {index > 0 && <ContextMenuSeparator />}
-                        {group.label ? (
-                            <ContextMenuLabel>{group.label}</ContextMenuLabel>
-                        ) : null}
-                        {group.actions.map(renderAction)}
-                    </ContextMenuGroup>
-                ))}
-            </ContextMenuContent>
+            {contextMenuContent}
         </ContextMenu>
     );
     const renderedRow = renderRowShell
-        ? renderRowShell(node, depth, baseRenderedRow)
-        : baseRenderedRow;
+        ? renderRowShell(node, depth, hoverRenderedRow)
+        : hoverRenderedRow;
 
     if (!canExpand) {
         return renderedRow;
