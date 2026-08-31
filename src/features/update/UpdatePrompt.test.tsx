@@ -32,6 +32,9 @@ describe("UpdatePromptContent", () => {
         expect(markup.includes("group-hover/update-prompt:max-w-16")).toBe(true);
         expect(markup.includes("group-focus-visible/update-prompt:max-w-16")).toBe(true);
         expect(markup.includes("motion-reduce:transition-none")).toBe(true);
+        expect(
+            /<span[^>]*class="[^"]*translate-y-px[^"]*"/.test(markup),
+        ).toBe(true);
         expect(markup.includes("有新版本")).toBe(false);
     });
 

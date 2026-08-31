@@ -46,7 +46,7 @@ export function UpdatePromptContent({
                 <CircleArrowUp className="size-4" />
                 <span
                     aria-hidden="true"
-                    className="inline-block max-w-0 overflow-hidden opacity-0 transition-[max-width,opacity] duration-200 group-hover/update-prompt:max-w-16 group-hover/update-prompt:opacity-100 group-focus-visible/update-prompt:max-w-16 group-focus-visible/update-prompt:opacity-100 motion-reduce:transition-none"
+                    className="inline-block max-w-0 translate-y-px overflow-hidden opacity-0 transition-[max-width,opacity] duration-200 group-hover/update-prompt:max-w-16 group-hover/update-prompt:opacity-100 group-focus-visible/update-prompt:max-w-16 group-focus-visible/update-prompt:opacity-100 motion-reduce:transition-none"
                 >
                     新版本
                 </span>
