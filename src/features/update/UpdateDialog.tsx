@@ -120,7 +120,8 @@ export function UpdateDialog() {
                     <Separator />
 
                     <ScrollArea
-                        className="h-64 min-h-0 rounded-md border bg-muted/30"
+                        type="auto"
+                        className="max-h-64 min-h-0 rounded-md border bg-muted/30 [&>[data-slot=scroll-area-viewport]]:max-h-64"
                     >
                         <div className="flex flex-col gap-3 p-4">
                             <p className="text-sm font-semibold">更新日志</p>
