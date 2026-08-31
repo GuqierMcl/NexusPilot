@@ -126,6 +126,7 @@ pub struct ConnectionDetail {
     pub connected: bool,
     pub runtime: Option<AiConnectionRuntime>,
     pub color: Option<String>,
+    pub note: String,
     pub tag_label: String,
     pub tag_color: Option<String>,
     pub folder_id: Option<String>,
@@ -150,6 +151,7 @@ impl ConnectionDetail {
             connected: runtime.is_some(),
             runtime: runtime.map(AiConnectionRuntime::from_snapshot),
             color: record.color.clone(),
+            note: record.note.clone(),
             tag_label: record.tag_label.clone(),
             tag_color: record.tag_color.clone(),
             folder_id: record.folder_id.clone(),
@@ -1291,6 +1293,7 @@ mod tests {
             driver: ConnectionDriver::Mysql,
             environment: "development".to_string(),
             color: Some("#123456".to_string()),
+            note: "Primary application database".to_string(),
             tag_label: "核心".to_string(),
             tag_color: Some("violet".to_string()),
             payload,
@@ -1364,6 +1367,7 @@ mod tests {
             "SHA256:safe-fingerprint"
         );
         assert_eq!(detail_value["color"], "#123456");
+        assert_eq!(detail_value["note"], "Primary application database");
         assert_eq!(detail_value["folderId"], "folder-1");
         assert_eq!(detail_value["sortOrder"], 4);
     }

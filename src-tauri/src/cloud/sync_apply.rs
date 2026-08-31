@@ -20,7 +20,9 @@ use crate::{
     repository::{
         cloud_sync_repository::CloudSyncOperationAction,
         connection_folder_repository::StoredConnectionFolder,
-        connection_repository::{ConnectionDriver, StoredConnectionRecord},
+        connection_repository::{
+            normalize_connection_note, ConnectionDriver, StoredConnectionRecord,
+        },
     },
 };
 
@@ -62,6 +64,7 @@ struct LocalConnectionRow {
     driver: String,
     environment: String,
     color: Option<String>,
+    note: String,
     tag_label: String,
     tag_color: Option<String>,
     payload: String,
@@ -740,19 +743,21 @@ async fn upsert_connection(
     payload: &Value,
 ) -> AppResult<()> {
     ConnectionDriver::from_str(&projection.driver)?;
+    let note = normalize_connection_note(&projection.note)?;
     let payload = serde_json::to_string(payload)?;
     sqlx::query(
         r#"
         INSERT INTO connections (
-            id, name, driver, environment, color, tag_label, tag_color, payload,
+            id, name, driver, environment, color, note, tag_label, tag_color, payload,
             folder_id, created_at, updated_at, sort_order
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                  strftime('%s','now') * 1000, strftime('%s','now') * 1000, ?10)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                  strftime('%s','now') * 1000, strftime('%s','now') * 1000, ?11)
         ON CONFLICT (id) DO UPDATE SET
             name = excluded.name,
             driver = excluded.driver,
             environment = excluded.environment,
             color = excluded.color,
+            note = excluded.note,
             tag_label = excluded.tag_label,
             tag_color = excluded.tag_color,
             payload = excluded.payload,
@@ -766,6 +771,7 @@ async fn upsert_connection(
     .bind(&projection.driver)
     .bind(&projection.environment)
     .bind(projection.color.as_deref())
+    .bind(&note)
     .bind(&projection.tag_label)
     .bind(projection.tag_color.as_deref())
     .bind(payload)
@@ -905,7 +911,7 @@ async fn load_connection(
 ) -> AppResult<Option<LocalConnectionRow>> {
     Ok(sqlx::query_as::<_, LocalConnectionRow>(
         r#"
-        SELECT id, name, driver, environment, color, tag_label, tag_color,
+        SELECT id, name, driver, environment, color, note, tag_label, tag_color,
                payload, folder_id, sort_order
         FROM connections WHERE id = ?1
         "#,
@@ -934,6 +940,7 @@ fn connection_record(row: LocalConnectionRow) -> AppResult<StoredConnectionRecor
         driver: ConnectionDriver::from_str(&row.driver)?,
         environment: row.environment,
         color: row.color,
+        note: row.note,
         tag_label: row.tag_label,
         tag_color: row.tag_color,
         payload: serde_json::from_str(&row.payload)?,
@@ -1118,6 +1125,7 @@ mod tests {
             driver: "postgres".to_string(),
             environment: "production".to_string(),
             color: None,
+            note: "Production owner: data team".to_string(),
             tag_label: String::new(),
             tag_color: None,
             folder_id: None,
@@ -1231,6 +1239,14 @@ mod tests {
                 .await
                 .unwrap(),
             "Remote"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT note FROM connections WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "Production owner: data team"
         );
     }
 

@@ -36,7 +36,7 @@ function flattenRecord(raw: RustConnectionRecord): StoredDatabaseConnection {
 /** 扁平的 ICreateConnectionInput → Rust 期望的嵌套结构 */
 function nestPayload(input: CreateDatabaseConnectionInput | UpdateDatabaseConnectionInput) {
     const {
-        id, name, driver, environment, color, tagLabel, tagColor,
+        id, name, driver, environment, color, note, tagLabel, tagColor,
         folderId, sortOrder,
         // IBaseConnectionProfile 字段
         createdAt: _createdAt, updatedAt: _updatedAt,
@@ -51,6 +51,7 @@ function nestPayload(input: CreateDatabaseConnectionInput | UpdateDatabaseConnec
         driver,
         environment: environment ?? "development",
         color: color ?? null,
+        note: typeof note === "string" ? note : "",
         tagLabel: typeof tagLabel === "string" ? tagLabel : "",
         tagColor: tagColor ?? null,
         payload: driverFields,

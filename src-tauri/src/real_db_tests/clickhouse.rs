@@ -1471,6 +1471,7 @@ fn stored_clickhouse_record(payload: serde_json::Value) -> StoredConnectionRecor
         driver: ConnectionDriver::Clickhouse,
         environment: "development".to_string(),
         color: None,
+        note: String::new(),
         tag_label: String::new(),
         tag_color: None,
         payload,

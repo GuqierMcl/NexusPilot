@@ -68,6 +68,7 @@ fn temporary_record(
         driver,
         environment: "development".to_string(),
         color: None,
+        note: String::new(),
         tag_label: String::new(),
         tag_color: None,
         payload,

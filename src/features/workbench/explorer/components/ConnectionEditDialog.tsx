@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { Wifi } from "lucide-react";
 import { toast } from "@/components/ui/toast";
 
@@ -11,7 +11,11 @@ import {
     DialogHeader,
     DialogTitle,
 } from "@/components/ui/dialog";
-import { Field, FieldContent, FieldLabel } from "@/components/ui/field";
+import {
+    Field,
+    FieldContent,
+    FieldLabel,
+} from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
     getDriverConfig,
@@ -20,11 +24,18 @@ import {
     ConnectionTestStatusBar,
     type ConnectionTestState,
 } from "@/features/workbench/explorer/components/ConnectionTestStatusBar";
+import { ConnectionMetadataDisclosure } from "@/features/workbench/explorer/components/ConnectionMetadataDisclosure";
+import type { ConnectionTagValue } from "@/features/workbench/explorer/components/ConnectionTagFields";
 import {
-    ConnectionTagFields,
-    type ConnectionTagValue,
-} from "@/features/workbench/explorer/components/ConnectionTagFields";
+    createConnectionMetadataDisclosureState,
+    reduceConnectionMetadataDisclosure,
+} from "@/features/workbench/explorer/connection-metadata";
 import { normalizeConnectionTagInput } from "@/features/workbench/explorer/connection-tags";
+import {
+    CONNECTION_NOTE_MAX_LENGTH,
+    isConnectionNoteWithinLimit,
+    normalizeConnectionNote,
+} from "@/features/workbench/explorer/connection-notes";
 import { apiInvoke } from "@/lib/api-client";
 import { normalizeIpcError } from "@/lib/ipc-error";
 import type { ImplementedDriver } from "@/features/workbench/explorer/driver-configs/types";
@@ -76,7 +87,7 @@ function buildDefaultConnectionName(
 /** 从 IStoredConnectionProfile 中提取驱动特有的 payload 字段（去掉通用 base 字段和存储层字段）。 */
 function extractPayload(connection: StoredDatabaseConnection): Record<string, unknown> {
     const BASE_KEYS: (keyof IBaseConnectionProfile)[] = [
-        "id", "name", "environment", "color", "tagLabel", "tagColor", "createdAt", "updatedAt",
+        "id", "name", "environment", "color", "note", "tagLabel", "tagColor", "createdAt", "updatedAt",
     ];
     const STORED_KEYS = [
         "driver", "folderId", "sortOrder",
@@ -108,6 +119,7 @@ export function ConnectionEditDialog({
     const effectiveDriverConfig = getDriverConfig(effectiveDriver as ImplementedDriver);
 
     const [name, setName] = useState("");
+    const [note, setNote] = useState("");
     const [tag, setTag] = useState<ConnectionTagValue>({
         tagLabel: "",
         tagColor: null,
@@ -119,22 +131,32 @@ export function ConnectionEditDialog({
     const [isSaving, setIsSaving] = useState(false);
     const [isTesting, setIsTesting] = useState(false);
     const [testState, setTestState] = useState<ConnectionTestState>({ status: "idle" });
+    const [metadataDisclosure, dispatchMetadataDisclosure] = useReducer(
+        reduceConnectionMetadataDisclosure,
+        createConnectionMetadataDisclosureState(),
+    );
+    const noteInputRef = useRef<HTMLTextAreaElement>(null);
 
     useEffect(() => {
         if (!open) {
             return;
         }
 
+        dispatchMetadataDisclosure({ type: "reset" });
+
         if (mode === "edit" && initialConnection) {
             setName(initialConnection.name);
+            setNote(initialConnection.note ?? "");
             setTag(normalizeConnectionTagInput(initialConnection));
             setConfig(extractPayload(initialConnection));
         } else if (mode === "create" && prefillConnection) {
             setName(buildClonedConnectionName(prefillConnection.name));
+            setNote(prefillConnection.note ?? "");
             setTag(normalizeConnectionTagInput(prefillConnection));
             setConfig(extractPayload(prefillConnection));
         } else {
             setName("");
+            setNote("");
             setTag({ tagLabel: "", tagColor: null });
             setConfig(effectiveDriverConfig?.createDefaultConfig() ?? {});
         }
@@ -143,13 +165,24 @@ export function ConnectionEditDialog({
         setTestState({ status: "idle" });
     }, [open, mode, initialConnection, prefillConnection, effectiveDriverConfig]);
 
+    useEffect(() => {
+        if (!metadataDisclosure.focusNote) {
+            return;
+        }
+
+        noteInputRef.current?.focus();
+        dispatchMetadataDisclosure({ type: "note-focused" });
+    }, [metadataDisclosure.focusNote]);
+
     function handleOpenChange(next: boolean) {
         if (!next) {
             setName("");
+            setNote("");
             setTag({ tagLabel: "", tagColor: null });
             setConfig(effectiveDriverConfig?.createDefaultConfig() ?? {});
             setIsTesting(false);
             setTestState({ status: "idle" });
+            dispatchMetadataDisclosure({ type: "reset" });
         }
         onOpenChange(next);
     }
@@ -233,6 +266,13 @@ export function ConnectionEditDialog({
             return;
         }
 
+        const normalizedNote = normalizeConnectionNote(note);
+        if (!isConnectionNoteWithinLimit(normalizedNote)) {
+            dispatchMetadataDisclosure({ type: "reveal-invalid-note" });
+            toast.error(`连接备注不能超过 ${CONNECTION_NOTE_MAX_LENGTH} 个字符`);
+            return;
+        }
+
         setIsSaving(true);
         const normalizedTag = normalizeConnectionTagInput(tag);
         try {
@@ -247,6 +287,7 @@ export function ConnectionEditDialog({
                     createdAt: 0,
                     updatedAt: 0,
                     ...config,
+                    note: normalizedNote,
                     tagLabel: normalizedTag.tagLabel,
                     tagColor: normalizedTag.tagColor,
                     folderId: folderId ?? null,
@@ -261,6 +302,7 @@ export function ConnectionEditDialog({
                     name: resolvedName,
                     driver: effectiveDriver,
                     ...config,
+                    note: normalizedNote,
                     tagLabel: normalizedTag.tagLabel,
                     tagColor: normalizedTag.tagColor,
                     folderId: initialConnection.folderId ?? null,
@@ -273,9 +315,8 @@ export function ConnectionEditDialog({
             handleOpenChange(false);
         } catch (e) {
             console.error("[ConnectionEditDialog] save failed", e);
-            toast.error(
-                "保存失败，请稍后重试" + e,
-            );
+            const error = normalizeIpcError(e);
+            toast.error(`保存失败：${error.message}`);
         } finally {
             setIsSaving(false);
         }
@@ -310,12 +351,6 @@ export function ConnectionEditDialog({
                         </FieldContent>
                     </Field>
 
-                    <ConnectionTagFields
-                        value={tag}
-                        onChange={setTag}
-                        disabled={isSaving || isTesting}
-                    />
-
                     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
                         {effectiveDriverConfig?.renderForm({
                             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -324,6 +359,20 @@ export function ConnectionEditDialog({
                             disabled: isSaving || isTesting,
                         })}
                     </div>
+
+                    <ConnectionMetadataDisclosure
+                        open={metadataDisclosure.open}
+                        onOpenChange={(nextOpen) => dispatchMetadataDisclosure({
+                            type: "set-open",
+                            open: nextOpen,
+                        })}
+                        tag={tag}
+                        onTagChange={setTag}
+                        note={note}
+                        onNoteChange={setNote}
+                        disabled={isSaving || isTesting}
+                        noteInputRef={noteInputRef}
+                    />
                 </div>
 
                 <div className="-mx-4 -mb-4 flex shrink-0 flex-col overflow-hidden rounded-b-xl">

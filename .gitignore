@@ -112,6 +112,7 @@ REVIEW.private.md
 
 # Personal project-local AI tooling
 # Keep these rules after the Comet-managed block so local state stays ignored.
+/docs/comet/
 /.codegraph/
 /.comet/
 /.cursor/

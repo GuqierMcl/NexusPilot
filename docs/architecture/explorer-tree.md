@@ -299,7 +299,7 @@ Explorer 的结构管理入口由 action registry、schema designer surface regi
 - 窄宽度下，连接名称是可退让内容：main action 区至少保留箭头、驱动图标和一个省略号的宽度，名称先截断；仅当该最小宽度也无法满足时，trailing slot 才允许收缩并被节点行裁剪。
 - 连接状态不再占用独立圆点列，而是通过驱动图标的低透明圆形背景、状态色 ring 和可选细 rail 表达。
 - 驱动缩写 badge（如 `My`、`Pg`、`Re`、`Or`）移除；数据库类型继续由驱动图标与可访问标签表达。
-- 用户连接标签属于域 A 本地配置空间，是展示元数据，通过连接记录的 `tagLabel` / `tagColor` 字段进入 row trailing slot，不参与连接 runtime、远程 metadata、SQL 执行、结构变更、排序过滤或 AI 上下文。
+- 用户连接标签与备注属于域 A 本地配置空间。标签通过连接记录的 `tagLabel` / `tagColor` 字段进入 row trailing slot；备注通过公共 `note` 字段保存，但不在连接树中渲染。两者都不参与连接 runtime、远程 metadata、SQL 执行、结构变更或排序过滤。
 - Redis `redis_database` 节点可使用通用 `itemCount` 展示该逻辑库 key 总数；Redis 前缀级数量仍由内容区 `browse_key_tree` 展示，避免 Explorer 展开前缀时触发完整 `SCAN MATCH prefix*`。
 
 Phase 1、Phase 2 和 Phase 3 已落地；轻量行内操作仍属于后续阶段。

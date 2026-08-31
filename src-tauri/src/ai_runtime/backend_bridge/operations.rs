@@ -2151,6 +2151,7 @@ mod tests {
                 driver,
                 environment: "development".to_string(),
                 color: Some("#123456".to_string()),
+                note: "Gateway test connection".to_string(),
                 tag_label: "测试".to_string(),
                 tag_color: Some("sky".to_string()),
                 payload,

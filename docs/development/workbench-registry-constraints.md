@@ -87,7 +87,7 @@ Explorer 节点行已按 [Explorer node actions roadmap](../roadmap/explorer-nod
 - trailing slot 只承载辅助展示或轻量操作，例如连接标签、计数、只读提示或未来三点按钮。
 - trailing slot 里的交互控件必须阻止不应冒泡的 pointer/click/double-click 事件，避免误触发选择、拖拽或展开。
 - 不要把驱动专属右侧按钮硬编码进 `ConnectionTreeNode`；如需 driver-specific 行动作，应通过现有 action/contributor 边界扩展。
-- 用户连接标签是本地域 A 展示元数据，当前通过连接记录的 `tagLabel` / `tagColor` 字段进入 row trailing slot；不参与排序、过滤、权限、风险确认、runtime state、远程 metadata 或 AI 上下文。
+- 用户连接标签与备注是本地域 A 公共元数据。标签通过连接记录的 `tagLabel` / `tagColor` 字段进入 row trailing slot；备注使用公共 `note` 字段并仅在连接公共表单中编辑，不由驱动注册表单或连接树渲染。两者不参与排序、过滤、权限、风险确认、runtime state 或远程 metadata。
 
 ### 3.3 远程节点动作
 

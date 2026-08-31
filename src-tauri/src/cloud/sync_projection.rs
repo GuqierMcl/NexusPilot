@@ -28,6 +28,8 @@ pub struct ConnectionSyncProjection {
     pub driver: String,
     pub environment: String,
     pub color: Option<String>,
+    #[serde(default)]
+    pub note: String,
     pub tag_label: String,
     pub tag_color: Option<String>,
     pub folder_id: Option<String>,
@@ -70,6 +72,7 @@ pub fn connection_projection(
         driver: record.driver.as_str().to_string(),
         environment: record.environment.clone(),
         color: record.color.clone(),
+        note: record.note.clone(),
         tag_label: record.tag_label.clone(),
         tag_color: record.tag_color.clone(),
         folder_id: record.folder_id.clone(),
@@ -201,6 +204,7 @@ mod tests {
             driver: ConnectionDriver::Sqlite,
             environment: "development".to_string(),
             color: None,
+            note: "Local development database".to_string(),
             tag_label: String::new(),
             tag_color: None,
             payload: json!({
@@ -239,6 +243,10 @@ mod tests {
             projection.get("localDependencies").unwrap(),
             &json!(["database_file", "ssh_private_key"])
         );
+        assert_eq!(
+            projection.get("note").unwrap(),
+            "Local development database"
+        );
         assert!(!bytes.windows(10).any(|window| window == b"database.s"));
         assert!(!digest.as_base64url().is_empty());
     }
@@ -268,6 +276,55 @@ mod tests {
     }
 
     #[test]
+    fn connection_note_changes_digest_and_defaults_for_legacy_projections() {
+        let record = StoredConnectionRecord {
+            id: "connection-1".to_string(),
+            name: "Postgres".to_string(),
+            driver: ConnectionDriver::Postgres,
+            environment: "development".to_string(),
+            color: None,
+            note: "Primary".to_string(),
+            tag_label: String::new(),
+            tag_color: None,
+            payload: json!({ "host": "db.example.com" }),
+            folder_id: None,
+            created_at: 0,
+            updated_at: 0,
+            last_connected_at: None,
+            last_connection_status: None,
+            last_connection_error: None,
+            sort_order: None,
+        };
+
+        let (_, first_digest) = connection_projection(&record).unwrap();
+        let changed = StoredConnectionRecord {
+            note: "Replica".to_string(),
+            ..record
+        };
+        let (_, second_digest) = connection_projection(&changed).unwrap();
+        assert_ne!(first_digest, second_digest);
+
+        let legacy = json!({
+            "schemaVersion": 1,
+            "assetType": "connection",
+            "id": "legacy-1",
+            "name": "Legacy",
+            "driver": "postgres",
+            "environment": "development",
+            "color": null,
+            "tagLabel": "",
+            "tagColor": null,
+            "folderId": null,
+            "sortOrder": null,
+            "payload": {},
+            "localDependencies": []
+        });
+        let projection: super::ConnectionSyncProjection =
+            serde_json::from_value(legacy).expect("legacy projection should parse");
+        assert_eq!(projection.note, "");
+    }
+
+    #[test]
     fn local_dependencies_follow_connection_semantics_not_field_names() {
         let sqlite = StoredConnectionRecord {
             id: "sqlite-1".to_string(),
@@ -275,6 +332,7 @@ mod tests {
             driver: ConnectionDriver::Sqlite,
             environment: "development".to_string(),
             color: None,
+            note: String::new(),
             tag_label: String::new(),
             tag_color: None,
             payload: json!({ "driver": "sqlite", "dbFilePath": "" }),

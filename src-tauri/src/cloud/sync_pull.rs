@@ -353,10 +353,12 @@ mod tests {
             .len() as u64;
         let result = validate_and_decrypt_page("account-1", 0, page(remote), &keys()).unwrap();
         assert_eq!(result.next_cursor, 1);
-        assert!(matches!(
-            result.items[0].projection,
-            Some(DecryptedSyncProjection::Connection(_))
-        ));
+        match &result.items[0].projection {
+            Some(DecryptedSyncProjection::Connection(projection)) => {
+                assert_eq!(projection.note, "");
+            }
+            other => panic!("expected connection projection, got {other:?}"),
+        }
     }
 
     #[test]

@@ -53,6 +53,7 @@ export interface IBaseConnectionProfile {
     name: string;
     environment: EnvironmentType;
     color?: string;
+    note?: string;
     tagLabel?: string;
     tagColor?: ConnectionTagColor | null;
     createdAt: number;   // Unix ms
@@ -235,6 +236,7 @@ export type IConnectionProfile = IBaseConnectionProfile & (
  * 这是从 Rust 后端读取并在前端 Store 中保存的完整记录类型。
  */
 export type IStoredConnectionProfile = IConnectionProfile & {
+    note: string;
     folderId?: ConnectionFolderId | null;
     sortOrder?: number | null;
     lastConnectedAt?: number | null;

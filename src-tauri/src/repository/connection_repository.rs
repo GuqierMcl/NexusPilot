@@ -122,6 +122,7 @@ pub struct StoredConnectionRecord {
     pub driver: ConnectionDriver,
     pub environment: String,
     pub color: Option<String>,
+    pub note: String,
     pub tag_label: String,
     pub tag_color: Option<String>,
     pub payload: Value,
@@ -142,6 +143,8 @@ pub struct CreateConnectionInput {
     pub driver: ConnectionDriver,
     pub environment: String,
     pub color: Option<String>,
+    #[serde(default)]
+    pub note: String,
     pub tag_label: String,
     pub tag_color: Option<String>,
     pub payload: Value,
@@ -157,6 +160,8 @@ pub struct UpdateConnectionInput {
     pub driver: ConnectionDriver,
     pub environment: String,
     pub color: Option<String>,
+    #[serde(default)]
+    pub note: String,
     pub tag_label: String,
     pub tag_color: Option<String>,
     pub payload: Value,
@@ -173,6 +178,7 @@ struct ConnectionRecordRow {
     driver: String,
     environment: String,
     color: Option<String>,
+    note: String,
     tag_label: String,
     tag_color: Option<String>,
     payload: String,
@@ -195,6 +201,7 @@ impl TryFrom<ConnectionRecordRow> for StoredConnectionRecord {
             driver: ConnectionDriver::from_str(&row.driver)?,
             environment: row.environment,
             color: row.color,
+            note: row.note,
             tag_label: row.tag_label,
             tag_color: row.tag_color,
             payload: serde_json::from_str(&row.payload)?,
@@ -221,7 +228,7 @@ impl ConnectionRepository {
         let rows = sqlx::query_as::<_, ConnectionRecordRow>(
             r#"
             SELECT
-                id, name, driver, environment, color, tag_label, tag_color, payload,
+                id, name, driver, environment, color, note, tag_label, tag_color, payload,
                 folder_id, created_at, updated_at,
                 last_connected_at, last_connection_status, last_connection_error,
                 sort_order
@@ -239,7 +246,7 @@ impl ConnectionRepository {
         let row = sqlx::query_as::<_, ConnectionRecordRow>(
             r#"
             SELECT
-                id, name, driver, environment, color, tag_label, tag_color, payload,
+                id, name, driver, environment, color, note, tag_label, tag_color, payload,
                 folder_id, created_at, updated_at,
                 last_connected_at, last_connection_status, last_connection_error,
                 sort_order
@@ -260,6 +267,7 @@ impl ConnectionRepository {
     ) -> AppResult<StoredConnectionRecord> {
         validate_connection_payload(&input.id, &input.name, &input.payload)?;
         ensure_folder_exists(pool, input.folder_id.as_deref()).await?;
+        let note = normalize_connection_note(&input.note)?;
         let (tag_label, tag_color) =
             normalize_connection_tag(&input.tag_label, input.tag_color.as_deref())?;
 
@@ -269,10 +277,10 @@ impl ConnectionRepository {
         sqlx::query(
             r#"
             INSERT INTO connections (
-                id, name, driver, environment, color, tag_label, tag_color, payload,
+                id, name, driver, environment, color, note, tag_label, tag_color, payload,
                 folder_id, created_at, updated_at, sort_order
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
             "#,
         )
         .bind(&input.id)
@@ -280,6 +288,7 @@ impl ConnectionRepository {
         .bind(input.driver.as_str())
         .bind(&input.environment)
         .bind(input.color.as_deref())
+        .bind(&note)
         .bind(&tag_label)
         .bind(tag_color.as_deref())
         .bind(&payload_json)
@@ -300,6 +309,7 @@ impl ConnectionRepository {
     ) -> AppResult<StoredConnectionRecord> {
         validate_connection_payload(&input.id, &input.name, &input.payload)?;
         ensure_folder_exists(pool, input.folder_id.as_deref()).await?;
+        let note = normalize_connection_note(&input.note)?;
         let (tag_label, tag_color) =
             normalize_connection_tag(&input.tag_label, input.tag_color.as_deref())?;
 
@@ -314,12 +324,13 @@ impl ConnectionRepository {
                 driver      = ?3,
                 environment = ?4,
                 color       = ?5,
-                tag_label   = ?6,
-                tag_color   = ?7,
-                payload     = ?8,
-                folder_id   = ?9,
-                sort_order  = ?10,
-                updated_at  = ?11
+                note        = ?6,
+                tag_label   = ?7,
+                tag_color   = ?8,
+                payload     = ?9,
+                folder_id   = ?10,
+                sort_order  = ?11,
+                updated_at  = ?12
             WHERE id = ?1
             "#,
         )
@@ -328,6 +339,7 @@ impl ConnectionRepository {
         .bind(input.driver.as_str())
         .bind(&input.environment)
         .bind(input.color.as_deref())
+        .bind(&note)
         .bind(&tag_label)
         .bind(tag_color.as_deref())
         .bind(&payload_json)
@@ -389,6 +401,7 @@ fn validate_connection_payload(id: &str, name: &str, payload: &Value) -> AppResu
 }
 
 const CONNECTION_TAG_LABEL_MAX_CHARS: usize = 8;
+const CONNECTION_NOTE_MAX_CHARS: usize = 50;
 const CONNECTION_TAG_COLORS: &[&str] = &[
     "slate", "red", "orange", "amber", "emerald", "teal", "sky", "violet", "pink",
 ];
@@ -401,6 +414,39 @@ fn normalize_connection_tag_label(value: &str) -> AppResult<String> {
         )));
     }
     Ok(trimmed.to_string())
+}
+
+pub(crate) fn normalize_connection_note(value: &str) -> AppResult<String> {
+    let trimmed = value.trim_matches(is_connection_note_boundary_whitespace);
+    if trimmed.chars().count() > CONNECTION_NOTE_MAX_CHARS {
+        return Err(AppError::validation(format!(
+            "Connection note must be at most {CONNECTION_NOTE_MAX_CHARS} characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Shared with TypeScript's `isConnectionNoteBoundaryWhitespace`.
+///
+/// This is the Unicode White_Space property plus U+FEFF (BOM). Listing the
+/// code points explicitly keeps the frontend and Rust normalization boundary
+/// identical instead of inheriting different language-runtime trim rules.
+fn is_connection_note_boundary_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
 }
 
 fn normalize_connection_tag_color(value: Option<&str>) -> AppResult<Option<String>> {
@@ -478,7 +524,8 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::{
-        ConnectionDriver, ConnectionRepository, CreateConnectionInput, UpdateConnectionInput,
+        normalize_connection_note, ConnectionDriver, ConnectionRepository, CreateConnectionInput,
+        UpdateConnectionInput,
     };
 
     fn run_repository_test<F, Fut>(test: F)
@@ -534,6 +581,7 @@ mod tests {
                 driver      TEXT NOT NULL,
                 environment TEXT NOT NULL DEFAULT 'development',
                 color       TEXT,
+                note        TEXT NOT NULL DEFAULT '',
                 tag_label   TEXT NOT NULL DEFAULT '',
                 tag_color   TEXT,
                 payload     TEXT NOT NULL,
@@ -561,6 +609,7 @@ mod tests {
             driver: ConnectionDriver::Mysql,
             environment: "development".to_string(),
             color: None,
+            note: "  Primary database\nOwner: data team  ".to_string(),
             tag_label: "  Dev  ".to_string(),
             tag_color: Some("sky".to_string()),
             payload: json!({ "host": "127.0.0.1", "port": 3306 }),
@@ -582,12 +631,13 @@ mod tests {
     }
 
     #[test]
-    fn create_connection_persists_normalized_tag_metadata() {
+    fn create_connection_persists_normalized_public_metadata() {
         run_repository_test(|pool| async move {
             let record = ConnectionRepository::create(&pool, create_input("profile-1"))
                 .await
                 .expect("connection should be created");
 
+            assert_eq!(record.note, "Primary database\nOwner: data team");
             assert_eq!(record.tag_label, "Dev");
             assert_eq!(record.tag_color.as_deref(), Some("sky"));
 
@@ -595,6 +645,7 @@ mod tests {
                 .await
                 .expect("connections should list");
 
+            assert_eq!(listed[0].note, "Primary database\nOwner: data team");
             assert_eq!(listed[0].tag_label, "Dev");
             assert_eq!(listed[0].tag_color.as_deref(), Some("sky"));
         });
@@ -631,6 +682,7 @@ mod tests {
                     driver: created.driver,
                     environment: created.environment,
                     color: created.color,
+                    note: " \n ".to_string(),
                     tag_label: " ".to_string(),
                     tag_color: None,
                     payload: created.payload,
@@ -641,6 +693,7 @@ mod tests {
             .await
             .expect("connection should update");
 
+            assert_eq!(updated.note, "");
             assert_eq!(updated.tag_label, "");
             assert_eq!(updated.tag_color, None);
         });
@@ -684,6 +737,85 @@ mod tests {
                 error.to_string().contains("Connection tag color"),
                 "unexpected error: {error}"
             );
+        });
+    }
+
+    #[test]
+    fn create_input_defaults_missing_note_for_older_ipc_clients() {
+        let input: CreateConnectionInput = serde_json::from_value(json!({
+            "id": "profile-1",
+            "name": "Legacy client",
+            "driver": "postgres",
+            "environment": "development",
+            "color": null,
+            "tagLabel": "",
+            "tagColor": null,
+            "payload": {},
+            "folderId": null,
+            "sortOrder": null
+        }))
+        .expect("older create input should deserialize");
+
+        assert_eq!(input.note, "");
+    }
+
+    #[test]
+    fn normalizes_the_shared_explicit_note_boundary_whitespace_set() {
+        let normalized = normalize_connection_note("\u{FEFF}数据库备注\u{0085}")
+            .expect("shared boundary whitespace should normalize");
+        assert_eq!(normalized, "数据库备注");
+
+        let internal = normalize_connection_note("数据库\u{0085}备注")
+            .expect("internal whitespace should be preserved");
+        assert_eq!(internal, "数据库\u{0085}备注");
+
+        let fifty = format!("\u{FEFF}{}\u{0085}", "数".repeat(50));
+        assert_eq!(
+            normalize_connection_note(&fifty)
+                .expect("fifty code points should remain within the limit"),
+            "数".repeat(50)
+        );
+
+        let fifty_one = format!("\u{FEFF}{}\u{0085}", "数".repeat(51));
+        assert!(normalize_connection_note(&fifty_one).is_err());
+    }
+
+    #[test]
+    fn rejects_overlong_connection_note_without_updating_existing_record() {
+        run_repository_test(|pool| async move {
+            let created = ConnectionRepository::create(&pool, create_input("profile-1"))
+                .await
+                .expect("connection should be created");
+            let original_note = created.note.clone();
+
+            let error = ConnectionRepository::update(
+                &pool,
+                UpdateConnectionInput {
+                    id: created.id.clone(),
+                    name: created.name,
+                    driver: created.driver,
+                    environment: created.environment,
+                    color: created.color,
+                    note: "🚀".repeat(51),
+                    tag_label: created.tag_label,
+                    tag_color: created.tag_color,
+                    payload: created.payload,
+                    folder_id: created.folder_id,
+                    sort_order: created.sort_order,
+                },
+            )
+            .await
+            .expect_err("overlong note should be rejected");
+
+            assert!(
+                error.to_string().contains("Connection note"),
+                "unexpected error: {error}"
+            );
+            let reloaded = ConnectionRepository::get(&pool, &created.id)
+                .await
+                .expect("connection should load")
+                .expect("connection should still exist");
+            assert_eq!(reloaded.note, original_note);
         });
     }
 }

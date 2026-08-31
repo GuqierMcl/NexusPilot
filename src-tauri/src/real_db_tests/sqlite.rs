@@ -1057,6 +1057,7 @@ fn stored_sqlite_record(payload: serde_json::Value) -> StoredConnectionRecord {
         driver: ConnectionDriver::Sqlite,
         environment: "development".to_string(),
         color: None,
+        note: String::new(),
         tag_label: String::new(),
         tag_color: None,
         payload,
