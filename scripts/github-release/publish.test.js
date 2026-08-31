@@ -109,6 +109,31 @@ describe("GitHub release artifact collection", () => {
     expect(result.latestJson.platforms["linux-x86_64-rpm"]?.url).toEndWith(".rpm");
     expect(result.latestJson.platforms["windows-x86_64"]?.url).toEndWith("-setup.exe");
   });
+
+  test("writes the normalized release payload to an explicit empty output directory", async () => {
+    const inputDir = mkdtempSync(path.join(tmpdir(), "nexpilot-ci-input-"));
+    const parentDir = mkdtempSync(path.join(tmpdir(), "nexpilot-ci-output-parent-"));
+    const outputDir = path.join(parentDir, "release-output");
+    writeFixture(inputDir);
+
+    Object.assign(process.env, {
+      CI_RELEASE_PUBLIC_BASE_URL: "https://downloads.example.test/releases",
+      CI_RELEASE_S3_ENDPOINT: "https://s3.example.test",
+      CI_RELEASE_S3_BUCKET: "nexpilot",
+      CI_RELEASE_S3_PREFIX: "releases",
+      CI_RELEASE_S3_ACCESS_KEY_ID: "test-key",
+      CI_RELEASE_S3_SECRET_ACCESS_KEY: "test-secret",
+    });
+
+    const result = await publishRelease({ version: releaseVersion, inputDir, outputDir, dryRun: true });
+
+    expect(result.outputDir).toBe(path.resolve(outputDir));
+    expect(existsSync(path.join(outputDir, "notes.md"))).toBe(true);
+    expect(existsSync(path.join(outputDir, "checksums.sha256"))).toBe(true);
+
+    await expect(publishRelease({ version: releaseVersion, inputDir, outputDir, dryRun: true }))
+      .rejects.toThrow("发布输出目录必须为空");
+  });
 });
 
 describe("GitHub release S3 multipart upload", () => {

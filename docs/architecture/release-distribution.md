@@ -18,15 +18,17 @@ The published data includes immutable version directories plus small mutable ind
 4. Immutable `releases/vX.Y.Z/**` content is uploaded first.
 5. The release history index is updated.
 6. The latest-release pointer and Tauri updater manifest are updated last.
+7. The same normalized platform artifacts are flattened into a GitHub Release asset set; colliding filenames receive deterministic platform prefixes.
+8. A draft GitHub Release receives the artifacts and a matching checksum manifest, is verified by name, size, and GitHub-computed SHA-256 digest, and is published only when complete.
 
 Updating mutable pointers last prevents clients from observing an incomplete release as current.
 
 ## GitHub Releases and object storage
 
-GitHub Releases may mirror future release artifacts for project discovery and source-hosting convenience. The canonical download and updater URLs remain the public `dl.nexuspilot.dev` boundary unless a separate decision changes that contract. Uploading to both destinations must reuse the same verified artifacts and checksums rather than rebuilding them independently.
+GitHub Releases mirror each CI release for project discovery and source-hosting convenience. The canonical download and updater URLs remain the public `dl.nexuspilot.dev` boundary unless a separate decision changes that contract. Both destinations reuse the same normalized build artifacts; the GitHub mirror regenerates its checksum manifest only to account for the flat asset namespace and deterministic collision prefixes.
 
 ## Failure behavior
 
-Public consumers show a clear unavailable state when release metadata cannot be loaded; they do not silently present bundled stale data as the latest release. Publishing retries must preserve immutable artifact paths and avoid moving the latest pointer until all required artifacts pass verification.
+Public consumers show a clear unavailable state when release metadata cannot be loaded; they do not silently present bundled stale data as the latest release. Publishing retries must preserve immutable artifact paths and avoid moving the latest pointer until all required object-storage artifacts pass verification. GitHub Release retries may resume a draft or accept an already-published exact match, but must never overwrite a mismatched published release.
 
 Operational commands, signing-key handling, and local release verification live in [the release guide](../development/release.md).

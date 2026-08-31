@@ -54,8 +54,8 @@ ${ci}:
   2. bun run release prepare <patch|minor|major|prerelease|prepatch|preminor|premajor|x.y.z>
   3. bun run release finalize
   4. git push --follow-tags
-  5. 推送的 v* tag（例如 v0.9.3）会自动触发 “Desktop S3 Release”。
-  6. CI 完成四平台构建后，会自动发布到对象存储；在 Actions 页面监控结果。
+  5. 推送的 v* tag（例如 v0.9.3）会自动触发 “Desktop Release”。
+  6. CI 完成四平台构建后，会自动发布到对象存储和 GitHub Releases；在 Actions 页面监控结果。
 
   使用这条 CI 路径时，不要再对同一版本执行本地 release build、collect 或 publish，
   避免两个独立发布者同时写入同一个对象存储版本目录。
@@ -64,12 +64,13 @@ ${ci}:
   Linux 发布 DEB、RPM；updater 按安装类型分别使用 linux-x86_64-deb 和
   linux-x86_64-rpm，系统可能要求 pkexec 或 sudo 授权。Windows 延续 NSIS .exe + .sig
   updater；macOS 使用 ad-hoc 应用签名以及 .app.tar.gz + .sig updater archive，首次启动
-  需要用户在“隐私与安全”中选择“仍要打开”。所有用户下载和自动更新继续使用
-  dl.nexuspilot.dev，不使用 GitHub Release Asset。
+  需要用户在“隐私与安全”中选择“仍要打开”。官网用户下载和自动更新
+  继续使用 dl.nexuspilot.dev；GitHub Release Asset 是同批已验证产物的分发镜像。
 
   CI updater 签名使用 repository Actions secrets：TAURI_SIGNING_PRIVATE_KEY 和
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD。自动 publish job 通过 GitHub Environment “release”
-  读取 CI_RELEASE_PUBLIC_BASE_URL、CI_RELEASE_S3_* 对象存储配置与访问凭据。
+  读取 CI_RELEASE_PUBLIC_BASE_URL、CI_RELEASE_S3_* 对象存储配置与访问凭据；GitHub
+  Release 使用 job 自带的 GITHUB_TOKEN，不需要额外 PAT。
   本地发布变量模板见 .env.release.example。
 
 ${files}:

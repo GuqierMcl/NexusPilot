@@ -126,14 +126,39 @@ function parseArgs(args) {
   };
   const version = valueFor("--version");
   const inputDir = valueFor("--input");
+  const outputDir = valueFor("--output");
 
   if (!version || !inputDir) {
-    throw new Error("用法：bun scripts/github-release/publish.mjs --version <version> --input <artifact-dir> [--dry-run]");
+    throw new Error("用法：bun scripts/github-release/publish.mjs --version <version> --input <artifact-dir> [--output <release-dir>] [--dry-run]");
   }
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
     throw new Error(`无效版本号：${version}`);
   }
-  return { version, inputDir: path.resolve(inputDir), dryRun: args.includes("--dry-run") };
+  return {
+    version,
+    inputDir: path.resolve(inputDir),
+    outputDir: outputDir ? path.resolve(outputDir) : undefined,
+    dryRun: args.includes("--dry-run"),
+  };
+}
+
+function prepareOutputDirectory(requestedOutputDir, tag) {
+  if (!requestedOutputDir) {
+    return mkdtempSync(path.join(tmpdir(), `nexpilot-ci-release-${tag}-`));
+  }
+
+  const outputDir = path.resolve(requestedOutputDir);
+  if (existsSync(outputDir)) {
+    if (!statSync(outputDir).isDirectory()) {
+      throw new Error(`发布输出路径不是目录：${outputDir}`);
+    }
+    if (readdirSync(outputDir).length > 0) {
+      throw new Error(`发布输出目录必须为空，避免复用旧产物：${outputDir}`);
+    }
+  } else {
+    mkdirSync(outputDir, { recursive: true });
+  }
+  return outputDir;
 }
 
 function listFilesRecursive(directory) {
@@ -690,7 +715,7 @@ async function uploadAll({ outputDir, tag, config, dryRun }) {
   }
 }
 
-export async function publishRelease({ version, inputDir, dryRun = false }) {
+export async function publishRelease({ version, inputDir, outputDir: requestedOutputDir, dryRun = false }) {
   validateSourceVersion(version);
   const config = resolveConfig();
   const versions = extractPublishedVersions(readFileSync(path.join(rootDir, "CHANGELOG.md"), "utf8"));
@@ -701,7 +726,7 @@ export async function publishRelease({ version, inputDir, dryRun = false }) {
   }
 
   const tag = `v${version}`;
-  const outputDir = mkdtempSync(path.join(tmpdir(), `nexpilot-ci-release-${tag}-`));
+  const outputDir = prepareOutputDirectory(requestedOutputDir, tag);
   const { artifacts, updaterEntries } = collectArtifacts(inputDir, outputDir);
   const notes = formatNotes(currentVersion);
   const generatedAt = new Date().toISOString();

@@ -25,10 +25,10 @@ describe("release help", () => {
     expect(help).toContain("典型流程");
     expect(help).toContain("命令");
     expect(help).toContain("GitHub Actions 跨平台 CI 发布");
-    expect(help).toContain("Desktop S3 Release");
+    expect(help).toContain("Desktop Release");
     expect(help).toContain("v* tag");
     expect(help).toContain("自动触发");
-    expect(help).toContain("自动发布到对象存储");
+    expect(help).toContain("自动发布到对象存储和 GitHub Releases");
     expect(help).not.toContain("publish=false");
     expect(help).not.toContain("publish=true");
     expect(help).toContain("linux-x86_64-deb");
@@ -38,6 +38,7 @@ describe("release help", () => {
     expect(help).toContain("仍要打开");
     expect(help).toContain("TAURI_SIGNING_PRIVATE_KEY");
     expect(help).toContain("CI_RELEASE_S3_*");
+    expect(help).toContain("GITHUB_TOKEN");
     expect(help).toContain("文件");
     expect(help).not.toContain("Typical flow");
   });

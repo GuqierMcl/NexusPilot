@@ -159,23 +159,23 @@ bun run release prepare 0.4.2
 
 ## GitHub Actions 跨平台发布流程
 
-`.github/workflows/desktop-s3-release.yml` 是独立的 CI 发布通道：每次推送匹配 `v*` 的 tag，都会自动构建四个平台产物，并在全部构建成功后发布到对象存储。workflow 另外提供 `workflow_dispatch` 的 `publish_only` 恢复模式，用于复用已有 run 的 artifacts 只执行最终发布 job。
+`.github/workflows/desktop-release.yml` 是独立的 CI 发布通道：每次推送匹配 `v*` 的 tag，都会自动构建四个平台产物，并在全部构建成功后先发布到对象存储，再把同一批已验证产物镜像到 GitHub Releases。workflow 另外提供 `workflow_dispatch` 的 `publish_only` 恢复模式，用于复用已有 run 的 artifacts 只执行最终发布 job。
 
-CI 与本地手工发布脚本拥有独立的构建和发布实现：CI **不得**执行 `bun run release build`、`collect` 或 `publish`。这样本机密钥、目录和 Windows-only 历史归档逻辑不会成为 CI 的隐式前置条件。使用 CI 自动发布时，维护者应执行 `prepare`、`finalize` 和 `git push --follow-tags`，但不得再为同一版本执行本地 `build`、`collect` 或 `publish`，避免两个发布者同时写入同一个对象存储版本目录。
+CI 与本地手工发布脚本拥有独立的构建和发布实现：CI **不得**执行 `bun run release build`、`collect` 或 `publish`。这样本机密钥、目录和 Windows-only 历史归档逻辑不会成为 CI 的隐式前置条件。使用 CI 自动发布时，维护者应执行 `prepare`、`finalize` 和 `git push --follow-tags`，但不得再为同一版本执行本地 `build`、`collect` 或 `publish`，避免两个发布者同时写入同一个对象存储版本目录；GitHub Release 也只由 CI 创建。
 
 发布前的 `Verify release source` job 只执行前端与 AI Runtime 类型检查，以及 `scripts/github-release/` 的发布器测试；它不执行 AI Runtime 全量单元测试。AI Runtime 的全量测试继续由常规 CI 或本地开发验证负责，避免非发布关键测试阻塞跨平台安装包构建。
 
 当四个平台构建已经成功、但最终 publish job 失败时，可以使用恢复模式避免重新构建：
 
 ```bash
-gh workflow run desktop-s3-release.yml \
+gh workflow run desktop-release.yml \
   --ref main \
   -f publish_only=true \
   -f release_tag=vX.Y.Z \
   -f artifact_run_id=<构建成功的 workflow run ID>
 ```
 
-`artifact_run_id` 必须指向 artifacts 尚未过期且四个平台 package job 均成功的 run；恢复模式会从该 run 下载产物，并仍然使用 `release` Environment 执行对象存储发布。
+`artifact_run_id` 必须指向 artifacts 尚未过期且四个平台 package job 均成功的 run；恢复模式会从该 run 下载产物，并仍然使用 `release` Environment 依次执行对象存储和 GitHub Release 发布。对象存储上传可安全重试；若 GitHub Release 草稿已存在，发布器会继续上传并校验，若正式 Release 已经完整发布则直接成功。
 
 GitHub Actions 在标准 GitHub-hosted runner 上原生构建以下四个正式发布目标，不需要 self-hosted runner：
 
@@ -194,6 +194,7 @@ CI 使用两组独立于本地 `.env.release.local` 的 GitHub Secrets：
 
 - 以下 Tauri updater 签名 Secrets 是 **repository Actions secrets**，因为四个 packaging job 都需要生成对应平台的 updater 签名；它们不参与 macOS Gatekeeper 身份认证；
 - 以下 `CI_RELEASE_*` Secrets 仅放入 GitHub Environment `release`，最终 publish job 在四个平台构建均成功后自动运行并读取对象存储凭据。若该 Environment 配置了 required reviewers，job 会先等待审批，再继续发布。
+- GitHub Release 使用 job 自动获得的 `GITHUB_TOKEN`，workflow 仅为最终 publish job 授予 `contents: write`，不需要额外配置 PAT。
 
 ```text
 TAURI_SIGNING_PRIVATE_KEY
@@ -210,7 +211,11 @@ CI_RELEASE_S3_SECRET_ACCESS_KEY
 CI_RELEASE_S3_FORCE_PATH_STYLE              # MinIO 通常为 true
 ```
 
-CI 会生成 `notes.md`、`checksums.sha256`、跨四个原生 target 的 `index.json` 与 Tauri `latest.json`。`latest.json` 包含五个 updater key：`linux-x86_64-deb`、`linux-x86_64-rpm`、`windows-x86_64`、`darwin-x86_64` 和 `darwin-aarch64`。上传顺序固定为：先完整上传 `releases/vX.Y.Z/**`，再更新根 `releases/index.json`，最后更新根 `releases/latest.json`。因此官网和自动更新端点始终使用既有 `https://dl.nexuspilot.dev/releases`，不依赖 GitHub Release Asset。
+CI 会生成 `notes.md`、`checksums.sha256`、跨四个原生 target 的 `index.json` 与 Tauri `latest.json`。`latest.json` 包含五个 updater key：`linux-x86_64-deb`、`linux-x86_64-rpm`、`windows-x86_64`、`darwin-x86_64` 和 `darwin-aarch64`。对象存储上传顺序固定为：先完整上传 `releases/vX.Y.Z/**`，再更新根 `releases/index.json`，最后更新根 `releases/latest.json`。因此官网和自动更新端点始终使用既有 `https://dl.nexuspilot.dev/releases`，GitHub Release Asset 只是附加分发镜像。
+
+对象存储发布并校验成功后，CI 使用 `notes.md` 作为 GitHub Release 正文，将四个平台的安装包、updater payload、签名文件以及一份与 GitHub 资产名称对应的 `checksums.sha256` 上传到草稿 Release。GitHub Release 的资产目录是扁平的，因此两个 macOS 架构中同名的 `.app.tar.gz` 与 `.sig` 会添加 `darwin-x86_64-` 或 `darwin-aarch64-` 前缀；文件内容不变。全部资产按名称、大小和 GitHub 计算的 SHA-256 digest 校验完成后才发布草稿。带有 `-alpha`、`-beta`、`-rc` 等 SemVer 后缀的 tag 会发布为 prerelease，且不会标记为 Latest。
+
+正式 GitHub Release 不会被自动覆盖：恢复运行遇到内容一致的正式 Release 时会直接成功；若已发布资产、标题、正文或 prerelease 状态与当前发布输入不一致，job 会失败并要求人工检查。
 
 CI 发布器对不超过 8 MiB 的文件使用 `PutObject`，更大的文件优先使用 8 MiB 分片的 S3 multipart upload；若对象存储网关或凭据不支持 multipart，会回退为带明确 `ContentLength` 的 Buffer `PutObject`。上传后优先使用 `HeadObject` 校验；若网关对 multipart 对象的 `HeadObject` 返回 403，则用 `ListObjectsV2` 按 key 和文件大小校验。每次上传及校验最多尝试 4 次，使用带抖动的指数退避，失败的 multipart upload 会主动 abort。仅网络瞬断、HTTP 408/429、服务端 5xx、限流和 SDK 标记为可重试的错误会重试；认证、权限、配置、签名和发布内容校验错误会立即失败。
 

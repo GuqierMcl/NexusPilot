@@ -1,4 +1,4 @@
-name: Desktop S3 Release
+name: Desktop Release
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_only:
-        description: "仅执行发布 job，复用已有 run 的构建 artifacts"
+        description: "仅执行发布 job，复用已有 run 的构建 artifacts 发布到 S3 和 GitHub Releases"
         required: false
         default: false
         type: boolean
@@ -25,7 +25,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: desktop-s3-release-${{ github.ref_name }}
+  group: desktop-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -204,7 +204,7 @@ jobs:
           path: src-tauri/target/release/bundle/**
 
   publish:
-    name: Publish to release object storage
+    name: Publish to S3 and GitHub Releases
     needs: package
     if: >-
       always() &&
@@ -213,7 +213,7 @@ jobs:
     environment: release
 
     permissions:
-      contents: read
+      contents: write
       actions: read
 
     env:
@@ -230,7 +230,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -307,5 +307,18 @@ jobs:
             fi
           done
 
-      - name: Publish versioned artifacts and current manifests
-        run: bun scripts/github-release/publish.mjs --version "${RELEASE_TAG#v}" --input release-input
+      - name: Publish versioned artifacts and current manifests to S3
+        run: >-
+          bun scripts/github-release/publish.mjs
+          --version "${RELEASE_TAG#v}"
+          --input release-input
+          --output release-output
+
+      - name: Publish GitHub Release mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          bun scripts/github-release/publish-to-github.mjs
+          --tag "${RELEASE_TAG}"
+          --input release-output
+          --repository "${GITHUB_REPOSITORY}"
