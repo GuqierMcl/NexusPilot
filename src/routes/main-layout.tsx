@@ -6,7 +6,7 @@ import NexusPilotWordmark from "@/assets/nexuspilot-wordmark.svg?react";
 import { AppTitleBar } from "@/components/layout/AppTitleBar";
 import { NavigationRail } from "@/components/layout/NavigationRail";
 import { TitleActions } from "@/components/title-actions";
-import { UpdatePromptBadge } from "@/features/update/UpdatePromptBadge";
+import { UpdatePrompt } from "@/features/update/UpdatePrompt";
 import {
     ResizableHandle,
     ResizablePanel,
@@ -96,7 +96,7 @@ export function MainLayout() {
                 titleActions={
                     <TitleActions onCloudSettingsRequested={() => openSettings("cloud")} />
                 }
-                macosContent={<UpdatePromptBadge />}
+                macosContent={<UpdatePrompt appearance="icon" />}
             >
                 <div
                     data-no-drag="true"
@@ -117,7 +117,7 @@ export function MainLayout() {
                             aria-label="NexusPilot"
                             focusable={false}
                         />
-                        <UpdatePromptBadge />
+                        <UpdatePrompt appearance="icon" />
                     </div>
                 </div>
             </AppTitleBar>

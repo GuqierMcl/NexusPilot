@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { getCurrentReleaseNotes } from "@/features/release-notes/current-release-notes";
-import { UpdatePromptBadge } from "@/features/update/UpdatePromptBadge";
+import { UpdatePrompt } from "@/features/update/UpdatePrompt";
 import { useUpdateController } from "@/features/update/use-update-controller";
 
 type ReleaseNotesState =
@@ -162,7 +162,7 @@ export function AboutPanel() {
                     </span>
                     <div className="flex items-center gap-2">
                         <span className="font-mono text-sm">{version}</span>
-                        <UpdatePromptBadge />
+                        <UpdatePrompt appearance="badge" />
                     </div>
                 </div>
             </div>
