@@ -3,9 +3,12 @@ import { ScrollArea as ScrollAreaPrimitive } from "@base-ui/react/scroll-area"
 
 import { cn } from "@/lib/utils"
 
+type ScrollAreaType = "auto" | "hover"
+
 type ScrollAreaProps = ScrollAreaPrimitive.Root.Props & {
   viewportRef?: React.Ref<HTMLDivElement>
   contentWidth?: "intrinsic" | "viewport"
+  type?: ScrollAreaType
 }
 
 function ScrollArea({
@@ -13,6 +16,7 @@ function ScrollArea({
   children,
   viewportRef,
   contentWidth = "intrinsic",
+  type = "auto",
   ...props
 }: ScrollAreaProps) {
   const content =
@@ -42,7 +46,7 @@ function ScrollArea({
       >
         {content}
       </ScrollAreaPrimitive.Viewport>
-      <ScrollBar />
+      <ScrollBar type={type} />
       <ScrollAreaPrimitive.Corner />
     </ScrollAreaPrimitive.Root>
   )
@@ -51,8 +55,9 @@ function ScrollArea({
 function ScrollBar({
   className,
   orientation = "vertical",
+  type = "auto",
   ...props
-}: ScrollAreaPrimitive.Scrollbar.Props) {
+}: ScrollAreaPrimitive.Scrollbar.Props & { type?: ScrollAreaType }) {
   return (
     <ScrollAreaPrimitive.Scrollbar
       data-slot="scroll-area-scrollbar"
@@ -60,6 +65,8 @@ function ScrollBar({
       orientation={orientation}
       className={cn(
         "flex touch-none p-px transition-colors select-none data-horizontal:h-2.5 data-horizontal:flex-col data-horizontal:border-t data-horizontal:border-t-transparent data-vertical:h-full data-vertical:w-2.5 data-vertical:border-l data-vertical:border-l-transparent",
+        type === "hover" &&
+          "pointer-events-none opacity-0 transition-opacity data-hovering:pointer-events-auto data-hovering:opacity-100 data-scrolling:pointer-events-auto data-scrolling:opacity-100 data-scrolling:duration-0",
         className
       )}
       {...props}

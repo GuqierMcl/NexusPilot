@@ -273,12 +273,14 @@ interface ContentTabScrollAreaProps {
     children: React.ReactNode;
     viewportRef: React.Ref<HTMLDivElement>;
     onWheel: React.WheelEventHandler<HTMLDivElement>;
+    type: "auto" | "hover";
 }
 
 function ContentTabScrollArea({
     children,
     viewportRef,
     onWheel,
+    type,
 }: ContentTabScrollAreaProps) {
     return (
         <ScrollAreaPrimitive.Root
@@ -293,7 +295,7 @@ function ContentTabScrollArea({
             >
                 {children}
             </ScrollAreaPrimitive.Viewport>
-            <ScrollBar orientation="horizontal" />
+            <ScrollBar type={type} orientation="horizontal" />
             <ScrollAreaPrimitive.Corner />
         </ScrollAreaPrimitive.Root>
     );
@@ -402,6 +404,7 @@ export function ContentTabBar() {
                     className="flex h-9 items-stretch border-b bg-muted/30"
                 >
                     <ContentTabScrollArea
+                        type="hover"
                         viewportRef={scrollRef}
                         onWheel={handleWheel}
                     >
