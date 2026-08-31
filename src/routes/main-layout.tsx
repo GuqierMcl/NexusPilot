@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Layout, useGroupRef } from "react-resizable-panels";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import logoSvg from "@/assets/logo.svg";
 import NexusPilotWordmark from "@/assets/nexuspilot-wordmark.svg?react";
@@ -12,11 +13,16 @@ import {
     ResizablePanel,
     ResizablePanelGroup,
 } from "@/components/ui/resizable";
+import { toast } from "@/components/ui/toast";
 import { SettingsDialog } from "@/features/settings/SettingsDialog";
 import {
     DEFAULT_SETTINGS_SECTION,
     type SettingsSection,
 } from "@/features/settings/settings-sections";
+import {
+    DOCUMENTATION_URL,
+    openDocumentation,
+} from "@/routes/open-documentation";
 import {
     WorkbenchAgentPanel,
     WorkbenchContentPanel,
@@ -44,6 +50,18 @@ export function MainLayout() {
 
     const openConnectionsPanel = () => {
         workspaceLayoutStore.setLeftSidebarCollapsed(false);
+    };
+
+    const handleDocumentationClick = (): void => {
+        void openDocumentation({
+            openUrl,
+            reportError: (message) => {
+                console.error(
+                    `Failed to open online documentation at ${DOCUMENTATION_URL}`,
+                );
+                toast.error(message);
+            },
+        });
     };
 
     useEffect(() => {
@@ -125,6 +143,7 @@ export function MainLayout() {
             <div className="flex min-h-0 flex-1">
                 <NavigationRail
                     onConnectionsClick={openConnectionsPanel}
+                    onDocumentationClick={handleDocumentationClick}
                     onSettingsClick={() => openSettings()}
                 />
 

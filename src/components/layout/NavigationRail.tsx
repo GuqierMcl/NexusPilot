@@ -1,8 +1,5 @@
 import type { ComponentType, MouseEventHandler } from "react";
-import {
-    Boxes,
-    Settings,
-} from "lucide-react";
+import { BookOpen, Boxes, Settings } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 
@@ -17,7 +14,20 @@ const topActions: RailAction[] = [
     { label: "连接列表", icon: Boxes, isActive: true },
 ];
 
-const bottomActions: RailAction[] = [{ label: "设置", icon: Settings }];
+interface BottomRailActionHandlers {
+    onDocumentationClick?: MouseEventHandler<HTMLButtonElement>;
+    onSettingsClick?: MouseEventHandler<HTMLButtonElement>;
+}
+
+export function createBottomRailActions({
+    onDocumentationClick,
+    onSettingsClick,
+}: BottomRailActionHandlers): RailAction[] {
+    return [
+        { label: "文档", icon: BookOpen, onClick: onDocumentationClick },
+        { label: "设置", icon: Settings, onClick: onSettingsClick },
+    ];
+}
 
 function RailButton({
     label,
@@ -37,6 +47,7 @@ function RailButton({
             }
             aria-label={label}
             title={label}
+            tooltipSide="right"
             onClick={onClick}
         >
             <Icon className="size-4" />
@@ -58,11 +69,13 @@ function RailGroup({ actions }: { actions: RailAction[] }) {
 
 interface NavigationRailProps {
     onConnectionsClick?: MouseEventHandler<HTMLButtonElement>;
+    onDocumentationClick?: MouseEventHandler<HTMLButtonElement>;
     onSettingsClick?: MouseEventHandler<HTMLButtonElement>;
 }
 
 export function NavigationRail({
     onConnectionsClick,
+    onDocumentationClick,
     onSettingsClick,
 }: NavigationRailProps) {
     const connectionActions: RailAction[] = onConnectionsClick
@@ -71,12 +84,10 @@ export function NavigationRail({
               onClick: onConnectionsClick,
           }))
         : topActions;
-    const settingsActions: RailAction[] = onSettingsClick
-        ? bottomActions.map((action) => ({
-              ...action,
-              onClick: onSettingsClick,
-          }))
-        : bottomActions;
+    const utilityActions = createBottomRailActions({
+        onDocumentationClick,
+        onSettingsClick,
+    });
 
     return (
         <aside className="flex w-14 shrink-0 flex-col justify-between border-r bg-sidebar text-sidebar-foreground">
@@ -85,7 +96,7 @@ export function NavigationRail({
             </div>
 
             <div className="mx-3 border-t border-sidebar-border">
-                <RailGroup actions={settingsActions} />
+                <RailGroup actions={utilityActions} />
             </div>
         </aside>
     );
