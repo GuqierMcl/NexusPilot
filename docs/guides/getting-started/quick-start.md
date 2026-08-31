@@ -42,6 +42,8 @@ LIMIT 20;
 
 现在你已经完成了 NexusPilot 的基本闭环：连接 → 对象浏览 → 数据查看 → 查询执行。
 
+工作台左下角的“文档”按钮会使用系统默认浏览器打开 NexusPilot 在线文档；它位于“设置”按钮上方，不会切换当前连接、面板或标签页。
+
 - 想更系统地组织连接，请阅读[数据库连接](/guides/managing-connections/)。
 - 想理解连接树、标签页和状态如何协作，请阅读[工作台概念](/getting-started/workbench-concepts/)。
 - 遇到连接失败或结果异常时，请查看[故障排查](/help/troubleshooting/)。

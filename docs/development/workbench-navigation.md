@@ -28,7 +28,8 @@ Features that fail these criteria should live inside an existing surface, a sett
 | --- | --- | --- |
 | Connections | Top rail item, default active | Shows the current left explorer connection tree. This is the primary workbench resource entry. |
 | Execution History | Future top rail item | Eligible for the rail, but only after persistent execution records, filtering, detail view, and reopen/reuse flows exist. Until then, do not show a placeholder. |
-| Settings | Bottom rail item | Opens the settings dialog/workspace. Keep it visually separated from workbench resource entries. |
+| Documentation | Bottom utility action, above Settings | Opens `https://docs.nexuspilot.dev` in the system browser. It is not a workbench destination and must not participate in active navigation state. |
+| Settings | Bottom utility action | Opens the settings dialog/workspace. Keep it visually separated from workbench resource entries. |
 | SSH tunnels | Not a top rail item yet | Important connection infrastructure, but currently too narrow for first-level rail placement. Manage it under Connections or Settings until it grows into a broader access asset center. |
 | Code snippets / knowledge context | Not shown | Do not show these as placeholders until they have real product surfaces and persistence/workflow backing. |
 | Driver quick access | Not shown | Keep the middle rail section empty until there is a real driver-level workflow such as favorites, filtered connection views, or fast connection creation. |
@@ -37,7 +38,7 @@ Features that fail these criteria should live inside an existing surface, a sett
 
 The Connections rail item is the default selected item. It maps to the existing `WorkbenchExplorerPanel` and should preserve the current connection tree behavior: folders, connection profiles, saved queries, lazy remote metadata, and live connection status.
 
-The first implementation slice should make the rail honest by replacing placeholder top actions with a real active Connections item and keeping Settings at the bottom. This slice should not add SSH management or execution history implementation.
+The rail keeps one real active workbench destination: Connections. Documentation and Settings are separate bottom utility actions; Documentation opens the public knowledge base externally and Settings opens the local settings dialog. Neither utility action changes the active workbench destination. This slice should not add SSH management or execution history implementation.
 
 ## 5. SSH Tunnel Assets
 
@@ -83,6 +84,8 @@ The rail action for Execution History should open or focus an `execution_history
 Keep the public workbench shell small:
 
 - `NavigationRail` renders actions and active state; it should not own feature-specific business logic.
+- Bottom utility actions must bind their callbacks explicitly. Documentation and Settings must not share a bulk callback mapping.
+- External documentation must open through the existing Tauri opener boundary; do not navigate the WebView or introduce a Rust command for this action.
 - `MainLayout` should not grow a long chain of product-specific `if`/`switch` branches.
 - When a second real left-panel activity is added, introduce a small navigation store and/or left-activity registry before adding more branches.
 - Content surfaces opened from the rail should use the existing Content Tab registry/lifecycle pattern.
@@ -90,7 +93,7 @@ Keep the public workbench shell small:
 
 Recommended future route:
 
-1. First slice: rail honesty. Show Connections and Settings only; remove placeholder top actions.
+1. First slice: rail honesty. Show Connections as the only active destination, with Documentation and Settings as bottom utility actions; remove placeholder top actions.
 2. Second slice: introduce a navigation model/store only when there is at least one additional real destination.
 3. Third slice: build SSH tunnel assets inside Connections or Settings, not as a rail item.
 4. Fourth slice: build persistent Execution History and expose it as a rail item after the content tab is useful.
