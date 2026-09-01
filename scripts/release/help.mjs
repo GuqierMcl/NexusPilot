@@ -63,10 +63,11 @@ ${ci}:
   CI 原生构建 Windows x64、Linux x64、macOS Intel 和 macOS Apple Silicon。
   Linux 发布 DEB、RPM；updater 按安装类型分别使用 linux-x86_64-deb 和
   linux-x86_64-rpm，系统可能要求 pkexec 或 sudo 授权。Windows 延续 NSIS .exe + .sig
-  updater；macOS 使用 .app.tar.gz + .sig updater archive。所有用户下载和自动更新
-  继续使用 dl.nexuspilot.dev，不使用 GitHub Release Asset。
+  updater；macOS 使用 ad-hoc 应用签名以及 .app.tar.gz + .sig updater archive，首次启动
+  需要用户在“隐私与安全”中选择“仍要打开”。所有用户下载和自动更新继续使用
+  dl.nexuspilot.dev，不使用 GitHub Release Asset。
 
-  CI 签名使用 repository Actions secrets：TAURI_SIGNING_PRIVATE_KEY 和
+  CI updater 签名使用 repository Actions secrets：TAURI_SIGNING_PRIVATE_KEY 和
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD。自动 publish job 通过 GitHub Environment “release”
   读取 CI_RELEASE_PUBLIC_BASE_URL、CI_RELEASE_S3_* 对象存储配置与访问凭据。
   本地发布变量模板见 .env.release.example。

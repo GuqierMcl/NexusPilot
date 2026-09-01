@@ -34,6 +34,8 @@ describe("release help", () => {
     expect(help).toContain("linux-x86_64-deb");
     expect(help).toContain("linux-x86_64-rpm");
     expect(help).toContain("dl.nexuspilot.dev");
+    expect(help).toContain("ad-hoc");
+    expect(help).toContain("仍要打开");
     expect(help).toContain("TAURI_SIGNING_PRIVATE_KEY");
     expect(help).toContain("CI_RELEASE_S3_*");
     expect(help).toContain("文件");
