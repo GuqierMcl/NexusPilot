@@ -5,6 +5,7 @@ export interface RuntimeConfig {
   port: number;
   accessToken: string | null;
   dataDir: string;
+  cacheDir: string;
   catalogPath: string;
   providersPath: string;
   runtimeSettingsPath: string;
@@ -19,13 +20,17 @@ export function resolveRuntimeConfig(
   const host = args.host ?? "127.0.0.1";
   const port = parsePort(args.port ?? "8787");
   const dataDir = normalizeOptionalPath(args["data-dir"] ?? env.NEXUS_PILOT_DATA_DIR ?? "");
+  const cacheDir = normalizeOptionalPath(
+    args["cache-dir"] ?? env.NEXUS_PILOT_CACHE_DIR ?? "",
+  );
 
   return {
     host,
     port,
     accessToken: normalizeOptionalSecret(env.NEXUS_PILOT_AI_RUNTIME_ACCESS_TOKEN),
     dataDir,
-    catalogPath: dataDir ? join(dataDir, "catalog.json") : "",
+    cacheDir,
+    catalogPath: cacheDir ? join(cacheDir, "catalog.json") : "",
     providersPath: dataDir ? join(dataDir, "providers.json") : "",
     runtimeSettingsPath: dataDir ? join(dataDir, "runtime-settings.json") : "",
     runtimeDbPath: dataDir ? join(dataDir, "ai-runtime.sqlite3") : "",
@@ -43,6 +48,9 @@ export function applyRuntimeEnvironment(
 ): void {
   if (config.dataDir) {
     env.NEXUS_PILOT_DATA_DIR = config.dataDir;
+  }
+  if (config.cacheDir) {
+    env.NEXUS_PILOT_CACHE_DIR = config.cacheDir;
   }
 }
 

@@ -82,9 +82,9 @@ export interface AppFactoryDeps {
 
 type AppRuntimeConfig = Omit<
   RuntimeConfig,
-  "accessToken" | "runtimeSettingsPath"
+  "accessToken" | "runtimeSettingsPath" | "cacheDir"
 > &
-  Partial<Pick<RuntimeConfig, "accessToken" | "runtimeSettingsPath">>;
+  Partial<Pick<RuntimeConfig, "accessToken" | "runtimeSettingsPath" | "cacheDir">>;
 
 export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps = {}) {
   const logger = deps.logger ?? createRuntimeLogger({ level: "silent" });

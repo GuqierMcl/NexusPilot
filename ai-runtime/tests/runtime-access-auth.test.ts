@@ -7,6 +7,7 @@ const config: RuntimeConfig = {
   port: 8787,
   accessToken: "test-access-token",
   dataDir: "",
+  cacheDir: "",
   catalogPath: "",
   providersPath: "",
   runtimeSettingsPath: "",

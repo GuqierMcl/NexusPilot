@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveRuntimeConfig } from "../src/config";
 import { CatalogService } from "../src/provider/catalog";
 import { sampleModelsDevCatalog } from "../src/testing/fixtures";
 
@@ -50,6 +51,32 @@ describe("CatalogService", () => {
     const metadata = await Bun.file(join(dir, "catalog-metadata.json")).json();
     expect(metadata.version).toBe(1);
     expect(metadata.last_updated_at).toBeGreaterThan(0);
+  });
+
+  test("does not read or migrate a catalog left in the data directory", async () => {
+    const root = tempDir();
+    const dataDir = join(root, "data");
+    const cacheDir = join(root, "cache");
+    const legacyCatalogPath = join(dataDir, "catalog.json");
+    const legacyCatalog = { legacy: { name: "Legacy catalog" } };
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(legacyCatalogPath, JSON.stringify(legacyCatalog));
+
+    const config = resolveRuntimeConfig(
+      ["--data-dir", dataDir, "--cache-dir", cacheDir],
+      {},
+    );
+    const service = new CatalogService({
+      catalogPath: config.catalogPath,
+      fetchCatalog: async () => sampleModelsDevCatalog,
+    });
+
+    expect(await service.get()).toEqual(sampleModelsDevCatalog);
+    expect(await Bun.file(legacyCatalogPath).json()).toEqual(legacyCatalog);
+    expect(await Bun.file(join(cacheDir, "catalog.json")).json()).toEqual(
+      sampleModelsDevCatalog,
+    );
+    expect(await Bun.file(join(cacheDir, "catalog-metadata.json")).exists()).toBe(true);
   });
 
   test("keeps the previous cache when a forced remote refresh fails", async () => {

@@ -11,8 +11,9 @@ use tauri_plugin_shell::ShellExt;
 use super::AI_RUNTIME_LOG_TARGET;
 
 const AI_RUNTIME_SIDECAR_NAME: &str = "ai-runtime";
-const AI_RUNTIME_DATA_DIR_NAME: &str = "ai-runtime";
+const AI_RUNTIME_DIR_NAME: &str = "ai-runtime";
 const AI_RUNTIME_DATA_DIR_ENV: &str = "NEXUS_PILOT_DATA_DIR";
+const AI_RUNTIME_CACHE_DIR_ENV: &str = "NEXUS_PILOT_CACHE_DIR";
 const AI_RUNTIME_ACCESS_TOKEN_ENV: &str = "NEXUS_PILOT_AI_RUNTIME_ACCESS_TOKEN";
 const AI_RUNTIME_LOG_FORMAT_ENV: &str = "NEXUS_PILOT_LOG_FORMAT";
 
@@ -71,24 +72,25 @@ pub fn start_ai_runtime_sidecar<R: Runtime>(
     port: u16,
     access_token: &str,
 ) -> Result<AiRuntimeSidecar, Box<dyn Error>> {
-    let data_dir = app.path().app_data_dir()?.join(AI_RUNTIME_DATA_DIR_NAME);
+    let data_dir = app.path().app_data_dir()?.join(AI_RUNTIME_DIR_NAME);
+    let cache_dir = app.path().app_cache_dir()?.join(AI_RUNTIME_DIR_NAME);
     fs::create_dir_all(&data_dir)?;
+    fs::create_dir_all(&cache_dir)?;
 
-    let port_arg = port.to_string();
     let data_dir_arg = data_dir.to_string_lossy().into_owned();
+    let cache_dir_arg = cache_dir.to_string_lossy().into_owned();
 
     let (mut events, child) = app
         .shell()
         .sidecar(AI_RUNTIME_SIDECAR_NAME)?
-        .args(vec![
-            "--host".to_string(),
-            host.to_string(),
-            "--port".to_string(),
-            port_arg,
-            "--data-dir".to_string(),
-            data_dir_arg.clone(),
-        ])
+        .args(build_ai_runtime_sidecar_args(
+            host,
+            port,
+            &data_dir_arg,
+            &cache_dir_arg,
+        ))
         .env(AI_RUNTIME_DATA_DIR_ENV, data_dir_arg)
+        .env(AI_RUNTIME_CACHE_DIR_ENV, cache_dir_arg)
         .env(AI_RUNTIME_ACCESS_TOKEN_ENV, access_token)
         .env(AI_RUNTIME_LOG_FORMAT_ENV, "json")
         .env("NO_COLOR", "1")
@@ -139,6 +141,24 @@ pub fn start_ai_runtime_sidecar<R: Runtime>(
     })
 }
 
+fn build_ai_runtime_sidecar_args(
+    host: &str,
+    port: u16,
+    data_dir: &str,
+    cache_dir: &str,
+) -> Vec<String> {
+    vec![
+        "--host".to_string(),
+        host.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--data-dir".to_string(),
+        data_dir.to_string(),
+        "--cache-dir".to_string(),
+        cache_dir.to_string(),
+    ]
+}
+
 fn forward_ai_runtime_log_line(pid: u32, line: &[u8]) {
     let line = String::from_utf8_lossy(line);
     let message = format!("[ai-runtime:{pid}] {}", line.trim_end());
@@ -152,5 +172,34 @@ fn forward_ai_runtime_log_line(pid: u32, line: &[u8]) {
         Some(20..) => tauri_plugin_log::log::debug!(target: AI_RUNTIME_LOG_TARGET, "{message}"),
         Some(10..) => tauri_plugin_log::log::trace!(target: AI_RUNTIME_LOG_TARGET, "{message}"),
         _ => tauri_plugin_log::log::info!(target: AI_RUNTIME_LOG_TARGET, "{message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_ai_runtime_sidecar_args;
+
+    #[test]
+    fn builds_sidecar_args_with_independent_data_and_cache_directories() {
+        let args = build_ai_runtime_sidecar_args(
+            "127.0.0.1",
+            8787,
+            "C:/NexusPilot/data/ai-runtime",
+            "C:/NexusPilot/cache/ai-runtime",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8787",
+                "--data-dir",
+                "C:/NexusPilot/data/ai-runtime",
+                "--cache-dir",
+                "C:/NexusPilot/cache/ai-runtime",
+            ]
+        );
     }
 }

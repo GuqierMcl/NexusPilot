@@ -52,11 +52,14 @@ ai-runtime/src/storage/
 └── runtime-migrations.ts        # ordered runtime SQLite migrations
 ```
 
-`resolveRuntimeConfig()` 会在存在 `dataDir` 时派生：
+`resolveRuntimeConfig()` 分别解析用户数据目录与可重建缓存目录，并派生：
 
-- `catalogPath = <dataDir>/catalog.json`
+- `catalogPath = <cacheDir>/catalog.json`
 - `providersPath = <dataDir>/providers.json`
+- `runtimeSettingsPath = <dataDir>/runtime-settings.json`
 - `runtimeDbPath = <dataDir>/ai-runtime.sqlite3`
+
+`dataDir` 来自 `--data-dir` 或 `NEXUS_PILOT_DATA_DIR`；`cacheDir` 来自 `--cache-dir` 或 `NEXUS_PILOT_CACHE_DIR`，两者都以命令行参数优先。缺少 cacheDir 时 catalog 不会回退到 dataDir；旧数据目录中的 catalog 缓存不读取或迁移。
 
 `createApp()` 在 `runtimeDbPath` 存在时会打开并迁移 runtime SQLite 数据库，然后创建 `RuntimeSqliteStore` 并通过 Elysia decorator 暴露为 `runtimeStore`。`createApp()` 自己打开的数据库句柄会绑定到 Elysia `onStop` 生命周期中关闭；外部通过依赖注入传入的 `runtimeDatabase` 仍由调用方负责关闭。启动时若 Store 中存在 stale active Run，Runtime 会将其修复为 `interrupted`，reason 为 `runtime_recovered_stale_run`。
 

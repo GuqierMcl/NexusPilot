@@ -36,31 +36,36 @@ Provider/model 数据分为两层：
 
 | 层 | 来源 | 文件 | 责任 |
 | --- | --- | --- | --- |
-| Preset catalog | models.dev | `catalog.json` | provider/model 元数据基线 |
-| Catalog metadata | Runtime | `catalog-metadata.json` | 最后一次目录更新时间 |
-| User config | 用户设置 | `providers.json` | API key、enabled、自定义 provider/model、disabled models |
+| Preset catalog | models.dev | `<cacheDir>/catalog.json` | provider/model 元数据基线 |
+| Catalog metadata | Runtime | `<cacheDir>/catalog-metadata.json` | 最后一次目录更新时间 |
+| User config | 用户设置 | `<dataDir>/providers.json` | API key、enabled、自定义 provider/model、disabled models |
 
 `catalog.json` 保存 models.dev 原始响应；`catalog-metadata.json` 保存最后一次目录更新时间；`providers.json` 保存用户 overlay。启动时 `ProviderService.initialize()` 读取 catalog，再应用 user config，生成内存中的 `ProviderInfo` 和 `ProviderModel`。
 
 ## 数据目录
 
-`ai-runtime` 的数据目录由 sidecar 启动参数或环境注入，不由业务代码自行猜测路径。目标结构：
+`ai-runtime` 的数据目录与缓存目录由 sidecar 启动参数或环境注入，不由业务代码自行猜测路径。生产宿主分别使用 Tauri `app_data_dir()/ai-runtime` 和 `app_cache_dir()/ai-runtime`。目标结构：
 
 ```text
 <app-data-dir>/ai-runtime/
-├── catalog.json
-├── catalog-metadata.json
 ├── providers.json
+├── runtime-settings.json
 └── ai-runtime.sqlite3
+
+<app-cache-dir>/ai-runtime/
+├── catalog.json
+└── catalog-metadata.json
 ```
 
 当前 provider/model 配置文件：
 
-- `catalogPath`：models.dev 缓存文件。
-- `catalog-metadata.json`：目录最后更新时间；旧版本缓存首次读取时以 `catalog.json` 的文件修改时间回填。
+- `catalogPath`：cacheDir 中的 models.dev 缓存文件。
+- `catalog-metadata.json`：与 catalog 同在 cacheDir，记录目录最后更新时间；同一缓存目录只有 `catalog.json` 时以其文件修改时间回填。
 - `providersPath`：用户 provider 配置文件。
 
 Runtime SQLite 存放 Conversation、Run、Message、Part、ToolCall、Event 和 Trace，不存放 provider API key。
+
+cacheDir 缺失时不回退到 dataDir。旧数据目录中的 `catalog.json` 和 `catalog-metadata.json` 不读取、不迁移也不清理；新缓存目录为空时直接沿用首次无缓存的远端获取与失败行为。
 
 ## Catalog 加载策略
 
@@ -211,7 +216,7 @@ POST   /v1/catalog/refresh
 }
 ```
 
-该时间只在成功写入远端目录时更新；旧 `catalog.json` 在首次读取时使用其文件修改时间回填，保证设置页能够展示已有缓存的上次更新时间。
+该时间只在成功写入远端目录时更新；cacheDir 中只有 `catalog.json` 时，在首次读取时使用其文件修改时间回填，保证设置页能够展示已有缓存的上次更新时间。
 
 `PUT /v1/providers/:providerId/config` 的字段语义：
 

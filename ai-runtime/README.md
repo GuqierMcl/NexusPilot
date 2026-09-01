@@ -27,8 +27,17 @@ bun run dev:all
 
 ```bash
 bun --cwd=ai-runtime run dev -- --host 0.0.0.0 --port 8787
-bun --cwd=ai-runtime run start -- --host 127.0.0.1 --port 8787 --data-dir D:/tmp/nexpilot-ai-runtime
+bun --cwd=ai-runtime run start -- --host 127.0.0.1 --port 8787 --data-dir D:/nexpilot/data --cache-dir D:/nexpilot/cache
 ```
+
+## 存储目录
+
+AI Runtime 将用户数据与可重建缓存分开：
+
+- `--data-dir` 或 `NEXUS_PILOT_DATA_DIR` 保存 `providers.json`、`runtime-settings.json` 和 `ai-runtime.sqlite3`。
+- `--cache-dir` 或 `NEXUS_PILOT_CACHE_DIR` 保存 models.dev 的 `catalog.json` 和 `catalog-metadata.json`。
+
+同类配置中命令行参数优先于环境变量。生产 sidecar 由 Tauri 使用应用专属的 `app_data_dir()/ai-runtime` 与 `app_cache_dir()/ai-runtime` 注入这两个目录；开发环境可以复制 `.env.example` 后分别设置。启动日志会分别输出已解析的 `dataDir` 与 `cacheDir`；缓存目录缺失时会记录 catalog 磁盘缓存不可用的警告，不会回退到数据目录，也不会读取或迁移旧数据目录中的 catalog 缓存。
 
 ## API 文档
 
@@ -119,7 +128,7 @@ Runtime sidecar 是专职本地服务，不使用综合业务后端常见的 `/a
 
 Logger 默认会脱敏 API key、authorization、cookie、连接密码等字段。不要在业务代码中记录完整 prompt、数据库结果集、连接 payload 或其他敏感数据。
 
-生产环境由 Tauri 启动 sidecar，并强制注入 `NEXUS_PILOT_LOG_FORMAT=json` 与 `NO_COLOR=1`。sidecar 不自行打开日志文件；stdout/stderr 由 Tauri 接收，按 Pino level 转写到 `%LOCALAPPDATA%\\NexusPilot\\logs\\ai-runtime.log`。该文件与 Tauri 主进程的 `nexuspilot.log` 物理分离，均使用 2 MiB 单文件上限和当前文件加 7 个归档的轮转策略。
+生产环境由 Tauri 启动 sidecar，并强制注入 `NEXUS_PILOT_LOG_FORMAT=json` 与 `NO_COLOR=1`。sidecar 不自行打开日志文件；stdout/stderr 由 Tauri 接收，按 Pino level 转写到 Tauri `app_log_dir()` 下的 `ai-runtime.log`。该文件与 Tauri 主进程的 `nexuspilot.log` 物理分离，均使用 2 MiB 单文件上限和当前文件加 7 个归档的轮转策略；日志目录不属于 `dataDir` 或 `cacheDir`。
 
 设置 `NEXUS_PILOT_LOG_LEVEL=debug` 后，自动会话标题流程会记录调用开始、模型响应、条件更新跳过和持久化完成，并只输出稳定标识、耗时、长度、usage 与跳过原因等诊断字段，不输出首条用户原文或标题正文。
 
