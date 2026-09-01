@@ -8,6 +8,7 @@ description: NexusPilot 官方信息入口，包含产品信息、发布下载�
 ## 官方入口
 
 - 产品首页：[NexusPilot](https://nexuspilot.dev/)
+- 应用内入口：打开“设置 → 关于”，点击“官网”
 - 文档入口：[NexusPilot 文档](/)
 - 发布日志：[查看发布记录](/releases/)
 - 下载入口：[下载 NexusPilot](https://nexuspilot.dev/#download)
@@ -23,9 +24,8 @@ description: NexusPilot 官方信息入口，包含产品信息、发布下载�
 ## 反馈与联系
 
 - 邮箱：[support@nexuspilot.dev](mailto:support@nexuspilot.dev)
-- QQ 群：`1054453561`
 
-反馈问题时，请尽量附上应用版本、操作系统、数据源类型、错误信息和可复现步骤。请勿在邮件、群聊截图或日志中发送密码、访问令牌、完整连接字符串或敏感业务数据。
+反馈问题时，请尽量附上应用版本、操作系统、数据源类型、错误信息和可复现步骤。请勿在邮件、截图或日志中发送密码、访问令牌、完整连接字符串或敏感业务数据。
 
 ## 信息更新
 

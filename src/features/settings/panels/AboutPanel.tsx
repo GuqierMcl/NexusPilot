@@ -1,14 +1,20 @@
 import { useEffect, useState } from "react";
 
-import { Loader2Icon } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { ExternalLinkIcon, Loader2Icon } from "lucide-react";
 
 import logoSvg from "@/assets/logo.svg";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { toast } from "@/components/ui/toast";
 import { getCurrentReleaseNotes } from "@/features/release-notes/current-release-notes";
 import { UpdatePrompt } from "@/features/update/UpdatePrompt";
 import { useUpdateController } from "@/features/update/use-update-controller";
+import {
+    PRODUCT_WEBSITE_URL,
+    openProductWebsite,
+} from "@/routes/open-product-website";
 
 type ReleaseNotesState =
     | { status: "idle" | "loading" }
@@ -136,21 +142,45 @@ export function AboutPanel() {
         };
     }, []);
 
+    const handleProductWebsiteClick = (): void => {
+        void openProductWebsite({
+            openUrl,
+            reportError: (message) => {
+                console.error(
+                    `Failed to open NexusPilot website at ${PRODUCT_WEBSITE_URL}`,
+                );
+                toast.error(message);
+            },
+        });
+    };
+
     return (
         <div className="space-y-6">
-            <div className="flex items-center gap-3">
-                <img
-                    src={logoSvg}
-                    alt=""
-                    className="size-10 shrink-0"
-                    draggable={false}
-                />
-                <div>
-                    <h3 className="font-medium">NexusPilot</h3>
-                    <p className="text-xs text-muted-foreground">
-                        下一代 AI 原生数据库工作台
-                    </p>
+            <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-3">
+                    <img
+                        src={logoSvg}
+                        alt=""
+                        className="size-10 shrink-0"
+                        draggable={false}
+                    />
+                    <div className="min-w-0">
+                        <h3 className="font-medium">NexusPilot</h3>
+                        <p className="truncate text-xs text-muted-foreground">
+                            下一代 AI 原生数据库工作台
+                        </p>
+                    </div>
                 </div>
+                <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={handleProductWebsiteClick}
+                >
+                    官网
+                    <ExternalLinkIcon data-icon="inline-end" />
+                </Button>
             </div>
 
             <Separator />
@@ -189,12 +219,6 @@ export function AboutPanel() {
                         邮箱
                     </span>
                     <span className="font-mono text-sm">support@nexuspilot.dev</span>
-                </div>
-                <div className="flex items-center justify-between">
-                    <span className="text-sm text-muted-foreground">
-                        QQ 群
-                    </span>
-                    <span className="font-mono text-sm">1054453561</span>
                 </div>
             </div>
 
