@@ -1,8 +1,15 @@
 import type { ReactNode } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
+import { Badge } from "@/components/ui/badge";
+import { toast } from "@/components/ui/toast";
+import type { SettingsPanelProps } from "@/features/settings/settings-sections";
+import {
+    PRODUCT_DOWNLOAD_URL,
+    openProductDownload,
+} from "@/routes/open-product-download";
 import type { AiRuntimeHealthStatus } from "@/store/slices/ai-runtime-endpoint-slice";
 import { useAiRuntimeEndpointStore } from "@/store/slices/ai-runtime-endpoint-slice";
-import { Badge } from "@/components/ui/badge";
 import {
     Item,
     ItemActions,
@@ -11,6 +18,11 @@ import {
     ItemGroup,
     ItemTitle,
 } from "@/components/ui/item";
+
+import {
+    AiRuntimeVersionMismatchAlert,
+    getAiRuntimeVersionMismatch,
+} from "./ai-runtime-version-mismatch-alert";
 
 function formatHealthStatus(status: AiRuntimeHealthStatus): string {
     const labels: Record<AiRuntimeHealthStatus, string> = {
@@ -104,7 +116,7 @@ function ReadonlyInfoRow({
     );
 }
 
-export function AiRuntimePanel() {
+export function AiRuntimePanel({ appVersion }: SettingsPanelProps) {
     const endpoint = useAiRuntimeEndpointStore((state) => state.endpoint);
     const healthStatus = useAiRuntimeEndpointStore(
         (state) => state.healthStatus,
@@ -119,9 +131,30 @@ export function AiRuntimePanel() {
     const backendBridge = useAiRuntimeEndpointStore(
         (state) => state.backendBridge,
     );
+    const versionMismatch = getAiRuntimeVersionMismatch(appVersion, version);
+
+    const handleOpenDownload = (): void => {
+        void openProductDownload({
+            openUrl,
+            reportError: (message) => {
+                console.error(
+                    `Failed to open the NexusPilot download page at ${PRODUCT_DOWNLOAD_URL}`,
+                );
+                toast.error(message);
+            },
+        });
+    };
 
     return (
         <div className="flex flex-col gap-6">
+            {versionMismatch ? (
+                <AiRuntimeVersionMismatchAlert
+                    appVersion={versionMismatch.appVersion}
+                    runtimeVersion={versionMismatch.runtimeVersion}
+                    onOpenDownload={handleOpenDownload}
+                />
+            ) : null}
+
             <section className="flex flex-col gap-3">
                 <h4 className="text-sm font-medium">运行状态</h4>
                 <ItemGroup className="gap-0 rounded-lg bg-muted/60 p-2">

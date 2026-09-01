@@ -22,7 +22,7 @@ export function SettingsWorkspace({
     onActiveSectionChange,
     className,
 }: SettingsWorkspaceProps) {
-    const [appVersion, setAppVersion] = useState("0.1.0");
+    const [appVersion, setAppVersion] = useState<string | null>(null);
     const activeSectionConfig =
         SETTINGS_SECTIONS.find((section) => section.key === activeSection) ??
         SETTINGS_SECTIONS[0];
@@ -31,7 +31,10 @@ export function SettingsWorkspace({
     useEffect(() => {
         getVersion()
             .then(setAppVersion)
-            .catch(() => setAppVersion("0.1.0"));
+            .catch((error: unknown) => {
+                console.error("Failed to read the NexusPilot version", error);
+                setAppVersion(null);
+            });
     }, []);
 
     return (
@@ -79,7 +82,7 @@ export function SettingsWorkspace({
 
                 <div className="mt-auto px-3 pb-1 text-sm text-muted-foreground">
                     <p className="font-medium">NexusPilot</p>
-                    <p>{appVersion}</p>
+                    <p>{appVersion ?? "未知"}</p>
                 </div>
             </nav>
 
@@ -94,7 +97,10 @@ export function SettingsWorkspace({
 
                 <ScrollArea className="min-h-0 flex-1 pt-5">
                     <div className="pr-3 pl-1 pb-1">
-                        <ActivePanel onNavigate={onActiveSectionChange} />
+                        <ActivePanel
+                            onNavigate={onActiveSectionChange}
+                            appVersion={appVersion}
+                        />
                     </div>
                 </ScrollArea>
             </section>

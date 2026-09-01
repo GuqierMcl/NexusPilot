@@ -26,6 +26,7 @@ import { NotificationSettingsPanel } from "./panels/NotificationSettingsPanel";
 
 export type SettingsPanelProps = {
     onNavigate?: (section: SettingsSection) => void;
+    appVersion?: string | null;
 };
 
 interface SettingsSectionDefinition {
