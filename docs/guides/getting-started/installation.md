@@ -1,6 +1,6 @@
 ---
 title: 安装与更新
-description: 在 Windows 上安装 NexusPilot、确认版本并安全地保持更新。
+description: 在 Windows 或 macOS 上安装 NexusPilot、确认版本并安全地保持更新。
 ---
 
 ## 安装 NexusPilot
@@ -8,6 +8,16 @@ description: 在 Windows 上安装 NexusPilot、确认版本并安全地保持�
 当前公开下载渠道和平台状态以[官网下载区](https://nexuspilot.dev/#download)为准。下载完成后，运行安装程序并按系统提示完成安装。
 
 首次启动时，NexusPilot 会创建保存本地应用配置所需的目录和数据。安装与升级不会要求你把数据库连接信息交给网页端。
+
+### Windows
+
+下载 Windows x64 安装包，运行安装程序并按提示完成安装。如果 Windows 显示安全提示，请先确认文件来自官网下载区，再查看发布日志和安装包校验信息。
+
+### macOS
+
+根据设备处理器下载 Apple Silicon 或 Intel DMG，打开磁盘映像后，将 `NexusPilot.app` 拖入“应用程序”。当前公开 macOS 包使用 ad-hoc 代码签名，CI 会验证应用包签名完整性，但 Apple 不会将其显示为已认证开发者应用。
+
+首次启动时，请先尝试打开 NexusPilot。若 macOS 阻止启动，请打开“系统设置 → 隐私与安全”，在安全区域找到 NexusPilot，点击“仍要打开”并完成系统确认。只应对从官网下载且校验信息一致的安装包执行此操作。
 
 ## 开始前的准备
 
@@ -24,7 +34,7 @@ description: 在 Windows 上安装 NexusPilot、确认版本并安全地保持�
 
 启动应用后，确认工作台能够正常打开。接下来可以继续阅读[5 分钟快速开始](/getting-started/quick-start/)，完成一次连接、对象浏览和查询。
 
-如果应用无法启动，或 Windows 阻止安装，请先查看[故障排查](/help/troubleshooting/)。
+如果应用无法启动，或操作系统阻止安装，请先查看[故障排查](/help/troubleshooting/)。
 
 ## 更新
 

@@ -188,9 +188,11 @@ GitHub Actions 在标准 GitHub-hosted runner 上原生构建以下四个正式�
 
 每个 job 都原生编译 Bun `ai-runtime` sidecar。不得把 x64 构建产物复制给 Apple Silicon job，也不得把交叉编译得到的 Tauri 主程序与 host 架构 sidecar 混包。GitHub-hosted macOS ARM64 runner 有部分社区 action 兼容性限制；本 workflow 使用的 Actions 官方 action 与 Bun/Rust 安装步骤均可运行在 ARM64。
 
+macOS packaging job 当前显式设置 `APPLE_SIGNING_IDENTITY=-`，为 `.app` 及其内嵌二进制生成完整的 ad-hoc 签名。该模式无需 Apple Developer Program，但无法提供 Developer ID 身份或 Apple 公证票据；用户首次启动时需要在“系统设置 → 隐私与安全”中选择“仍要打开”。上传 CI artifact 前必须通过 `codesign --verify --deep --strict`、`Signature=adhoc` 检查和 `hdiutil verify`，任何一项失败都会终止对应平台的 package job。
+
 CI 使用两组独立于本地 `.env.release.local` 的 GitHub Secrets：
 
-- 以下 Tauri 签名 Secrets 是 **repository Actions secrets**，因为四个 packaging job 都需要生成对应平台的 updater 签名；
+- 以下 Tauri updater 签名 Secrets 是 **repository Actions secrets**，因为四个 packaging job 都需要生成对应平台的 updater 签名；它们不参与 macOS Gatekeeper 身份认证；
 - 以下 `CI_RELEASE_*` Secrets 仅放入 GitHub Environment `release`，最终 publish job 在四个平台构建均成功后自动运行并读取对象存储凭据。若该 Environment 配置了 required reviewers，job 会先等待审批，再继续发布。
 
 ```text

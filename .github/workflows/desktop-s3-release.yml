@@ -155,9 +155,45 @@ jobs:
             bun run tauri signer sign "$package"
           done < <(find src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.rpm' \) -print0)
 
-      - name: Build signed native installers and updater artifacts
-        if: runner.os != 'Linux'
+      - name: Build Windows installer and updater artifacts
+        if: runner.os == 'Windows'
         run: bun run tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Build macOS ad-hoc installer and updater artifacts
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: bun run tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Verify macOS ad-hoc application signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app_path="src-tauri/target/release/bundle/macos/NexusPilot.app"
+          dmg_path="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+          if [[ ! -d "$app_path" ]]; then
+            echo "::error::缺少 macOS 应用包：$app_path"
+            exit 1
+          fi
+
+          if [[ -z "$dmg_path" ]]; then
+            echo "::error::缺少 macOS DMG 安装包"
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=4 "$app_path"
+          signature_info="$(codesign --display --verbose=4 "$app_path" 2>&1)"
+          echo "$signature_info"
+
+          if [[ "$signature_info" != *"Signature=adhoc"* ]]; then
+            echo "::error::macOS 应用未生成完整的 ad-hoc 签名"
+            exit 1
+          fi
+
+          hdiutil verify "$dmg_path"
 
       - name: Upload platform bundle directory
         uses: actions/upload-artifact@v7
