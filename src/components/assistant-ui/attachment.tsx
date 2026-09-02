@@ -186,23 +186,28 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ src }) => {
   );
 };
 
-const AttachmentPreviewDialog: FC<PropsWithChildren<{ src?: string }>> = ({ children, src }) => {
-  if (!src) return children;
+const AttachmentPreviewDialog: FC<
+  PropsWithChildren<{ enabled: boolean; src?: string }>
+> = ({ children, enabled, src }) => {
+  if (!enabled) return children;
 
   return (
     <Dialog>
       <DialogTrigger
+        disabled={!src}
         className="aui-attachment-preview-trigger hover:bg-accent/50 cursor-pointer transition-colors"
         render={children as ReactElement}
       />
-      <DialogContent className="aui-attachment-preview-dialog-content [&>button]:bg-foreground/60 [&_svg]:text-background [&>button]:hover:[&_svg]:text-destructive p-2 sm:max-w-3xl [&>button]:rounded-full [&>button]:p-1 [&>button]:opacity-100 [&>button]:ring-0!">
-        <DialogTitle className="aui-sr-only sr-only">
-          Image Attachment Preview
-        </DialogTitle>
-        <div className="aui-attachment-preview bg-background relative mx-auto flex max-h-[80dvh] w-full items-center justify-center overflow-hidden">
-          <AttachmentPreview src={src} />
-        </div>
-      </DialogContent>
+      {src ? (
+        <DialogContent className="aui-attachment-preview-dialog-content [&>button]:bg-foreground/60 [&_svg]:text-background [&>button]:hover:[&_svg]:text-destructive p-2 sm:max-w-3xl [&>button]:rounded-full [&>button]:p-1 [&>button]:opacity-100 [&>button]:ring-0!">
+          <DialogTitle className="aui-sr-only sr-only">
+            Image Attachment Preview
+          </DialogTitle>
+          <div className="aui-attachment-preview bg-background relative mx-auto flex max-h-[80dvh] w-full items-center justify-center overflow-hidden">
+            <AttachmentPreview src={src} />
+          </div>
+        </DialogContent>
+      ) : null}
     </Dialog>
   );
 };
@@ -299,7 +304,10 @@ const AttachmentUI: FC = () => {
             "aui-attachment-root-message only:*:first:size-24",
         )}
       >
-        <AttachmentPreviewDialog src={attachmentSource.src}>
+        <AttachmentPreviewDialog
+          enabled={isImage}
+          src={attachmentSource.src}
+        >
           <TooltipTrigger
             render={
               <div

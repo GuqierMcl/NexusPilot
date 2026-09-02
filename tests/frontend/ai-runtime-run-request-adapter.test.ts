@@ -300,7 +300,7 @@ describe("formatRunRequestAdapterError", () => {
                     { partType: "file" },
                 ),
             ),
-        ).toBe("当前版本暂不支持此输入类型");
+        ).toBe("当前阶段暂不支持 file 输入。");
 
         expect(
             formatRunRequestAdapterError(

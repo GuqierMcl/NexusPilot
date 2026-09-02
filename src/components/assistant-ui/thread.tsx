@@ -615,7 +615,7 @@ const Composer: FC<{ variant: ThreadVariant }> = ({ variant }) => {
         >
           <ComposerAttachments />
           <ComposerPrimitive.Input
-            placeholder="询问数据库问题..."
+            placeholder="尽管说，什么都可以..."
             className={cn(
               "aui-composer-input placeholder:text-muted-foreground/80 w-full resize-none bg-transparent outline-none",
               isWorkbench
