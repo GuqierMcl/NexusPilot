@@ -970,7 +970,7 @@ AI SDK / assistant-ui 的默认请求体可能包含 `messages`、`system`、`to
 | `model.provider_id` | yes | 第一版调用方显式选择 provider；后续可由默认模型策略接管。 |
 | `model.model_id` | yes | 第一版调用方显式选择 model；后续可由默认模型策略接管。 |
 | `agent_mode` | yes | 语义化内置 agent 运行模式，默认 `ask`，第一版支持 `ask` / `query` / `agent`。 |
-| `input.parts` | yes | 必填且非空；第一版仅支持 text part。 |
+| `input.parts` | yes | 必填且非空；接受有序 `text` part 和只含最终 `attachment_id` 的 `file` part，允许纯附件。 |
 | `metadata` | yes | 仅用于轻量 trace/debug，不承载业务事实或 prompt 控制。 |
 | `text` | no | 已由 `input.parts` 替代，不能作为长期公开字段。 |
 | `messages` | no | Runtime Store 是历史上下文事实来源，调用方不传完整历史。 |
@@ -980,23 +980,30 @@ AI SDK / assistant-ui 的默认请求体可能包含 `messages`、`system`、`to
 | `tools` | no | 工具策略不由调用方控制，当前 `web_fetch` 也通过 Agent Definition / Tool Policy / ToolRegistry 暴露。 |
 | `config` / `callSettings` | no | AI SDK / assistant-ui 的 transport 扩展字段，不能作为 Runtime 公开控制面。 |
 
-输入 part 的设计借鉴 OpenCode 的 `parts` 思路，也贴合 AI SDK user message content 可以使用 part array 的能力。但 NexusPilot 不照搬 OpenCode 的 workspace/file/agent/subtask 语义。第一版公开类型只需要：
+输入 part 的设计借鉴 OpenCode 的 `parts` 思路，也贴合 AI SDK user message content 可以使用 part array 的能力。但 NexusPilot 不照搬 OpenCode 的 workspace/file/agent/subtask 语义。当前公开类型为：
 
 ```ts
-type RunInputPart = TextInputPart;
+type RunInputPart = TextInputPart | FileInputPart;
 
 interface TextInputPart {
   type: "text";
   text: string;
 }
+
+interface FileInputPart {
+  type: "file";
+  attachment_id: string; // 仅接受最终 att_*
+}
 ```
 
-后续可以扩展为 file、context reference 或 selection reference，但必须先明确 Runtime Store、artifact/blob、权限和 UI projection 的事实边界，再进入公开 contract：
+附件必须先经专用上传 API 保存到 Runtime `dataDir` 并取得最终 `att_*`；Run 不接收或获取文件字节，也拒绝 `upl_*`、Base64/data URL、HTTP/Blob URL、本地路径、Provider file ID 和客户端声明的文件名或媒体类型。`commitRunStart` 在同一 SQLite 事务内复核 Attachment/Blob 状态和不可变快照，保存 Message FilePart 与 `runtime_message_attachments` 引用。随后模型投影从 Blob Store 读取 bytes，并保留 text/file 顺序。
+
+后续仍可扩展 context reference 或 selection reference，但必须先明确 Runtime Store、权限和 UI projection 的事实边界，再进入公开 contract：
 
 ```ts
 type FutureRunInputPart =
   | { type: "text"; text: string }
-  | { type: "file"; mime_type: string; filename?: string; url?: string; data_ref?: string }
+  | { type: "file"; attachment_id: string }
   | {
       type: "context_ref";
       ref_type: "sql_selection" | "editor_document" | "connection" | "schema" | "table" | "query_result";
@@ -1006,7 +1013,7 @@ type FutureRunInputPart =
   | { type: "artifact_ref"; artifact_id: string };
 ```
 
-上述 future part 只是方向约束，不代表当前已经实现。当前实现计划应先把 parser、OpenAPI 和 route tests 从旧的顶层 `text` 迁移到 `input.parts`，并在遇到非 text part 时返回明确的 422。
+其中 `text` 与 `file` 已实现；其余 future part 只是方向约束，不代表当前已经开放。附件读取失败或 Provider 在 stream 建立前拒绝附件时，Runner 返回带 Runtime headers 的 AI SDK-compatible failure stream，并以受控 `onError` 防止泄露 Provider body、headers、凭据、附件内容或本地路径。
 
 ## OpenCode 借鉴策略
 

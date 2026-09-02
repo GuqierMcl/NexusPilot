@@ -138,7 +138,7 @@ Model 字段语义：
 
 `supportsTools` 会直接影响 L3 per-Run Tool resolver：模型不支持 tool calling 时，候选 Tool 会以 `provider_tools_unsupported` 进入 Snapshot unavailable facts，Run 仍退化为普通问答。支持工具的模型会由 L5-A adapter 只接收当前 Snapshot active Tools。
 
-`attachment`、`modalities`、`structured_output`、`interleaved` 和 `temperature` 目前是模型目录与设置页的能力事实；它们不会自动扩大 NexusPilot 当前 Run 输入协议。第一版 `/v1/runs` 仍只接收 text input part，因此设置页显示图像、音频、视频或 PDF 模态不代表应用已开放对应上传入口。
+`attachment`、`modalities`、`structured_output`、`interleaved` 和 `temperature` 是模型目录与设置页的能力事实。聊天附件入口已经开放，但 `supportsVision`、`supportsAttachments`、`inputModalities` 等目录字段不参与附件上传或发送门禁：Runtime 只验证附件协议、安全、完整性和资源限制，然后把本地 bytes 投影为 AI SDK 标准 `file` part。adapter 或上游 Provider/Model 不接受某种附件时，当前 Run 明确失败并显示脱敏错误；系统不静默删除附件、不自动换模型，也不降级为纯文本重试。
 
 自定义 OpenAI-compatible 模型的工具能力默认是**开启**：模型定义省略 `capabilities.supports_tools` 时，Runtime 按 `true` 处理。只有显式写入 `false` 才会禁用工具调用。这个默认值适用于历史 `providers.json`，无需迁移；设置页编辑时也必须保留已保存的显式能力值。
 
@@ -291,6 +291,8 @@ Run 创建请求只携带：
 4. 检查 model 是否启用。
 5. 根据 `apiProtocol` 创建 AI SDK `LanguageModel`。
 6. 生成 Runtime context 中的 provider/model capability snapshot。
+
+该 capability snapshot 可用于展示、Prompt 与既有 Tool Policy，但不得用于决定聊天附件是否可以进入 Run。附件内容只能由 Runtime Attachment Store 读取并作为 bytes 交给 AI SDK；本地内容 URL、Runtime access token 和文件系统路径不得传给 Provider。
 
 错误映射：
 

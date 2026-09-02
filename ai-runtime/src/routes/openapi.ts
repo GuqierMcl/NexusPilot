@@ -13,6 +13,8 @@ export interface OpenApiSchema {
   items?: OpenApiSchema;
   oneOf?: OpenApiSchema[];
   minimum?: number;
+  minItems?: number;
+  pattern?: string;
 }
 
 export function jsonRequestBody(

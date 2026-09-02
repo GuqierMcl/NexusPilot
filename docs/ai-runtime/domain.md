@@ -104,7 +104,7 @@ Run 终态包含 `completed`、`failed`、`interrupted`；历史 `cancelled` 占
 - `diff`
 - `error`
 
-其中 `text` 已由 text-only Run 使用；`tool` 和 `source` 已由 Runtime-local `web_fetch` 在工具完成边界生成。AI SDK stream 中的 `text` / `reasoning` delta 会在 Runtime 内存中按 `start -> delta -> end` 生命周期聚合，并在完成或中断边界保存为多个独立 `TextPart` / `ReasoningPart`；Runtime 不逐条持久化 delta，但会保留 message parts 的相对顺序。即使 provider 在 `end` 后复用同一个 stream id，新的 `start` 也必须生成新的 Runtime part，避免历史恢复时丢失后续 reasoning UI。`file`、`diff` 等仍是领域模型能力，具体业务执行能力需要后续阶段接入。
+其中 `text` 与 `file` 已由当前 Run 使用；`tool` 和 `source` 已由 Runtime-local `web_fetch` 在工具完成边界生成。`FilePart` 只保存最终 `attachmentId`、不可变 `mediaType`、`filename` 与 `byteLength` 展示快照，不保存 bytes、URL、data URL、用户路径、Provider file ID 或 access token。AI SDK stream 中的 `text` / `reasoning` delta 会在 Runtime 内存中按 `start -> delta -> end` 生命周期聚合，并在完成或中断边界保存为多个独立 `TextPart` / `ReasoningPart`；Runtime 不逐条持久化 delta，但会保留 message parts 的相对顺序。即使 provider 在 `end` 后复用同一个 stream id，新的 `start` 也必须生成新的 Runtime part，避免历史恢复时丢失后续 reasoning UI。`diff` 等其余 Part 仍是领域模型能力，具体业务执行能力需要后续阶段接入。
 
 ## Diff 设计
 
@@ -193,7 +193,9 @@ Store 会在一个 SQLite 事务中完成以下操作：
 
 Projection 不应把多个 `reasoning` part 合并为一个全局文本字段。`format=ai_sdk` 必须按 Runtime Message 的 part 顺序输出多个 AI SDK `reasoning` part，让 assistant-ui 在完成态和重启恢复后仍能渲染每一个 reasoning block。Workbench 对连续的 `reasoning` 与 `tool` part 可以渲染为单一、可折叠的“执行过程”容器；最终 `text` 保持在该容器外，因此这项展示优化不能改变 part 的相对顺序或投影形状。长会话的前端可以按用户回合虚拟化消息 DOM，但必须仍以稳定 message id 和原始 part 顺序进行渲染，且不能改变 Snapshot 的投影内容。Runtime part metadata 可以保留 `aiSdkTextId`、`aiSdkReasoningId` 等来源标识，用于调试、投影对齐或后续更精细的 block 级能力。
 
-该模块不依赖 React、不创建 assistant-ui runtime、不使用 `AssistantChatTransport`，也不直接实现 HTTP streaming。`POST /v1/runs` 的公开输入应使用 `input.parts` 表达用户消息；第一版 route 层可以只接受 text part，并在进入 `RuntimeTextRunner` 前归一化为内部 text prompt。领域模型模块只负责内部事实与 UI-friendly projection 的边界，不承担 HTTP 请求兼容层。
+该模块不依赖 React、不创建 assistant-ui runtime、不使用 `AssistantChatTransport`，也不直接实现 HTTP streaming。`POST /v1/runs` 的公开输入使用 `input.parts` 表达有序 `text | file` 用户消息，`file` 只接受最终 `attachment_id`；route 映射成内部 Part 后，Runner 与 Store 在提交边界建立消息引用。领域模型模块只负责内部事实与 UI-friendly projection 的边界，不承担 HTTP 请求兼容层。
+
+附件持久化由 `runtime_attachment_uploads`、`runtime_blobs`、`runtime_attachments` 和 `runtime_message_attachments` 四张表承担。上传完成事务创建或复用内容寻址 Blob、创建逻辑 Attachment 并完成 UploadSession；`commitRunStart` 事务把 FilePart 与 Attachment 关系一并写入。History projection 使用 `nexuspilot-attachment:att_*` 恢复稳定身份，模型投影则直接读取本地 Blob bytes，二者不能混用。
 
 ## Snapshot Read API
 

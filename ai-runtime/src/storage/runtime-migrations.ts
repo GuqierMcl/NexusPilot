@@ -468,4 +468,72 @@ export const RUNTIME_MIGRATIONS: RuntimeMigration[] = [
       WHERE confirmation_json IS NULL;
     `,
   },
+  {
+    id: "0007_runtime_chat_attachments",
+    description: "Create Runtime-owned upload, blob, attachment, and message reference storage",
+    sql: `
+      CREATE TABLE runtime_blobs (
+        id TEXT PRIMARY KEY,
+        sha256 TEXT NOT NULL UNIQUE,
+        byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+        storage_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('available', 'deleting', 'corrupt')),
+        created_at INTEGER NOT NULL,
+        verified_at INTEGER
+      );
+
+      CREATE TABLE runtime_attachments (
+        id TEXT PRIMARY KEY,
+        blob_id TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        declared_media_type TEXT,
+        media_type TEXT NOT NULL,
+        byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+        state TEXT NOT NULL CHECK (state IN ('ready', 'corrupt', 'deleting')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        gc_after INTEGER,
+        FOREIGN KEY (blob_id) REFERENCES runtime_blobs(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE runtime_attachment_uploads (
+        id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        declared_media_type TEXT,
+        declared_byte_length INTEGER NOT NULL CHECK (declared_byte_length >= 0),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+        attachment_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        FOREIGN KEY (attachment_id) REFERENCES runtime_attachments(id) ON DELETE CASCADE,
+        CHECK (
+          (state = 'pending' AND attachment_id IS NULL) OR
+          (state = 'completed' AND attachment_id IS NOT NULL)
+        )
+      );
+
+      CREATE TABLE runtime_message_attachments (
+        part_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        attachment_id TEXT NOT NULL,
+        sort_index INTEGER NOT NULL,
+        FOREIGN KEY (part_id) REFERENCES runtime_message_parts(id) ON DELETE CASCADE,
+        FOREIGN KEY (message_id) REFERENCES runtime_messages(id) ON DELETE CASCADE,
+        FOREIGN KEY (attachment_id) REFERENCES runtime_attachments(id) ON DELETE RESTRICT,
+        UNIQUE (message_id, sort_index)
+      );
+
+      CREATE INDEX idx_runtime_attachments_blob
+        ON runtime_attachments(blob_id);
+      CREATE INDEX idx_runtime_attachments_state_gc
+        ON runtime_attachments(state, gc_after);
+      CREATE INDEX idx_runtime_attachment_uploads_state_expiry
+        ON runtime_attachment_uploads(state, expires_at);
+      CREATE INDEX idx_runtime_message_attachments_attachment
+        ON runtime_message_attachments(attachment_id);
+      CREATE INDEX idx_runtime_blobs_state
+        ON runtime_blobs(state);
+    `,
+  },
 ];

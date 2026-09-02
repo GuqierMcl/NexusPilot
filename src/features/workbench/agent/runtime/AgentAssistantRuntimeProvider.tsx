@@ -59,6 +59,7 @@ import {
     type AgentMessageEditController,
 } from "./agent-message-edit-context";
 import { AgentToolPermissionProvider } from "./tool-permission-context";
+import { RuntimeAttachmentAdapter } from "./runtime-attachment-adapter";
 
 interface AgentAssistantRuntimeProviderProps {
     children: ReactNode;
@@ -148,6 +149,18 @@ export function AgentAssistantRuntimeProvider({
             modelId: selectedModel.modelId,
         };
     }, [canRun, selectedModel]);
+    const attachmentAdapter = useMemo(
+        () => new RuntimeAttachmentAdapter({
+            baseUrl: endpoint?.baseUrl ?? FALLBACK_AI_RUNTIME_BASE_URL,
+            accessToken: endpoint?.accessToken ?? null,
+            onFirstAdd: () => {
+                toast.info(
+                    "附件内容会发送给当前选择的外部 AI Provider，并受其数据处理政策约束。",
+                );
+            },
+        }),
+        [endpoint?.accessToken, endpoint?.baseUrl],
+    );
     const transport = useMemo(
         () =>
             new AssistantChatTransport(
@@ -206,6 +219,7 @@ export function AgentAssistantRuntimeProvider({
         runtimeHook: () =>
             useChatRuntime({
                 transport,
+                adapters: { attachments: attachmentAdapter },
                 sendAutomaticallyWhen:
                     lastAssistantMessageIsCompleteWithApprovalResponses,
                 isSendDisabled: shouldDisableAgentRuntimeSend({

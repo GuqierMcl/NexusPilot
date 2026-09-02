@@ -34,6 +34,7 @@ describe("parseRunCreateRequestBody", () => {
         providerId: "openai",
         modelId: "gpt-4o",
         text: "Hello",
+        parts: [{ type: "text", text: "Hello" }],
         agentMode: "ask",
         metadata: {
           client_request_id: "req_1",
@@ -64,6 +65,53 @@ describe("parseRunCreateRequestBody", () => {
         },
       })?.runRequest.text,
     ).toBe("First\n\nSecond");
+  });
+
+  test("accepts a pure final attachment id and preserves mixed part order", () => {
+    expect(
+      parseRunCreateRequestBody({
+        response_mode: "stream",
+        model: { provider_id: "openai", model_id: "gpt-4o" },
+        input: {
+          parts: [
+            { type: "file", attachment_id: "att_first" },
+            { type: "text", text: "Describe it" },
+            { type: "file", attachment_id: "att_second" },
+          ],
+        },
+      })?.runRequest,
+    ).toMatchObject({
+      text: "Describe it",
+      parts: [
+        { type: "file", attachmentId: "att_first" },
+        { type: "text", text: "Describe it" },
+        { type: "file", attachmentId: "att_second" },
+      ],
+    });
+
+    expect(
+      parseRunCreateRequestBody({
+        response_mode: "stream",
+        model: { provider_id: "openai", model_id: "gpt-4o" },
+        input: { parts: [{ type: "file", attachment_id: "att_only" }] },
+      })?.runRequest.text,
+    ).toBe("");
+  });
+
+  test("rejects upload ids, URLs, paths and client-provided file metadata", () => {
+    const create = (part: Record<string, unknown>) => parseRunCreateRequestBody({
+      response_mode: "stream",
+      model: { provider_id: "openai", model_id: "gpt-4o" },
+      input: { parts: [part] },
+    });
+    expect(create({ type: "file", attachment_id: "upl_pending" })).toBeNull();
+    expect(create({ type: "file", attachment_id: "https://example.com/a.png" })).toBeNull();
+    expect(create({ type: "file", attachment_id: "C:\\a.png" })).toBeNull();
+    expect(create({
+      type: "file",
+      attachment_id: "att_valid",
+      filename: "spoof.png",
+    })).toBeNull();
   });
 
   test("parses an edited-message replacement boundary only with a Runtime conversation", () => {

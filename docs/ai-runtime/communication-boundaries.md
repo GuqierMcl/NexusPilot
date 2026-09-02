@@ -27,7 +27,7 @@ Frontend / WebView
        接收 AI Runtime 的可丢弃 UI/失效通知
 
   <-> /v1/... and AI SDK-compatible stream
-       创建 Run、读取 Snapshot、提交明确命令、渲染当前消息
+       上传/读取附件、创建 Run、读取 Snapshot、提交明确命令、渲染当前消息
 
 Rust / Tauri Host
   <-> /v1/internal/backend-bridge (target WebSocket)
@@ -51,6 +51,8 @@ Rust / Tauri Host
 | `/health` | Frontend -> AI Runtime | 查询 AI Runtime 进程健康与只读诊断，展示给用户并决定是否开放智能体入口 | 请求时快照；前端轮询或按需读取；不参与 Backend Bridge 建连和恢复 |
 
 这三条通道按通信双方和职责划分，不因它们共享同一个 loopback host 或 Elysia 进程而合并语义。当前 Bearer token 保护 `/v1/**`（包括 EventBus/SSE）；`/health` 保持公开。未来 Backend Bridge 在 WebSocket Upgrade 前复用相同 token。
+
+聊天附件同样走受认证的 Frontend ↔ AI Runtime HTTP 通道，但上传与 Run 是两个明确阶段：`/v1/attachment-uploads` 获取原始 bytes 并在 Runtime `dataDir` 建立最终 `att_*`；`/v1/runs` 只接收该 ID。附件内容端点仅供 NexusPilot UI 预览或下载，loopback URL 与 Bearer token 都不能进入 Provider 请求；AI Runtime 从本地 Blob Store 读取 bytes 后构造 AI SDK 标准 `file` part。
 
 ## 相邻通道：Workbench Domain Event
 
@@ -134,6 +136,7 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 
 - 判断 AI Runtime 是否已经启动并可以接受前端请求；
 - 展示 Runtime version 和健康状态；
+- 展示附件子系统的只读 `attachments.status` 与脱敏 diagnostics warnings；单个 corrupt/orphan、过期上传或待重试 GC 只产生 warning，不把 Runtime 全局状态改为不可用；
 - 决定是否开放 Frontend 的智能体入口；
 - 按需展示 AI Runtime 当前观察到的只读诊断。
 
@@ -144,7 +147,9 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 - 代替 Run、Conversation、ToolCall 或 Permission Snapshot；
 - 代替 EventBus 的实时 UI 通知。
 
-如果 `/health` 后续增加 `backendBridge.state`，该字段只是 AI Runtime 对内部依赖的只读诊断。Frontend 是否开放智能体入口仍只取决于 AI Runtime 自身是否健康；Rust/Tauri 不读取该字段，也不根据它调整 Bridge 状态。
+`backendBridge.state` 与 `attachments` 都只是 AI Runtime 对内部依赖的只读诊断。Frontend 是否开放智能体入口仍只取决于 AI Runtime 自身是否健康；Rust/Tauri 不读取这些字段，也不根据它们调整 Bridge 状态。附件 diagnostics warning 只帮助定位局部损坏或维护重试，不等同于全局 unhealthy。
+
+正常状态和局部附件 warning 返回 HTTP 200 与全局 `status: "ok"`。Runtime DB 或附件根目录整体不可用时返回 HTTP 503、全局 `status: "unhealthy"`，并把 `attachments.status` 置为 `unavailable`；这一区分避免单个损坏附件关闭整个智能体入口，同时让致命本地存储故障不会被误报为健康。
 
 ## 事实来源与失败语义
 
@@ -172,6 +177,7 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 - Frontend 通过 Tauri endpoint discovery 获得 AI Runtime base URL；
 - `GET /health`；
 - `/v1/runs`、Snapshot Read API 与 AI SDK-compatible stream；
+- 专用 Attachment Upload、元数据、受认证内容与删除 API，以及 `/v1/runs` 的最终 `attachment_id` 引用；
 - live-only Global EventBus 与 `GET /v1/events`；
 - Frontend EventBus 订阅和 Snapshot invalidation。
 

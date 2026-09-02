@@ -647,10 +647,11 @@ describe("RuntimeTextRunner", () => {
       return getToolCall(toolCallId);
     }) as typeof store.getToolCall;
 
-    await expect(runner.continueText(waitingRun.id, [{
+    const failedContinuation = await runner.continueText(waitingRun.id, [{
       permissionId: permission.id,
       approved: true,
-    }])).rejects.toThrow("Continuation bootstrap failed");
+    }]);
+    expect(await failedContinuation.response.text()).toContain("模型执行失败");
 
     expect(store.getRun(waitingRun.id)?.status).toBe("failed");
     expect(store.getConversation(waitingRun.conversationId)?.status.type).toBe("error");

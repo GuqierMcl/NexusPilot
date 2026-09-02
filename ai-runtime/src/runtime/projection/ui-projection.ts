@@ -11,7 +11,7 @@ export type UiPartLike =
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "source"; sourceType: "url"; id?: string; url: string; title?: string }
-  | { type: "file"; filename?: string; mimeType: string; data: string }
+  | { type: "file"; filename: string; mimeType: string; data: string }
   | {
       type: "tool-call";
       toolCallId: string;
@@ -76,8 +76,8 @@ export function projectPartToUiParts(part: Part): UiPartLike[] {
         {
           type: "file",
           filename: part.filename,
-          mimeType: part.mimeType,
-          data: part.dataRef ?? part.url ?? "",
+          mimeType: part.mediaType,
+          data: `nexuspilot-attachment:${part.attachmentId}`,
         },
       ];
     case "tool": {

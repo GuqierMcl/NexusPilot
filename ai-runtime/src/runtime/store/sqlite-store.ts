@@ -14,6 +14,7 @@ import type {
   Conversation,
   ConversationId,
   Event,
+  FilePart,
   Message,
   MessageId,
   Part,
@@ -25,6 +26,7 @@ import type {
   ToolCallId,
   TraceEvent,
 } from "../core/types";
+import { ATTACHMENT_LIMITS, RuntimeAttachmentError } from "../attachments";
 
 function encode(value: unknown): string {
   return JSON.stringify(value) ?? "null";
@@ -75,6 +77,17 @@ interface MessageRow {
 
 interface PartRow {
   payload_json: string;
+}
+
+interface MessageFilePartRow {
+  id: string;
+  message_id: string;
+  type: string;
+  sort_index: number;
+  payload_json: string;
+  indexed_attachment_id: string | null;
+  indexed_message_id: string | null;
+  indexed_sort_index: number | null;
 }
 
 interface ToolCallRow {
@@ -210,7 +223,12 @@ export class RuntimeSqliteStore {
       traces.forEach((trace) => this.appendTrace(trace));
     });
 
-    tx();
+    try {
+      tx();
+    } catch (error) {
+      this.persistAttachmentCorruption(error);
+      throw error;
+    }
     events.forEach((event) => this.options.eventBus?.publish(runtimeEventToEnvelope(event)));
   }
 
@@ -259,7 +277,20 @@ export class RuntimeSqliteStore {
       return null;
     }
 
-    this.db.query("DELETE FROM runtime_conversations WHERE id = ?").run(id);
+    const tx = this.db.transaction(() => {
+      const attachmentIds = this.db
+        .query<{ attachment_id: string }, [string]>(
+          `SELECT DISTINCT rma.attachment_id
+           FROM runtime_message_attachments AS rma
+           JOIN runtime_messages AS message ON message.id = rma.message_id
+           WHERE message.conversation_id = ?`,
+        )
+        .all(id)
+        .map((row) => row.attachment_id);
+      this.db.query("DELETE FROM runtime_conversations WHERE id = ?").run(id);
+      this.scheduleUnreferencedAttachments(attachmentIds);
+    });
+    tx();
 
     return existing;
   }
@@ -396,8 +427,46 @@ export class RuntimeSqliteStore {
         id, conversation_id, message_id, type, sort_index, payload_json, time_json, metadata_json
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
+    const insertAttachmentReference = this.db.query(
+      `INSERT INTO runtime_message_attachments (
+        part_id, message_id, attachment_id, sort_index
+      ) VALUES (?, ?, ?, ?)`,
+    );
 
     const tx = this.db.transaction((record: Message) => {
+      const fileParts = record.parts.filter(
+        (part): part is FilePart => part.type === "file",
+      );
+      if (fileParts.length > ATTACHMENT_LIMITS.maxMessageAttachments) {
+        throw new RuntimeAttachmentError(
+          "ATTACHMENT_COUNT_EXCEEDED",
+          "单条消息最多可包含 10 个附件。",
+          422,
+        );
+      }
+      if (new Set(fileParts.map((part) => part.attachmentId)).size !== fileParts.length) {
+        throw new RuntimeAttachmentError(
+          "ATTACHMENT_COUNT_EXCEEDED",
+          "同一条消息不能重复引用同一个附件。",
+          422,
+        );
+      }
+      if (
+        fileParts.reduce((sum, part) => sum + part.byteLength, 0) >
+        ATTACHMENT_LIMITS.maxMessageAttachmentBytes
+      ) {
+        throw new RuntimeAttachmentError(
+          "ATTACHMENT_TOTAL_SIZE_EXCEEDED",
+          "单条消息的附件总量超过 50 MiB 限制。",
+          413,
+        );
+      }
+      const previousAttachmentIds = this.db
+        .query<{ attachment_id: string }, [string]>(
+          "SELECT attachment_id FROM runtime_message_attachments WHERE message_id = ?",
+        )
+        .all(record.id)
+        .map((row) => row.attachment_id);
       insertMessage.run(
         record.id,
         record.conversationId,
@@ -443,18 +512,31 @@ export class RuntimeSqliteStore {
           part.time ? encode(part.time) : null,
           part.metadata ? encode(part.metadata) : null,
         );
+        if (part.type === "file") {
+          this.assertFilePartAttachment(part);
+          insertAttachmentReference.run(part.id, record.id, part.attachmentId, index);
+          this.db
+            .query("UPDATE runtime_attachments SET gc_after = NULL, updated_at = ? WHERE id = ?")
+            .run(Date.now(), part.attachmentId);
+        }
       });
+      this.scheduleUnreferencedAttachments(previousAttachmentIds);
     });
 
-    tx(parsed);
+    try {
+      tx(parsed);
+    } catch (error) {
+      this.persistAttachmentCorruption(error);
+      throw error;
+    }
   }
 
   getMessage(id: MessageId): Message | null {
     const row = this.db
       .query<MessageRow, [string]>("SELECT message_json FROM runtime_messages WHERE id = ?")
       .get(id);
-
-    return row ? (messageSchema.parse(JSON.parse(row.message_json)) as Message) : null;
+    if (!row) return null;
+    return this.parseAndAssertLoadedMessage(row.message_json);
   }
 
   listMessages(conversationId: ConversationId): Message[] {
@@ -473,7 +555,7 @@ export class RuntimeSqliteStore {
           id`,
       )
       .all(conversationId)
-      .map((row) => messageSchema.parse(JSON.parse(row.message_json)) as Message);
+      .map((row) => this.parseAndAssertLoadedMessage(row.message_json));
   }
 
   listParts(messageId: MessageId): Part[] {
@@ -1063,6 +1145,14 @@ export class RuntimeSqliteStore {
     removedMessageIds: readonly MessageId[],
   ): void {
     const placeholders = removedMessageIds.map(() => "?").join(", ");
+    const attachmentIds = this.db
+      .query<{ attachment_id: string }, string[]>(
+        `SELECT DISTINCT attachment_id
+         FROM runtime_message_attachments
+         WHERE message_id IN (${placeholders})`,
+      )
+      .all(...removedMessageIds)
+      .map((row) => row.attachment_id);
     const runFilter = `
       conversation_id = ?
       AND (
@@ -1092,6 +1182,201 @@ export class RuntimeSqliteStore {
         WHERE conversation_id = ? AND id IN (${placeholders})`,
       )
       .run(conversationId, ...removedMessageIds);
+    this.scheduleUnreferencedAttachments(attachmentIds);
+  }
+
+  private assertFilePartAttachment(part: FilePart): void {
+    const row = this.db
+      .query<{
+        filename: string;
+        media_type: string;
+        byte_length: number;
+        attachment_state: string;
+        blob_state: string;
+      }, [string]>(
+        `SELECT
+          attachment.filename,
+          attachment.media_type,
+          attachment.byte_length,
+          attachment.state AS attachment_state,
+          blob.state AS blob_state
+         FROM runtime_attachments AS attachment
+         JOIN runtime_blobs AS blob ON blob.id = attachment.blob_id
+         WHERE attachment.id = ?`,
+      )
+      .get(part.attachmentId);
+    if (!row) {
+      throw new RuntimeAttachmentError("ATTACHMENT_NOT_FOUND", "附件不存在。", 404);
+    }
+    if (row.attachment_state !== "ready" || row.blob_state !== "available") {
+      throw new RuntimeAttachmentError(
+        "ATTACHMENT_CONTENT_MISSING",
+        "附件内容不存在或暂不可用。",
+        422,
+      );
+    }
+    if (
+      row.filename !== part.filename ||
+      row.media_type !== part.mediaType ||
+      row.byte_length !== part.byteLength
+    ) {
+      throw new RuntimeAttachmentError(
+        "ATTACHMENT_CORRUPT",
+        "消息中的附件快照与附件索引不一致。",
+        500,
+        { attachment_id: part.attachmentId, mark_corrupt: true },
+      );
+    }
+  }
+
+  private assertLoadedFilePartSnapshot(part: FilePart): void {
+    const row = this.db
+      .query<{
+        filename: string;
+        media_type: string;
+        byte_length: number;
+      }, [string]>(
+        `SELECT filename, media_type, byte_length
+         FROM runtime_attachments
+         WHERE id = ?`,
+      )
+      .get(part.attachmentId);
+    if (
+      !row ||
+      row.filename !== part.filename ||
+      row.media_type !== part.mediaType ||
+      row.byte_length !== part.byteLength
+    ) {
+      throw new RuntimeAttachmentError(
+        "ATTACHMENT_CORRUPT",
+        "消息中的附件快照与附件索引不一致。",
+        500,
+        { attachment_id: part.attachmentId, mark_corrupt: true },
+      );
+    }
+  }
+
+  private parseAndAssertLoadedMessage(messageJson: string): Message {
+    let message: Message;
+    try {
+      message = messageSchema.parse(JSON.parse(messageJson)) as Message;
+      this.assertLoadedMessageAttachmentIntegrity(message);
+      return message;
+    } catch (error) {
+      this.persistAttachmentCorruption(error);
+      throw error;
+    }
+  }
+
+  private assertLoadedMessageAttachmentIntegrity(message: Message): void {
+    const storedRows = this.db
+      .query<MessageFilePartRow, [string]>(
+        `SELECT
+           part.id,
+           part.message_id,
+           part.type,
+           part.sort_index,
+           part.payload_json,
+           relation.attachment_id AS indexed_attachment_id,
+           relation.message_id AS indexed_message_id,
+           relation.sort_index AS indexed_sort_index
+         FROM runtime_message_parts AS part
+         LEFT JOIN runtime_message_attachments AS relation ON relation.part_id = part.id
+         WHERE part.message_id = ? AND (part.type = 'file' OR relation.part_id IS NOT NULL)
+         ORDER BY part.sort_index ASC, part.id ASC`,
+      )
+      .all(message.id);
+    const messageParts = message.parts
+      .map((part, sortIndex) => ({ part, sortIndex }))
+      .filter((entry): entry is { part: FilePart; sortIndex: number } => entry.part.type === "file");
+    const recognizedIds = new Set<string>([
+      ...messageParts.map(({ part }) => part.attachmentId),
+      ...storedRows
+        .map((row) => row.indexed_attachment_id)
+        .filter((id): id is string => Boolean(id)),
+    ]);
+
+    const fail = (): never => {
+      throw new RuntimeAttachmentError(
+        "ATTACHMENT_CORRUPT",
+        "消息中的附件快照、Part 与附件索引不一致。",
+        500,
+        { attachment_ids: [...recognizedIds], mark_corrupt: true },
+      );
+    };
+
+    if (storedRows.length !== messageParts.length) fail();
+    const storedById = new Map(storedRows.map((row) => [row.id, row]));
+    for (const { part, sortIndex } of messageParts) {
+      const row = storedById.get(part.id);
+      if (!row) return fail();
+      const storedPart = (() => {
+        try {
+          return partSchema.parse(JSON.parse(row.payload_json)) as Part;
+        } catch {
+          return fail();
+        }
+      })();
+      if (
+        storedPart.type !== "file" ||
+        row.message_id !== message.id ||
+        row.sort_index !== sortIndex ||
+        row.indexed_attachment_id !== part.attachmentId ||
+        row.indexed_message_id !== message.id ||
+        row.indexed_sort_index !== sortIndex ||
+        storedPart.id !== part.id ||
+        storedPart.messageId !== part.messageId ||
+        storedPart.conversationId !== part.conversationId ||
+        storedPart.attachmentId !== part.attachmentId ||
+        storedPart.filename !== part.filename ||
+        storedPart.mediaType !== part.mediaType ||
+        storedPart.byteLength !== part.byteLength
+      ) {
+        if (storedPart.type === "file") recognizedIds.add(storedPart.attachmentId);
+        fail();
+      }
+      this.assertLoadedFilePartSnapshot(part);
+    }
+  }
+
+  private persistAttachmentCorruption(error: unknown): void {
+    if (
+      !(error instanceof RuntimeAttachmentError) ||
+      error.code !== "ATTACHMENT_CORRUPT" ||
+      error.data?.mark_corrupt !== true ||
+      typeof error.data.attachment_id !== "string" &&
+      !Array.isArray(error.data.attachment_ids)
+    ) {
+      return;
+    }
+    const ids = new Set<string>();
+    if (typeof error.data.attachment_id === "string") ids.add(error.data.attachment_id);
+    if (Array.isArray(error.data.attachment_ids)) {
+      for (const id of error.data.attachment_ids) {
+        if (typeof id === "string") ids.add(id);
+      }
+    }
+    for (const id of ids) {
+      this.db
+        .query("UPDATE runtime_attachments SET state = 'corrupt', updated_at = ? WHERE id = ?")
+        .run(Date.now(), id);
+    }
+  }
+
+  private scheduleUnreferencedAttachments(ids: readonly string[]): void {
+    const gcAfter = Date.now() + ATTACHMENT_LIMITS.gcGraceMs;
+    for (const id of new Set(ids)) {
+      this.db
+        .query(
+          `UPDATE runtime_attachments
+           SET gc_after = ?, updated_at = ?
+           WHERE id = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM runtime_message_attachments WHERE attachment_id = ?
+             )`,
+        )
+        .run(gcAfter, Date.now(), id, id);
+    }
   }
 
   listEvents(conversationId: ConversationId): Event[] {

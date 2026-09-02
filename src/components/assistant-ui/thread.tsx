@@ -1030,8 +1030,21 @@ const UserActionBar: FC = () => {
     <ActionBarPrimitive.Root
       hideWhenRunning
       autohide="not-last"
-      className="aui-user-action-bar-root flex flex-col items-end"
+      className="aui-user-action-bar-root flex items-center gap-1"
     >
+      <ActionBarPrimitive.Copy asChild>
+        <TooltipIconButton
+          tooltip="复制"
+          className="aui-user-action-copy"
+        >
+          <AuiIf condition={(state) => state.message.isCopied}>
+            <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
+          </AuiIf>
+          <AuiIf condition={(state) => !state.message.isCopied}>
+            <CopyIcon className="animate-in zoom-in-75 fade-in duration-150" />
+          </AuiIf>
+        </TooltipIconButton>
+      </ActionBarPrimitive.Copy>
       <ActionBarPrimitive.Edit asChild>
         <TooltipIconButton
           tooltip="编辑"

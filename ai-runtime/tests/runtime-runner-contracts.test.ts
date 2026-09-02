@@ -12,12 +12,14 @@ describe("Runtime Runner contracts", () => {
       providerId: "openai",
       modelId: "gpt-4o",
       text: "Explain this query",
+      parts: [{ type: "text", text: "Explain this query" }],
     };
 
     expect(normalizeRunRequest(request)).toEqual({
       providerId: "openai",
       modelId: "gpt-4o",
       text: "Explain this query",
+      parts: [{ type: "text", text: "Explain this query" }],
       agentMode: "ask",
       title: "Explain this query",
       titleSource: "fallback",
@@ -108,7 +110,7 @@ describe("Runtime Runner contracts", () => {
         modelId: "gpt-4o",
         text: "   ",
       }),
-    ).toThrow("RunRequest.text must not be empty");
+    ).toThrow("RunRequest text parts must not be empty");
   });
 
   test("identifies terminal run states", () => {

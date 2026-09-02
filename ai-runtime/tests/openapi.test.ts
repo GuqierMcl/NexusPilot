@@ -222,14 +222,18 @@ describe("OpenAPI docs", () => {
     expect(runBody?.properties?.input?.required).toEqual(["parts"]);
     expect(runBody?.properties?.input?.additionalProperties).toBe(false);
     expect(runBody?.properties?.input?.properties?.parts?.type).toBe("array");
-    expect(runBody?.properties?.input?.properties?.parts?.items?.required).toEqual([
+    expect(runBody?.properties?.input?.properties?.parts?.items?.oneOf?.[0]?.required).toEqual([
       "type",
       "text",
     ]);
-    expect(runBody?.properties?.input?.properties?.parts?.items?.additionalProperties)
+    expect(runBody?.properties?.input?.properties?.parts?.items?.oneOf?.[0]?.additionalProperties)
       .toBe(false);
-    expect(runBody?.properties?.input?.properties?.parts?.items?.properties?.type?.enum)
+    expect(runBody?.properties?.input?.properties?.parts?.items?.oneOf?.[0]?.properties?.type?.enum)
       .toEqual(["text"]);
+    expect(runBody?.properties?.input?.properties?.parts?.items?.oneOf?.[1]?.required)
+      .toEqual(["type", "attachment_id"]);
+    expect(runBody?.properties?.input?.properties?.parts?.items?.oneOf?.[1]?.properties?.type?.enum)
+      .toEqual(["file"]);
     expect(runBody?.properties).not.toHaveProperty("text");
     expect(runBody?.properties).not.toHaveProperty("provider_id");
     expect(runBody?.properties).not.toHaveProperty("model_id");

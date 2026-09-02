@@ -1,5 +1,7 @@
 import {
   consumeStream,
+  createUIMessageStream,
+  createUIMessageStreamResponse,
   type GenerateTextOnEndCallback,
   type IdGenerator,
   isStepCount,
@@ -12,6 +14,7 @@ import {
   type StreamTextOnErrorCallback,
   type TextStreamPart,
   type ToolSet,
+  type UserContent,
 } from "ai";
 import { createRuntimeId, type RuntimeId, type RuntimeIdPrefix } from "../core/ids";
 import {
@@ -43,6 +46,7 @@ import {
   type PreparedToolInvocationRegistry,
 } from "../tools";
 import type {
+  FilePart,
   FinishReason,
   InterruptReason,
   PermissionId,
@@ -62,6 +66,11 @@ import type {
   ToolPart,
   SourcePart,
 } from "../core/types";
+import {
+  ATTACHMENT_LIMITS,
+  RuntimeAttachmentError,
+  type RuntimeAttachmentService,
+} from "../attachments";
 import { mapAiSdkUsage } from "../core/usage";
 import type {
   RuntimeNetworkPolicy,
@@ -232,6 +241,7 @@ export interface RuntimeUIMessageStreamResponseOptions extends ResponseInit {
     stream: ReadableStream<string>;
   }) => PromiseLike<void> | void;
   generateMessageId?: IdGenerator;
+  onError?: (error: unknown) => string;
 }
 
 export interface RuntimeStreamTextResult {
@@ -244,6 +254,7 @@ export type RuntimeStreamText = (
 
 export interface RuntimeTextRunnerDependencies {
   store: RuntimeRunnerStore;
+  attachmentService?: RuntimeAttachmentService | null;
   appVersion?: string;
   now?: () => number;
   createId?: <TPrefix extends RuntimeIdPrefix>(prefix: TPrefix) => RuntimeId<TPrefix>;
@@ -362,6 +373,7 @@ export class RuntimeTextRunner {
     });
     const runner = new RuntimeRunner({
       store: this.deps.store,
+      attachmentService: this.deps.attachmentService,
       appVersion: this.deps.appVersion,
       now: this.deps.now,
       createId: this.deps.createId,
@@ -385,7 +397,7 @@ export class RuntimeTextRunner {
       generateConversationTitle: this.deps.generateConversationTitle,
       store: this.deps.store,
       started,
-      userText: request.text,
+      userText: request.text ?? extractRequestText(request),
       providerId: request.providerId,
       modelId: request.modelId,
       model: resolved.languageModel,
@@ -515,10 +527,6 @@ export class RuntimeTextRunner {
           content: approvalParts,
         },
       ];
-      const messages: ModelMessage[] = [
-        ...buildModelMessages(history),
-        ...continuationResponsePrefix,
-      ];
       const request: RunRequest = {
         runId,
         conversationId: waitingRun.conversationId,
@@ -530,6 +538,7 @@ export class RuntimeTextRunner {
       };
       const runner = new RuntimeRunner({
         store: this.deps.store,
+        attachmentService: this.deps.attachmentService,
         appVersion: this.deps.appVersion,
         now: this.deps.now,
         createId: this.deps.createId,
@@ -553,6 +562,10 @@ export class RuntimeTextRunner {
         assistantMessage,
       };
       committedStart = started;
+      const messages: ModelMessage[] = [
+        ...(await buildModelMessages(history, this.deps.attachmentService)),
+        ...continuationResponsePrefix,
+      ];
 
       return await this.#executeText({
         request,
@@ -568,27 +581,38 @@ export class RuntimeTextRunner {
         releaseContinuation,
       });
     } catch (error) {
-      try {
-        if (
-          committedStart &&
-          committedRunner &&
-          this.deps.store.getRun(runId)?.status === "running"
-        ) {
-          committedRunner.fail(committedStart, toRuntimeError(error));
-          finalizeUnfinishedToolCalls({
-            store: this.deps.store,
-            createId: this.deps.createId ?? createRuntimeId,
-            runId,
-            completedAt: (this.deps.now ?? Date.now)(),
-            state: "error",
-            message: "Runtime continuation failed after permission commit.",
-          });
-          this.deps.preparedInvocations?.clearRun(runId);
-          void this.deps.backendToolExecutor?.cleanupRun?.(runId);
-        }
-      } finally {
+      if (
+        committedStart &&
+        committedRunner &&
+        this.deps.store.getRun(runId)?.status === "running"
+      ) {
+        const failedStart = committedStart;
+        committedRunner.fail(failedStart, toRuntimeError(error));
+        finalizeUnfinishedToolCalls({
+          store: this.deps.store,
+          createId: this.deps.createId ?? createRuntimeId,
+          runId,
+          completedAt: (this.deps.now ?? Date.now)(),
+          state: "error",
+          message: "Runtime continuation failed after permission commit.",
+        });
+        this.deps.preparedInvocations?.clearRun(runId);
+        void this.deps.backendToolExecutor?.cleanupRun?.(runId);
         releaseContinuation();
+        return {
+          started: failedStart,
+          response: withRuntimeHeaders(createUIMessageStreamResponse({
+            stream: createUIMessageStream({
+              execute: ({ writer }) => {
+                writer.write({ type: "error", errorText: safeUiErrorMessage(error) });
+              },
+              generateId: () => failedStart.assistantMessage.id,
+              onError: safeUiErrorMessage,
+            }),
+          }), failedStart),
+        };
       }
+      releaseContinuation();
       throw error;
     }
   }
@@ -941,7 +965,10 @@ export class RuntimeTextRunner {
     let result: RuntimeStreamTextResult;
     try {
       const messages = continuationMessages ??
-        buildModelMessages(this.deps.store.listMessages(started.conversation.id));
+        await buildModelMessages(
+          this.deps.store.listMessages(started.conversation.id),
+          this.deps.attachmentService,
+        );
       const aiSdkTools = this.deps.toolRegistry
         ? runtimeToolsToAiSdkToolSet({
             registry: this.deps.toolRegistry,
@@ -973,7 +1000,7 @@ export class RuntimeTextRunner {
       result = await this.streamTextImpl({
         model: resolved.languageModel,
         system: policy.prompt.system,
-        ...(messages.length > 0 ? { messages } : { prompt: request.text }),
+        ...(messages.length > 0 ? { messages } : { prompt: request.text ?? "" }),
         maxSteps: Math.max(1, policy.limits.maxSteps - previousStepCount),
         maxOutputTokens: remainingOutputTokens(
           policy.limits.maxOutputTokens,
@@ -1434,7 +1461,21 @@ export class RuntimeTextRunner {
       });
     } catch (error) {
       writeFailure(error);
-      throw error;
+      return {
+        started,
+        response: withRuntimeHeaders(createUIMessageStreamResponse({
+          stream: createUIMessageStream({
+            execute: ({ writer }) => {
+              writer.write({
+                type: "error",
+                errorText: safeUiErrorMessage(error),
+              });
+            },
+            generateId: () => started.assistantMessage.id,
+            onError: safeUiErrorMessage,
+          }),
+        }), started),
+      };
     }
 
     return {
@@ -1443,6 +1484,7 @@ export class RuntimeTextRunner {
         result.toUIMessageStreamResponse({
           consumeSseStream: consumeStream,
           generateMessageId: () => started.assistantMessage.id,
+          onError: safeUiErrorMessage,
         }),
         started,
       ),
@@ -1696,6 +1738,9 @@ function scheduleConversationTitleGeneration(input: {
   if (!input.generateConversationTitle) {
     return;
   }
+  if (!input.userText.trim()) {
+    return;
+  }
 
   const titleMetadata = readConversationTitleMetadata(
     input.started.conversation.metadata,
@@ -1837,15 +1882,97 @@ async function consumeRuntimeFullStream(
   }
 }
 
-function buildModelMessages(messages: Message[]): ModelMessage[] {
-  return messages.flatMap((message) => {
-    const text = extractTextContent(message);
-    if (!text) {
-      return [];
+async function buildModelMessages(
+  messages: Message[],
+  attachmentService?: RuntimeAttachmentService | null,
+): Promise<ModelMessage[]> {
+  const fileParts = messages.flatMap((message) =>
+    message.role === "user"
+      ? message.parts.filter(isPromptFilePart)
+      : [],
+  );
+  const totalBytes = fileParts.reduce((sum, part) => sum + part.byteLength, 0);
+  if (totalBytes > ATTACHMENT_LIMITS.maxRunHistoryAttachmentBytes) {
+    throw new RuntimeAttachmentError(
+      "ATTACHMENT_HISTORY_SIZE_EXCEEDED",
+      "本次运行的历史附件总量超过 100 MiB 限制。",
+      413,
+      { limit_bytes: ATTACHMENT_LIMITS.maxRunHistoryAttachmentBytes },
+    );
+  }
+  if (fileParts.length > 0 && !attachmentService) {
+    throw new RuntimeAttachmentError(
+      "ATTACHMENT_CONTENT_MISSING",
+      "附件存储服务不可用。",
+      503,
+    );
+  }
+
+  const loaded = await mapWithConcurrency(
+    fileParts,
+    ATTACHMENT_LIMITS.readConcurrency,
+    async (part) => [part.id, await attachmentService!.readBytes(part.attachmentId)] as const,
+  );
+  const bytesByPartId = new Map(loaded);
+
+  return messages.flatMap((message): ModelMessage[] => {
+    if (message.role === "user") {
+      if (!message.parts.some(isPromptFilePart)) {
+        const text = extractTextContent(message);
+        return text ? [{ role: "user", content: text }] : [];
+      }
+      const content: UserContent = [];
+      for (const part of message.parts) {
+        if (isPromptTextPart(part)) {
+          content.push({ type: "text", text: part.text });
+          continue;
+        }
+        if (isPromptFilePart(part)) {
+          const data = bytesByPartId.get(part.id);
+          if (!data) {
+            throw new RuntimeAttachmentError(
+              "ATTACHMENT_CONTENT_MISSING",
+              "附件内容未能加载。",
+              500,
+            );
+          }
+          content.push({
+            type: "file",
+            mediaType: part.mediaType,
+            filename: part.filename,
+            data: { type: "data", data },
+          });
+        }
+      }
+      return content.length > 0
+        ? [{ role: "user", content } satisfies ModelMessage]
+        : [];
     }
 
-    return [{ role: message.role, content: text } satisfies ModelMessage];
+    const text = extractTextContent(message);
+    return text
+      ? [{ role: message.role, content: text } satisfies ModelMessage]
+      : [];
   });
+}
+
+async function mapWithConcurrency<T, TResult>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<TResult>,
+): Promise<TResult[]> {
+  const results = new Array<TResult>(values.length);
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+      while (nextIndex < values.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(values[index]!);
+      }
+    }),
+  );
+  return results;
 }
 
 function extractTextContent(message: Message): string | null {
@@ -1860,6 +1987,25 @@ function extractTextContent(message: Message): string | null {
 
 function isPromptTextPart(part: Part): part is TextPart {
   return part.type === "text" && !part.ignored;
+}
+
+function isPromptFilePart(part: Part): part is FilePart {
+  return part.type === "file";
+}
+
+function extractRequestText(request: RunRequest): string {
+  return request.parts
+    ?.filter((part) => part.type === "text")
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join("\n\n") ?? "";
+}
+
+function safeUiErrorMessage(error: unknown): string {
+  if (error instanceof RuntimeAttachmentError) {
+    return error.message;
+  }
+  return "模型执行失败。当前模型可能不支持所发送的附件，请检查模型或附件后重试。";
 }
 
 function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | null {
@@ -2356,7 +2502,7 @@ function toRuntimeError(error: unknown): RuntimeError {
     return {
       name: "APIError",
       data: {
-        message: error.message,
+        message: safeUiErrorMessage(error),
         isRetryable: false,
       },
     };
@@ -2365,7 +2511,7 @@ function toRuntimeError(error: unknown): RuntimeError {
   return {
     name: "UnknownError",
     data: {
-      message: String(error),
+      message: "模型执行失败，请检查模型与附件后重试。",
     },
   };
 }

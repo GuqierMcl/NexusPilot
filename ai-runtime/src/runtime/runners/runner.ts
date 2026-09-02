@@ -19,6 +19,7 @@ import type {
   AssistantMessage,
   Conversation,
   Event,
+  FilePart,
   FinishReason,
   Message,
   Run,
@@ -28,6 +29,7 @@ import type {
   TraceEvent,
   UserMessage,
 } from "../core/types";
+import { RuntimeAttachmentError, type RuntimeAttachment } from "../attachments";
 
 export class RuntimeConversationNotFoundError extends Error {
   constructor(readonly conversationId: string) {
@@ -52,7 +54,6 @@ export class RuntimeRunner {
     const created = this.now();
     const conversationId = normalized.conversationId ?? this.createId("conv");
     const userMessageId = normalized.userMessageId ?? this.createId("msg");
-    const userTextPartId = this.createId("part");
     const runId = normalized.runId ?? this.createId("run");
     const assistantMessageId = this.createId("msg");
 
@@ -84,13 +85,33 @@ export class RuntimeRunner {
       messages: existingMessages,
       replaceFromMessageId: normalized.replaceFromMessageId,
     });
+    const requestedAttachmentIds = normalized.parts
+      .filter((part) => part.type === "file")
+      .map((part) => part.attachmentId);
+    if (requestedAttachmentIds.length > 0 && !this.deps.attachmentService) {
+      throw new RuntimeAttachmentError(
+        "ATTACHMENT_CONTENT_MISSING",
+        "附件存储服务不可用。",
+        503,
+      );
+    }
+    const resolvedAttachments = requestedAttachmentIds.length > 0
+      ? this.deps.attachmentService!.resolveMessageAttachments(requestedAttachmentIds)
+      : [];
+    const attachmentsById = new Map(
+      resolvedAttachments.map((attachment) => [attachment.id, attachment]),
+    );
+    const resolvedTitle =
+      normalized.titleSource === "fallback" && !normalized.text
+        ? resolvedAttachments[0]?.filename ?? normalized.title
+        : normalized.title;
 
     const conversation: Conversation = existingConversation
       ? {
           ...existingConversation,
           ...(shouldRefreshConversationTitle
             ? {
-                title: normalized.title,
+                title: resolvedTitle,
                 metadata: withConversationTitleMetadata(existingConversation.metadata, {
                   source: "fallback",
                   sourceMessageId: userMessageId,
@@ -102,7 +123,7 @@ export class RuntimeRunner {
         }
       : {
           id: conversationId,
-          title: normalized.title,
+          title: resolvedTitle,
           version: "1",
           status: { type: "busy", runId },
           time: { created, updated: created },
@@ -121,16 +142,21 @@ export class RuntimeRunner {
         providerId: normalized.providerId,
         modelId: normalized.modelId,
       },
-      parts: [
-        {
-          id: userTextPartId,
+      parts: normalized.parts.map((part) => {
+        const base = {
+          id: this.createId("part"),
           conversationId,
           messageId: userMessageId,
-          type: "text",
-          text: normalized.text,
           time: { created },
-        },
-      ],
+        };
+        if (part.type === "text") {
+          return { ...base, type: "text" as const, text: part.text };
+        }
+        return createFilePart(
+          base,
+          requireAttachment(attachmentsById, part.attachmentId),
+        );
+      }),
       time: { created, completed: created },
       metadata: normalized.metadata ? { request: normalized.metadata } : undefined,
     };
@@ -539,6 +565,31 @@ function shouldRefreshTitleAfterReplacement(input: {
   }
 
   return readConversationTitleMetadata(input.conversation.metadata)?.source !== "user";
+}
+
+function requireAttachment(
+  attachments: ReadonlyMap<string, RuntimeAttachment>,
+  id: string,
+): RuntimeAttachment {
+  const attachment = attachments.get(id);
+  if (!attachment) {
+    throw new Error(`Attachment ${id} was not resolved`);
+  }
+  return attachment;
+}
+
+function createFilePart(
+  base: Pick<FilePart, "id" | "conversationId" | "messageId" | "time">,
+  attachment: RuntimeAttachment,
+): FilePart {
+  return {
+    ...base,
+    type: "file",
+    attachmentId: attachment.id,
+    mediaType: attachment.mediaType,
+    filename: attachment.filename,
+    byteLength: attachment.byteLength,
+  };
 }
 
 function createEmptyRunToolSnapshot(

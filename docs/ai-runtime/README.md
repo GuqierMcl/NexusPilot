@@ -11,6 +11,8 @@ Status: **Current**
 - Runtime Store and Snapshot Read APIs are the durable facts; SSE is a live-only invalidation channel.
 - Each run resolves an immutable tool snapshot from the selected agent mode, model capabilities, runtime settings, and registered tools.
 - Tool visibility is not authorization. Risk analysis, permission state, prepared plans, and backend checks still apply at execution time.
+- Chat attachments are uploaded through dedicated authenticated endpoints, persisted under Runtime `dataDir`, and referenced by final `att_*` IDs. `/v1/runs` never uploads files or accepts file bytes, paths, URLs, or upload-session IDs.
+- Runtime projects persisted attachment bytes to AI SDK standard `file` parts without using provider/model catalog capabilities as an attachment gate.
 
 ## Documentation map
 
@@ -25,6 +27,7 @@ Status: **Current**
 | [database-tools.md](./database-tools.md) | Stable safety rules for SQL and key-value tools. |
 | [settings.md](./settings.md) | Runtime-owned settings and per-run freezing. |
 | [provider-model.md](./provider-model.md) | models.dev catalog, provider configuration, credentials, and model resolution. |
+| [attachment-storage.md](./attachment-storage.md) | Current Runtime-owned chat attachment storage, upload, lifecycle, and multimodal model-input contract. |
 | [live-eventbus-sse.md](./live-eventbus-sse.md) | Live-only EventBus and scoped SSE. |
 | [communication-boundaries.md](./communication-boundaries.md) | Frontend HTTP/SSE, backend bridge, and health responsibilities. |
 | [backend-bridge.md](./backend-bridge.md) | Authenticated WebSocket transport and Rust Gateway. |
@@ -37,6 +40,8 @@ The sidecar is a focused local service and does not use an `/api` prefix:
 - process health: `GET /health`;
 - versioned runtime resources: `/v1/**`;
 - run creation: `POST /v1/runs`;
+- attachment upload: `POST/PUT/GET/DELETE /v1/attachment-uploads`;
+- attachment metadata and authenticated content: `GET/DELETE /v1/attachments/:attachmentId` and `GET /v1/attachments/:attachmentId/content`;
 - history and recovery: Snapshot Read APIs under `/v1/**`;
 - live invalidation events: `GET /v1/events`;
 - backend capability transport: authenticated WebSocket bridge.

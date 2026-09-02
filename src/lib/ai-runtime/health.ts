@@ -5,11 +5,15 @@ export interface BaseResponse<T> {
 }
 
 export interface AiRuntimeHealthResponse {
-    status: string;
+    status: "ok" | "unhealthy";
     version: string;
     backendBridge?: {
         state: "waiting" | "ready" | "disconnected";
         lastHeartbeatAt?: number;
+    };
+    attachments?: {
+        status: "ok" | "warning" | "unavailable";
+        warnings: string[];
     };
 }
 
@@ -17,6 +21,7 @@ export interface AiRuntimeHealthResult {
     status: "ok";
     version: string;
     backendBridge: AiRuntimeHealthResponse["backendBridge"];
+    attachments: AiRuntimeHealthResponse["attachments"];
 }
 
 export async function checkAiRuntimeHealth(
@@ -39,5 +44,6 @@ export async function checkAiRuntimeHealth(
         status: "ok",
         version: body.data.version,
         backendBridge: body.data.backendBridge,
+        attachments: body.data.attachments,
     };
 }

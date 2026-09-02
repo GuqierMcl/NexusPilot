@@ -23,3 +23,4 @@ export * from "./runners/run-interrupt";
 export * from "./runners/active-run-registry";
 export * from "./runners/run-continuation-registry";
 export * from "./runners/text-runner";
+export * from "./attachments";

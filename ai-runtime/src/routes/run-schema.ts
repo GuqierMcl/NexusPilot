@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type {
+  AttachmentId,
   RuntimePermissionResponseInput,
   RunRequest,
 } from "../runtime";
@@ -25,7 +26,19 @@ const textInputPartSchema = z
   })
   .strict();
 
-export type RunInputPart = z.infer<typeof textInputPartSchema>;
+const fileInputPartSchema = z
+  .object({
+    type: z.literal("file"),
+    attachment_id: z.string().refine((value) => isRuntimeId(value, "att")),
+  })
+  .strict();
+
+const runInputPartSchema = z.discriminatedUnion("type", [
+  textInputPartSchema,
+  fileInputPartSchema,
+]);
+
+export type RunInputPart = z.infer<typeof runInputPartSchema>;
 
 const runCreateRequestSchema = z
   .object({
@@ -41,7 +54,7 @@ const runCreateRequestSchema = z
     agent_mode: z.enum(["ask", "query", "agent"]).optional(),
     input: z
       .object({
-        parts: z.array(textInputPartSchema).min(1),
+        parts: z.array(runInputPartSchema).min(1),
       })
       .strict(),
     metadata: z.record(z.string(), z.unknown()).optional(),
@@ -83,14 +96,28 @@ export function parseRunCreateRequestBody(body: unknown): ParsedRunCreateRequest
     return null;
   }
 
+  const parts = result.data.input.parts.map((part) =>
+    part.type === "text"
+      ? { type: "text" as const, text: part.text }
+      : {
+          type: "file" as const,
+          attachmentId: part.attachment_id as AttachmentId,
+        },
+  );
+  const text = parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n\n");
+
   return {
     responseMode: result.data.response_mode,
     runRequest: {
-      conversationId,
-      replaceFromMessageId,
+      ...(conversationId ? { conversationId } : {}),
+      ...(replaceFromMessageId ? { replaceFromMessageId } : {}),
       providerId: result.data.model.provider_id,
       modelId: result.data.model.model_id,
-      text: normalizeTextParts(result.data.input.parts),
+      text,
+      parts,
       agentMode: result.data.agent_mode,
       metadata: result.data.metadata,
     },
@@ -120,8 +147,4 @@ export function parseRunContinueRequestBody(
       ...(response.reason ? { reason: response.reason } : {}),
     })),
   };
-}
-
-function normalizeTextParts(parts: RunInputPart[]): string {
-  return parts.map((part) => part.text).join("\n\n");
 }

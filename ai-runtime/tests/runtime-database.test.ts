@@ -27,6 +27,10 @@ describe("runtime database", () => {
     expect(tables).toContain("runtime_permissions");
     expect(tables).toContain("runtime_events");
     expect(tables).toContain("runtime_traces");
+    expect(tables).toContain("runtime_blobs");
+    expect(tables).toContain("runtime_attachments");
+    expect(tables).toContain("runtime_attachment_uploads");
+    expect(tables).toContain("runtime_message_attachments");
 
     const indexes = db
       .query<{ name: string }, []>(
@@ -44,6 +48,11 @@ describe("runtime database", () => {
     expect(indexes).toContain("idx_runtime_permissions_tool_call");
     expect(indexes).toContain("idx_runtime_events_conversation_time");
     expect(indexes).toContain("idx_runtime_traces_run_time");
+    expect(indexes).toContain("idx_runtime_attachments_blob");
+    expect(indexes).toContain("idx_runtime_attachments_state_gc");
+    expect(indexes).toContain("idx_runtime_attachment_uploads_state_expiry");
+    expect(indexes).toContain("idx_runtime_message_attachments_attachment");
+    expect(indexes).toContain("idx_runtime_blobs_state");
 
     const migrations = db
       .query<{ id: string }, []>(
@@ -60,6 +69,7 @@ describe("runtime database", () => {
       "0004_runtime_run_tool_snapshot",
       "0005_runtime_tool_permission_state",
       "0006_runtime_tool_permission_confirmation",
+      "0007_runtime_chat_attachments",
     ]);
 
     const runColumns = db
@@ -192,6 +202,7 @@ describe("runtime database", () => {
           "0004_runtime_run_tool_snapshot",
           "0005_runtime_tool_permission_state",
           "0006_runtime_tool_permission_confirmation",
+          "0007_runtime_chat_attachments",
         ]);
       } finally {
         secondDb.close();

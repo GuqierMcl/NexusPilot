@@ -7,7 +7,10 @@ export type RuntimeIdPrefix =
   | "perm"
   | "evt"
   | "trace"
-  | "diff";
+  | "diff"
+  | "upl"
+  | "att"
+  | "blob";
 
 export type RuntimeId<TPrefix extends RuntimeIdPrefix = RuntimeIdPrefix> =
   `${TPrefix}_${string}`;

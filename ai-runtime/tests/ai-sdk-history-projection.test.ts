@@ -61,9 +61,10 @@ describe("AI SDK history projection", () => {
           conversationId: "conv_history",
           messageId: "msg_assistant",
           type: "file",
-          mimeType: "application/pdf",
+          attachmentId: "att_schema",
+          mediaType: "application/pdf",
           filename: "schema.pdf",
-          url: "https://example.com/schema.pdf",
+          byteLength: 1024,
         },
         {
           id: "part_tool",
@@ -137,7 +138,7 @@ describe("AI SDK history projection", () => {
             type: "file",
             mediaType: "application/pdf",
             filename: "schema.pdf",
-            url: "https://example.com/schema.pdf",
+            url: "nexuspilot-attachment:att_schema",
           },
           {
             type: "tool-web_fetch",

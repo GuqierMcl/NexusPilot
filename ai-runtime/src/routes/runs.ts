@@ -31,6 +31,9 @@ import {
   type BackendBridgeRunState,
   type RuntimeToolRegistry,
   type PreparedToolInvocationRegistry,
+  type RuntimeAttachmentService,
+  RuntimeAttachmentError,
+  attachmentErrorEnvelope,
 } from "../runtime";
 import {
   jsonRequestBody,
@@ -65,6 +68,7 @@ export interface RunRouteDeps {
   continuations?: RunContinuationRegistry;
   getToolApprovalPolicy?: () => RuntimeToolApprovalPolicy;
   getNetworkPolicy?: () => RuntimeNetworkPolicy;
+  attachmentService?: RuntimeAttachmentService | null;
 }
 
 export function runRoutes(deps: RunRouteDeps) {
@@ -73,6 +77,15 @@ export function runRoutes(deps: RunRouteDeps) {
       const body = await parseJsonBody(request);
       const parsed = parseRunCreateRequestBody(body);
       if (!parsed) {
+        if (containsFileInputPart(body)) {
+          return Response.json(
+            {
+              code: "ATTACHMENT_CORRUPT",
+              message: "Run 的附件输入格式无效；只接受最终 attachment_id。",
+            },
+            { status: 422 },
+          );
+        }
         return detailError(422, "Invalid run creation request body");
       }
 
@@ -101,6 +114,7 @@ export function runRoutes(deps: RunRouteDeps) {
           continuations: deps.continuations,
           getToolApprovalPolicy: deps.getToolApprovalPolicy,
           getNetworkPolicy: deps.getNetworkPolicy,
+          attachmentService: deps.attachmentService ?? undefined,
         });
 
         if (parsed.responseMode === "stream") {
@@ -117,6 +131,10 @@ export function runRoutes(deps: RunRouteDeps) {
           return detailError(404, error.message);
         }
 
+        if (error instanceof RuntimeAttachmentError) {
+          return Response.json(attachmentErrorEnvelope(error), { status: error.status });
+        }
+
         if (
           error instanceof RuntimeConversationBusyError ||
           error instanceof RuntimeMessageNotEditableError
@@ -131,7 +149,7 @@ export function runRoutes(deps: RunRouteDeps) {
         tags: ["运行"],
         summary: "创建并流式执行 Run",
         description:
-          "创建 Runtime Run。公开请求使用 agent_mode 表达内置 agent 运行模式，使用 input.parts 承载用户输入，当前仅支持 text part，并返回 AI SDK 兼容 UI message stream。",
+          "创建 Runtime Run。公开请求使用 agent_mode 表达内置 agent 运行模式，input.parts 接受有序 text part 与仅含最终 attachment_id 的 file part，并返回 AI SDK 兼容 UI message stream。",
         requestBody: jsonRequestBody(
           runCreateRequestSchema,
           "创建 Runtime Run 的请求参数。响应模式必须通过 body 字段显式声明，不使用 Accept header 协商。",
@@ -168,6 +186,7 @@ export function runRoutes(deps: RunRouteDeps) {
           continuations: deps.continuations,
           getToolApprovalPolicy: deps.getToolApprovalPolicy,
           getNetworkPolicy: deps.getNetworkPolicy,
+          attachmentService: deps.attachmentService ?? undefined,
         });
         return (
           await runner.continueText(
@@ -383,11 +402,29 @@ const runInputTextPartSchema: OpenApiSchema = {
     type: {
       type: "string",
       enum: ["text"],
-      description: "第一版仅支持 text part。",
+      description: "文本 part。",
     },
     text: {
       ...stringSchema,
       description: "用户输入文本。",
+    },
+  },
+};
+
+const runInputFilePartSchema: OpenApiSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["type", "attachment_id"],
+  properties: {
+    type: {
+      type: "string",
+      enum: ["file"],
+      description: "已完成上传的附件 part。",
+    },
+    attachment_id: {
+      ...stringSchema,
+      pattern: "^att_.+$",
+      description: "专用上传 API 返回的最终 Attachment ID。",
     },
   },
 };
@@ -399,11 +436,25 @@ const runInputSchema: OpenApiSchema = {
   properties: {
     parts: {
       type: "array",
-      description: "用户输入 part 列表；第一版仅支持 text part。",
-      items: runInputTextPartSchema,
+      minItems: 1,
+      description: "保持用户输入顺序的 text/file part 列表。",
+      items: {
+        oneOf: [runInputTextPartSchema, runInputFilePartSchema],
+      },
     },
   },
 };
+
+function containsFileInputPart(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const input = (value as Record<string, unknown>).input;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return false;
+  const parts = (input as Record<string, unknown>).parts;
+  return Array.isArray(parts) && parts.some(
+    (part) => typeof part === "object" && part !== null &&
+      !Array.isArray(part) && (part as Record<string, unknown>).type === "file",
+  );
+}
 
 const runCreateRequestSchema: OpenApiSchema = {
   type: "object",

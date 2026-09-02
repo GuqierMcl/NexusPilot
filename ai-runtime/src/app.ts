@@ -13,6 +13,7 @@ import { type discoverOpenAICompatibleModels } from "./provider/model-discovery"
 import { type testOpenAICompatibleToolCalling } from "./provider/tool-call-compatibility";
 import { ProviderService } from "./provider/service";
 import { agentModeRoutes } from "./routes/agent-modes";
+import { attachmentRoutes } from "./routes/attachments";
 import { conversationRoutes } from "./routes/conversations";
 import { eventRoutes } from "./routes/events";
 import { healthRoutes } from "./routes/health";
@@ -41,6 +42,8 @@ import {
   createTableToolNamespace,
   createWebToolNamespace,
   type ConversationTitleTextGenerator,
+  RuntimeAttachmentService,
+  RuntimeAttachmentSqliteStore,
 } from "./runtime";
 import { openRuntimeDatabase, type RuntimeDatabase } from "./storage/runtime-database";
 import { APP_VERSION } from "./version";
@@ -78,6 +81,7 @@ export interface AppFactoryDeps {
   toolRegistry?: RuntimeToolRegistry;
   backendBridge?: BackendBridgeManager;
   runtimeSettingsService?: RuntimeSettingsService;
+  attachmentService?: RuntimeAttachmentService | null;
 }
 
 type AppRuntimeConfig = Omit<
@@ -139,6 +143,16 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
   const runtimeStore = runtimeDatabase
     ? new RuntimeSqliteStore(runtimeDatabase, { eventBus: runtimeEventBus ?? undefined })
     : null;
+  const attachmentService =
+    deps.attachmentService === undefined
+      ? runtimeDatabase && config.dataDir
+        ? new RuntimeAttachmentService(
+            new RuntimeAttachmentSqliteStore(runtimeDatabase),
+            config.dataDir,
+          )
+        : null
+      : deps.attachmentService;
+  await attachmentService?.initialize();
   const generateConversationTitle = runtimeStore
     ? createConversationTitleGenerator({
         store: runtimeStore,
@@ -202,6 +216,7 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
               description: "内置 Agent Mode 的只读 UI catalog",
             },
             { name: "运行", description: "AI Runtime Run 创建与执行接口" },
+            { name: "附件", description: "Runtime-owned 附件上传与内容读取接口" },
             {
               name: "运行时设置",
               description: "AI Runtime 权威偏好与工具审批策略",
@@ -272,11 +287,12 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
     .onStop(() => {
       backendBridge.shutdown();
       preparedInvocations.clearAll();
+      attachmentService?.dispose();
       if (ownsRuntimeDatabase) {
         runtimeStore?.close();
       }
     })
-    .use(healthRoutes(backendBridge))
+    .use(healthRoutes(backendBridge, attachmentService, Boolean(runtimeDatabase)))
     .use(backendBridgeRoutes(backendBridge))
     .use(providerRoutes({
       providerService,
@@ -286,6 +302,7 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
     }))
     .use(runtimeSettingsRoutes(runtimeSettingsService))
     .use(agentModeRoutes())
+    .use(attachmentRoutes({ attachmentService }))
     .use(conversationRoutes({
       runtimeStore,
       activeRuns,
@@ -311,6 +328,7 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
           runtimeSettingsService.snapshot().toolPolicy,
         getNetworkPolicy: () => runtimeSettingsService.snapshot().networkPolicy,
         appVersion: APP_VERSION,
+        attachmentService,
       }),
     );
 }

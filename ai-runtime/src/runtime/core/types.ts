@@ -14,6 +14,9 @@ export type PermissionId = RuntimeId<"perm">;
 export type EventId = RuntimeId<"evt">;
 export type TraceId = RuntimeId<"trace">;
 export type DiffId = RuntimeId<"diff">;
+export type UploadId = RuntimeId<"upl">;
+export type AttachmentId = RuntimeId<"att">;
+export type BlobId = RuntimeId<"blob">;
 
 export interface TimeCreated {
   created: number;
@@ -294,11 +297,10 @@ export interface ReasoningPart extends BasePart {
 
 export interface FilePart extends BasePart {
   type: "file";
-  mimeType: string;
-  filename?: string;
-  url?: string;
-  dataRef?: string;
-  source?: FileSource;
+  attachmentId: AttachmentId;
+  mediaType: string;
+  filename: string;
+  byteLength: number;
 }
 
 export interface SourcePart extends BasePart {

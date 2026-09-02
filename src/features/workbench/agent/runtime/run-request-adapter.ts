@@ -6,9 +6,9 @@ import {
 
 import type {
     RunAgentMode,
+    RunCreateInputPart,
     RunCreateRequest,
     RunCreateRequestMetadata,
-    RunCreateTextInputPart,
     RunContinueRequest,
     RunModelSelection,
 } from "@/lib/ai-runtime/runs";
@@ -93,7 +93,7 @@ export function buildRunCreateRequestFromAiSdkMessages(
         );
     }
 
-    const parts = extractTextInputParts(userMessage);
+    const parts = extractRunInputParts(userMessage);
     const metadata = buildMetadata({
         clientThreadId: input.clientThreadId,
         clientUserMessageId: userMessage.id,
@@ -225,7 +225,7 @@ export function formatRunRequestAdapterError(error: unknown): string | null {
         case "unsupported_trigger":
             return "该操作即将支持";
         case "unsupported_input_part":
-            return "当前版本暂不支持此输入类型";
+            return error.message;
         case "missing_model":
             return "请选择模型";
         case "missing_user_message":
@@ -263,8 +263,8 @@ function findLastUserMessage(messages: UIMessage[]): UIMessage | null {
     return null;
 }
 
-function extractTextInputParts(message: UIMessage): RunCreateTextInputPart[] {
-    const result: RunCreateTextInputPart[] = [];
+function extractRunInputParts(message: UIMessage): RunCreateInputPart[] {
+    const result: RunCreateInputPart[] = [];
 
     for (const part of message.parts) {
         if (!isRecord(part)) {
@@ -278,10 +278,27 @@ function extractTextInputParts(message: UIMessage): RunCreateTextInputPart[] {
         const partRecord: Record<string, unknown> = part;
         const partType =
             typeof partRecord.type === "string" ? partRecord.type : "unknown";
+        if (partType === "file") {
+            const value = typeof partRecord.url === "string"
+                ? partRecord.url
+                : typeof partRecord.data === "string"
+                  ? partRecord.data
+                  : "";
+            const match = /^nexuspilot-attachment:(att_[A-Za-z0-9]+)$/.exec(value);
+            if (!match?.[1]) {
+                throw new RunRequestAdapterError(
+                    "unsupported_input_part",
+                    "附件尚未完成上传，无法发送。",
+                    { partType },
+                );
+            }
+            result.push({ type: "file", attachment_id: match[1] });
+            continue;
+        }
         if (partType !== "text") {
             throw new RunRequestAdapterError(
                 "unsupported_input_part",
-                `当前阶段暂不支持 ${partType} 输入。`,
+                `暂不支持 ${partType} 输入。`,
                 { partType },
             );
         }

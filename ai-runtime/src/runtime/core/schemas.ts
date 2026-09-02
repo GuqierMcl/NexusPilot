@@ -401,11 +401,10 @@ export const partSchema = z.discriminatedUnion("type", [
   z.object({
     ...basePartShape,
     type: z.literal("file"),
-    mimeType: z.string(),
-    filename: z.string().optional(),
-    url: z.string().optional(),
-    dataRef: z.string().optional(),
-    source: unknownRecordSchema.optional(),
+    attachmentId: z.string().startsWith("att_"),
+    mediaType: z.string(),
+    filename: z.string(),
+    byteLength: z.number().int().nonnegative(),
   }),
   z.object({
     ...basePartShape,

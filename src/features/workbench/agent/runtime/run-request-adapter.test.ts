@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { UIMessage } from "ai";
 
 import {
+    buildRunCreateRequestFromAiSdkMessages,
     buildRunContinueRequestFromAiSdkMessages,
     createPrepareRunSendMessagesRequest,
 } from "./run-request-adapter";
@@ -65,6 +66,62 @@ describe("run continuation request adapter", () => {
             },
         });
         clearPermissionDecision(approvalId);
+    });
+});
+
+describe("run attachment request adapter", () => {
+    test("maps the stable Runtime scheme to attachment_id and preserves order", () => {
+        expect(buildRunCreateRequestFromAiSdkMessages({
+            selectedModel: { providerId: "openai", modelId: "gpt-4o" },
+            messages: [{
+                id: "msg_user",
+                role: "user",
+                parts: [
+                    { type: "text", text: "  Compare  " },
+                    {
+                        type: "file",
+                        mediaType: "image/png",
+                        filename: "chart.png",
+                        url: "nexuspilot-attachment:att_chart123",
+                    },
+                ],
+            }],
+        }).input.parts).toEqual([
+            { type: "text", text: "Compare" },
+            { type: "file", attachment_id: "att_chart123" },
+        ]);
+    });
+
+    test("allows pure attachments and rejects URLs or upload ids", () => {
+        const build = (url: string) => buildRunCreateRequestFromAiSdkMessages({
+            selectedModel: { providerId: "openai", modelId: "gpt-4o" },
+            messages: [{
+                id: "msg_user",
+                role: "user",
+                parts: [{
+                    type: "file",
+                    mediaType: "application/pdf",
+                    filename: "a.pdf",
+                    url,
+                }],
+            }],
+        });
+
+        expect(build("nexuspilot-attachment:att_pdf123").input.parts).toEqual([
+            { type: "file", attachment_id: "att_pdf123" },
+        ]);
+        for (const value of [
+            "https://example.com/a.pdf",
+            "nexuspilot-attachment:upl_pending",
+        ]) {
+            let message = "";
+            try {
+                build(value);
+            } catch (error) {
+                message = error instanceof Error ? error.message : String(error);
+            }
+            expect(message.includes("附件尚未完成上传")).toBe(true);
+        }
     });
 });
 

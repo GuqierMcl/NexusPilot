@@ -1,6 +1,7 @@
 import type { RuntimeId, RuntimeIdPrefix } from "../core/ids";
 import type {
   AgentMode,
+  AttachmentId,
   AssistantMessage,
   Conversation,
   ConversationId,
@@ -25,6 +26,7 @@ import type {
   UserMessage,
 } from "../core/types";
 import type { RunToolSnapshot } from "../tools/resolution";
+import type { RuntimeAttachmentService } from "../attachments";
 
 export const DEFAULT_RUN_LIMITS: RunLimits = {
   maxSteps: 1,
@@ -63,12 +65,18 @@ export interface RunRequest {
   replaceFromMessageId?: MessageId;
   providerId: string;
   modelId: string;
-  text: string;
+  /** @deprecated Prefer ordered parts at the HTTP boundary. Kept for internal callers/tests. */
+  text?: string;
+  parts?: RunRequestInputPart[];
   agentMode?: AgentMode;
   title?: string;
   executionPolicy?: RunExecutionPolicySnapshot;
   metadata?: Record<string, unknown>;
 }
+
+export type RunRequestInputPart =
+  | { type: "text"; text: string }
+  | { type: "file"; attachmentId: AttachmentId };
 
 export interface NormalizedRunRequest {
   runId?: Run["id"];
@@ -78,6 +86,7 @@ export interface NormalizedRunRequest {
   providerId: string;
   modelId: string;
   text: string;
+  parts: RunRequestInputPart[];
   agentMode: AgentMode;
   title: string;
   titleSource: "fallback" | "user";
@@ -155,6 +164,7 @@ export interface RuntimeRunnerStore {
 
 export interface RuntimeRunnerDependencies {
   store: RuntimeRunnerStore;
+  attachmentService?: RuntimeAttachmentService | null;
   now?: () => number;
   createId?: <TPrefix extends RuntimeIdPrefix>(prefix: TPrefix) => RuntimeId<TPrefix>;
   appVersion?: string;
@@ -219,10 +229,13 @@ export type RunExecutionResult =
   | RuntimeRunInterrupted;
 
 export function normalizeRunRequest(request: RunRequest): NormalizedRunRequest {
-  const text = request.text.trim();
-  if (!text) {
-    throw new Error("RunRequest.text must not be empty");
-  }
+  const parts = normalizeRunInputParts(request);
+  const text = parts
+    .filter((part): part is Extract<RunRequestInputPart, { type: "text" }> =>
+      part.type === "text",
+    )
+    .map((part) => part.text)
+    .join("\n\n");
 
   const agentMode = request.agentMode ?? "ask";
   const executionPolicy = request.executionPolicy ?? createDefaultExecutionPolicy();
@@ -236,6 +249,7 @@ export function normalizeRunRequest(request: RunRequest): NormalizedRunRequest {
     providerId: request.providerId,
     modelId: request.modelId,
     text,
+    parts,
     agentMode,
     title: requestedTitle || createDefaultConversationTitle(text),
     titleSource: requestedTitle ? "user" : "fallback",
@@ -243,6 +257,26 @@ export function normalizeRunRequest(request: RunRequest): NormalizedRunRequest {
     executionPolicy,
     metadata: request.metadata,
   };
+}
+
+function normalizeRunInputParts(request: RunRequest): RunRequestInputPart[] {
+  const source = request.parts ?? (request.text === undefined
+    ? []
+    : [{ type: "text" as const, text: request.text }]);
+  if (source.length === 0) {
+    throw new Error("RunRequest.parts must contain at least one part");
+  }
+
+  return source.map((part) => {
+    if (part.type === "file") {
+      return part;
+    }
+    const text = part.text.trim();
+    if (!text) {
+      throw new Error("RunRequest text parts must not be empty");
+    }
+    return { type: "text", text };
+  });
 }
 
 export function createDefaultConversationTitle(text: string): string {

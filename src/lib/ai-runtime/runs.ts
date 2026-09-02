@@ -31,7 +31,14 @@ export interface RunCreateTextInputPart {
     text: string;
 }
 
-export type RunCreateInputPart = RunCreateTextInputPart;
+export interface RunCreateFileInputPart {
+    type: "file";
+    attachment_id: string;
+}
+
+export type RunCreateInputPart =
+    | RunCreateTextInputPart
+    | RunCreateFileInputPart;
 
 export interface RunCreateInput {
     parts: RunCreateInputPart[];

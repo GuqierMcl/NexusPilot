@@ -67,17 +67,14 @@ export function projectPartToAiSdkUIParts(part: Part): AiSdkUIPartLike[] {
         },
       ];
     case "file": {
-      const url = part.url ?? part.dataRef;
-      return url
-        ? [
-            {
-              type: "file",
-              mediaType: part.mimeType,
-              filename: part.filename,
-              url,
-            },
-          ]
-        : [];
+      return [
+        {
+          type: "file",
+          mediaType: part.mediaType,
+          filename: part.filename,
+          url: `nexuspilot-attachment:${part.attachmentId}`,
+        },
+      ];
     }
     case "tool":
       return [projectToolPart(part)];
