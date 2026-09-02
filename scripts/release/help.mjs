@@ -30,7 +30,7 @@ ${commands}:
       检查工具链、.env.release.local、版本同步、CHANGELOG.md 和对象存储配置。
 
   prepare <patch|minor|major|prerelease|prepatch|preminor|premajor|x.y.z> [--preid alpha|beta|rc]
-      递增或设置根版本号，刷新 lockfile，同步版本文件，并轮转 CHANGELOG.md。
+      递增或设置根版本号，同步版本文件和 Cargo.lock 根包版本，并轮转 CHANGELOG.md。
 
   build
       读取发布环境变量，执行带 updater 签名的 Tauri 生产构建。

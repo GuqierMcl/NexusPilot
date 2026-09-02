@@ -125,7 +125,7 @@ git push --follow-tags
 说明：
 
 1. `doctor` 检查工具、环境文件、对象存储配置、版本同步和 CHANGELOG 状态。
-2. `prepare` bump 或设置版本号，刷新 lockfile，同步 Tauri/Rust/AI Runtime 版本，并把 `[Unreleased]` 轮转成当前版本。
+2. `prepare` bump 或设置版本号，同步 Tauri/Rust/AI Runtime 版本与 `Cargo.lock` 根包版本，并把 `[Unreleased]` 轮转成当前版本；已锁定的 Rust 依赖版本保持不变。
 3. `build` 读取 `.env.release.local`，运行前端/AI Runtime 验证，并执行签名 Tauri production build。
 4. `collect` 从 `src-tauri/target/release/bundle/` 复制当前版本产物到 `releases/vX.Y.Z/`，并在该版本目录内生成 `index.json`、`latest.json`、`notes.md` 和 `checksums.sha256`。
 5. `publish --dry-run` 打印将要上传的 MinIO/S3 对象路径，不写入远端。

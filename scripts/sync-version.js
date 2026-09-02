@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
-import { spawnSync } from 'child_process';
+
+import { updateCargoLockPackageVersion } from './sync-version-utils.js';
 
 const pkgPath = path.resolve('package.json');
 const pkgData = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
@@ -19,21 +20,6 @@ function replaceRequired(content, pattern, replacement, label) {
   }
 
   return content.replace(pattern, replacement);
-}
-
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    stdio: 'inherit',
-    ...options,
-  });
-
-  if (result.error) {
-    throw result.error;
-  }
-
-  if (result.status !== 0) {
-    throw new Error(`命令执行失败：${command} ${args.join(' ')}`);
-  }
 }
 
 const skipConfirm = process.argv.includes('--yes');
@@ -64,9 +50,13 @@ function doSync() {
     console.log(`✅ 已更新 ai-runtime/package.json -> ${version}`);
   }
 
-  const cargoCommand = process.platform === 'win32' ? 'cargo.exe' : 'cargo';
-  run(cargoCommand, ['generate-lockfile'], { cwd: path.resolve('src-tauri') });
-  console.log('✅ 已刷新 src-tauri/Cargo.lock');
+  const cargoLockPath = path.resolve('src-tauri/Cargo.lock');
+  const cargoLock = fs.readFileSync(cargoLockPath, 'utf-8');
+  writeTextFile(
+    cargoLockPath,
+    updateCargoLockPackageVersion(cargoLock, 'NexusPilot', version),
+  );
+  console.log('✅ 已更新 src-tauri/Cargo.lock 根包版本');
 
   console.log('🎉 所有版本号同步完成！');
 }
