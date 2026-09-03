@@ -148,3 +148,7 @@ Please do not open public issues for security vulnerabilities. When reporting a 
 Licensed under the [Apache License, Version 2.0](./LICENSE).
 
 NexusPilot and NIEEX are trademarks of the maintainer; see [NOTICE](./NOTICE).
+
+## 🙏 Acknowledgements
+
+- [Linux Do Community](https://linux.do/)

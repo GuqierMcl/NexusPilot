@@ -148,3 +148,7 @@ NexusPilot 采用由用户自行配置提供商的模式。你可以在本地 AI
 本项目采用 [Apache License 2.0](./LICENSE) 开源。
 
 NexusPilot 与 NIEEX 为维护者商标，详见 [NOTICE](./NOTICE)。
+
+## 🙏 致谢
+
+- [Linux Do 社区](https://linux.do/)
