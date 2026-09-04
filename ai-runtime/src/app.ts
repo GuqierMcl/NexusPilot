@@ -1,6 +1,7 @@
 import { cors } from "@elysiajs/cors";
 import { openapi } from "@elysiajs/openapi";
 import { Elysia } from "elysia";
+import { generateText } from "ai";
 import { createRuntimeLogger, type RuntimeLogger } from "./core/logger";
 import {
   createRuntimeAccessAuth,
@@ -44,6 +45,9 @@ import {
   type ConversationTitleTextGenerator,
   RuntimeAttachmentService,
   RuntimeAttachmentSqliteStore,
+  ContextCompactionService,
+  ModelContextManager,
+  type ContextSummaryGenerator,
 } from "./runtime";
 import { openRuntimeDatabase, type RuntimeDatabase } from "./storage/runtime-database";
 import { APP_VERSION } from "./version";
@@ -82,6 +86,7 @@ export interface AppFactoryDeps {
   backendBridge?: BackendBridgeManager;
   runtimeSettingsService?: RuntimeSettingsService;
   attachmentService?: RuntimeAttachmentService | null;
+  contextSummaryGenerator?: ContextSummaryGenerator;
 }
 
 type AppRuntimeConfig = Omit<
@@ -185,6 +190,19 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
     ]);
   const backendToolExecutor = createBackendBridgeToolExecutor(backendBridge);
   const preparedInvocations = new PreparedToolInvocationRegistry();
+  const contextCompactionService = runtimeStore
+    ? new ContextCompactionService({
+        store: runtimeStore,
+        generator: deps.contextSummaryGenerator ?? generateRuntimeContextSummary,
+      })
+    : undefined;
+  const contextManager = runtimeStore && contextCompactionService
+    ? new ModelContextManager({
+        store: runtimeStore,
+        compactionService: contextCompactionService,
+        attachmentService,
+      })
+    : undefined;
 
   return new Elysia()
     .use(
@@ -329,6 +347,19 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
         getNetworkPolicy: () => runtimeSettingsService.snapshot().networkPolicy,
         appVersion: APP_VERSION,
         attachmentService,
+        contextManager,
       }),
     );
 }
+
+const generateRuntimeContextSummary: ContextSummaryGenerator = async (input) => {
+  const result = await generateText({
+    model: input.model,
+    system: input.system,
+    messages: input.messages,
+    maxOutputTokens: input.maxOutputTokens,
+    abortSignal: input.abortSignal,
+    timeout: input.timeoutMs,
+  });
+  return { text: result.text, usage: result.usage };
+};

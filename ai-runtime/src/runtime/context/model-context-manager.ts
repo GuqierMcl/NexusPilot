@@ -1,9 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { LanguageModel, ModelMessage } from "ai";
 
 import type { RuntimeAttachmentService } from "../attachments";
 import { createRuntimeId, type RuntimeId, type RuntimeIdPrefix } from "../core/ids";
-import type { ConversationId, Message, Run, RunId } from "../core/types";
+import type { ConversationId, Message, MessageId, Run, RunId } from "../core/types";
 import {
   projectContextBoundaries,
   projectModelHistory,
@@ -20,9 +20,15 @@ import type {
   ContextCompactionPolicy,
   ContextCompactionTrigger,
   ContextPlan,
+  ContextPlannerInput,
   ContextPreparationClaim,
   ContextPlannerSnapshot,
 } from "./types";
+import {
+  CONTEXT_ESTIMATOR_OVERHEAD,
+  estimateJsonTokens,
+  stableStringifyJson,
+} from "./token-estimator";
 
 export interface ModelContextPreparationInput {
   conversationId: ConversationId;
@@ -40,6 +46,14 @@ export interface ModelContextPreparationInput {
   safetyStateMaxTokens?: number;
   abortSignal?: AbortSignal;
   timeoutMs?: number;
+  /** Keep the durable current User while the runner replays the exact in-flight AI SDK suffix. */
+  excludeAssistantMessageId?: MessageId;
+  /** Exact AI SDK messages retained after the durable base projection. */
+  retainedMessages?: ModelMessage[];
+}
+
+interface ResolvedModelContextPreparationInput extends ModelContextPreparationInput {
+  retainedModelInput?: ContextPlannerInput["retainedModelInput"];
 }
 
 export interface ContextCompactionMarker {
@@ -104,7 +118,11 @@ export class ModelContextManager {
 
   prepare(input: ModelContextPreparationInput): Promise<PreparedModelContext> {
     input.abortSignal?.throwIfAborted();
-    const requestHash = computeContextPlanRequestHash(input);
+    const resolvedInput: ResolvedModelContextPreparationInput = {
+      ...input,
+      retainedModelInput: describeRetainedModelInput(input.retainedMessages),
+    };
+    const requestHash = computeContextPlanRequestHash(resolvedInput);
     const key = `${input.runId}:${input.requestIndex}`;
     const broker = getPreparationBroker(this.store.getContextPreparationBrokerKey());
     const inFlight = broker.get(key);
@@ -115,7 +133,9 @@ export class ModelContextManager {
       return inFlight.operation;
     }
 
-    const operation = Promise.resolve().then(() => this.prepareClaimed(input, requestHash));
+    const operation = Promise.resolve().then(() =>
+      this.prepareClaimed(resolvedInput, requestHash)
+    );
     broker.set(key, { requestHash, operation });
     const clear = (): void => {
       if (broker.get(key)?.operation === operation) {
@@ -127,7 +147,7 @@ export class ModelContextManager {
   }
 
   private async prepareClaimed(
-    input: ModelContextPreparationInput,
+    input: ResolvedModelContextPreparationInput,
     requestHash: string,
   ): Promise<PreparedModelContext> {
     const durablePlan = this.store.getContextPlanByRunRequest(input.runId, input.requestIndex);
@@ -161,7 +181,7 @@ export class ModelContextManager {
   }
 
   private async prepareOnce(
-    input: ModelContextPreparationInput,
+    input: ResolvedModelContextPreparationInput,
     requestHash: string,
     preparationClaim: ContextPreparationClaim,
   ): Promise<PreparedModelContext> {
@@ -177,7 +197,7 @@ export class ModelContextManager {
     let { snapshot, plan } = this.planFromStore(input, input.runId);
     let createdCheckpoint: ContextCheckpoint | undefined;
 
-    if (plan.reason === "compaction_required") {
+    if (plan.reason === "compaction_required" && input.trigger !== "auto_mid_turn") {
       let result: Awaited<ReturnType<ContextCompactionService["compact"]>> | undefined;
       try {
         result = await this.compactionService.compact({
@@ -198,6 +218,8 @@ export class ModelContextManager {
           candidateCoverageThroughRunId: plan.eligibleCoverageThroughRunId,
           policy: input.policy,
           safetyStateMaxTokens: input.safetyStateMaxTokens,
+          excludeAssistantMessageId: input.excludeAssistantMessageId,
+          retainedModelInput: input.retainedModelInput,
           abortSignal: input.abortSignal,
           timeoutMs: input.timeoutMs,
         });
@@ -225,7 +247,11 @@ export class ModelContextManager {
       }
     }
 
-    if (plan.reason === "compaction_required" && !isRawWithinHardBudget(plan)) {
+    if (
+      plan.reason === "compaction_required"
+      && input.trigger !== "auto_mid_turn"
+      && !isRawWithinHardBudget(plan)
+    ) {
       throw new Error("Context compaction did not produce a model view within the hard budget");
     }
     const proposedPlanId = plan.id;
@@ -249,7 +275,7 @@ export class ModelContextManager {
   private saveOrReadDurablePlan(
     plan: ContextPlan,
     snapshot: ContextPlannerSnapshot,
-    input: ModelContextPreparationInput,
+    input: ResolvedModelContextPreparationInput,
     requestHash: string,
     preparationClaim: ContextPreparationClaim,
   ): ContextPlan {
@@ -268,7 +294,7 @@ export class ModelContextManager {
 
   private assertPlanMatchesRequest(
     plan: ContextPlan,
-    input: ModelContextPreparationInput,
+    input: ResolvedModelContextPreparationInput,
     requestHash: string,
   ): void {
     if (
@@ -296,7 +322,7 @@ export class ModelContextManager {
   }
 
   private planFromStore(
-    input: ModelContextPreparationInput,
+    input: ResolvedModelContextPreparationInput,
     runId: RunId,
   ): { snapshot: ContextPlannerSnapshot; plan: ContextPlan } {
     const snapshot = readContextPlannerSnapshot(this.store, input.conversationId);
@@ -317,6 +343,8 @@ export class ModelContextManager {
         planId: this.createId("ctxplan"),
         createdAt: this.now(),
         safetyStateMaxTokens: input.safetyStateMaxTokens,
+        excludeAssistantMessageId: input.excludeAssistantMessageId,
+        retainedModelInput: input.retainedModelInput,
       }),
     };
   }
@@ -324,7 +352,7 @@ export class ModelContextManager {
   private async assembleMessages(
     snapshot: ContextPlannerSnapshot,
     plan: ContextPlan,
-    input: ModelContextPreparationInput,
+    input: ResolvedModelContextPreparationInput,
   ): Promise<ModelMessage[]> {
     const checkpoint = plan.checkpointId
       ? snapshot.checkpoints.find((candidate) => candidate.id === plan.checkpointId)
@@ -332,7 +360,11 @@ export class ModelContextManager {
     if (plan.checkpointId && !checkpoint) {
       throw new Error(`Selected Context checkpoint is unavailable: ${plan.checkpointId}`);
     }
-    const rawMessages = messagesForPlan(snapshot, plan.rawRunIds);
+    const rawMessages = messagesForPlan(
+      snapshot,
+      plan.rawRunIds,
+      input.excludeAssistantMessageId,
+    );
     const projectedRaw = await projectModelHistory(rawMessages, {
       target: { providerId: input.providerId, modelId: input.modelId },
       attachmentService: this.attachmentService,
@@ -340,8 +372,27 @@ export class ModelContextManager {
     return [
       ...projectContextBoundaries({ checkpoint, safetyState: plan.safetyState }),
       ...projectedRaw,
+      ...(input.retainedMessages ?? []),
     ];
   }
+}
+
+function describeRetainedModelInput(
+  messages: readonly ModelMessage[] | undefined,
+): ContextPlannerInput["retainedModelInput"] {
+  if (!messages?.length) return undefined;
+  return {
+    estimatedTokens: messages.reduce(
+      (total, message) => total
+        + CONTEXT_ESTIMATOR_OVERHEAD.message
+        + CONTEXT_ESTIMATOR_OVERHEAD.part
+        + estimateJsonTokens(message),
+      0,
+    ),
+    contentHash: `sha256:${createHash("sha256")
+      .update(stableStringifyJson(messages))
+      .digest("hex")}`,
+  };
 }
 
 function getPreparationBroker(
@@ -387,7 +438,11 @@ function isRawWithinHardBudget(plan: ContextPlan): boolean {
       <= plan.budget.hardInputBudget;
 }
 
-function messagesForPlan(snapshot: ContextPlannerSnapshot, runIds: readonly RunId[]): Message[] {
+function messagesForPlan(
+  snapshot: ContextPlannerSnapshot,
+  runIds: readonly RunId[],
+  excludeAssistantMessageId?: MessageId,
+): Message[] {
   const runsById = new Map(snapshot.runs.map((run) => [run.id, run]));
   const messagesById = new Map(snapshot.messages.map((message) => [message.id, message]));
   return runIds.flatMap((runId) => {
@@ -399,7 +454,7 @@ function messagesForPlan(snapshot: ContextPlannerSnapshot, runIds: readonly RunI
     if (!run || !user || user.role !== "user" || !assistant || assistant.role !== "assistant") {
       throw new Error(`Context plan raw Run has incomplete Messages: ${runId}`);
     }
-    return [user, assistant];
+    return assistant.id === excludeAssistantMessageId ? [user] : [user, assistant];
   });
 }
 

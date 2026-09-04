@@ -45,6 +45,7 @@ describe("model execution error normalization", () => {
         isRetryable: true,
       },
     });
+    expect(JSON.stringify(toRuntimeModelError(error))).not.toContain("secret");
   });
 
   test("does not fabricate retryability or a provider error name", () => {

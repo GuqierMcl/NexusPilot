@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import type { AssistantMessage, Message, Run, RunId, UserMessage } from "../core/types";
+import type {
+  AssistantMessage,
+  Message,
+  MessageId,
+  Run,
+  RunId,
+  UserMessage,
+} from "../core/types";
 import {
   CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION,
   CONTEXT_CHECKPOINT_FORMAT_VERSION,
@@ -90,6 +97,8 @@ export function computeContextPlanRequestHash(
     | "trigger"
     | "policy"
     | "safetyStateMaxTokens"
+    | "excludeAssistantMessageId"
+    | "retainedModelInput"
   >,
 ): string {
   const identity = {
@@ -105,6 +114,8 @@ export function computeContextPlanRequestHash(
     trigger: input.trigger,
     policy: input.policy,
     safetyStateMaxTokens: input.safetyStateMaxTokens,
+    excludeAssistantMessageId: input.excludeAssistantMessageId,
+    retainedModelInput: input.retainedModelInput,
   };
   return `sha256:${createHash("sha256")
     .update(stableStringifyJson(identity))
@@ -115,7 +126,11 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
   assertPlannerInput(input);
   const lineage = resolveActiveLineage(input);
   const lineageRunIds = lineage.runs.map((run) => run.id);
-  const fullMessages = messagesForRuns(lineage, lineage.runs);
+  const fullMessages = messagesForRuns(
+    lineage,
+    lineage.runs,
+    input.excludeAssistantMessageId,
+  );
   const safetyState = buildRuntimeSafetyState({
     conversationId: input.snapshot.conversation.id,
     activeRunIds: lineageRunIds,
@@ -125,7 +140,8 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
   });
   const systemPromptTokens = estimateTextTokens(input.systemPrompt);
   const toolSchemaTokens = estimateJsonTokens(input.toolSchemas);
-  const fullRawTokens = estimateMessagesTokens(fullMessages);
+  const retainedModelInputTokens = input.retainedModelInput?.estimatedTokens ?? 0;
+  const fullRawTokens = estimateMessagesTokens(fullMessages) + retainedModelInputTokens;
   const safetyStateTokens = estimateJsonTokens(safetyState);
   const validContextWindow = isValidContextWindow(input.contextWindow)
     ? input.contextWindow
@@ -159,6 +175,8 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
   });
   const rawContentTokens = fullRawTokens + safetyStateTokens;
   if (
+    input.trigger !== "provider_overflow"
+    &&
     rawContentTokens <= (rawBudget.hardInputBudget ?? Number.NEGATIVE_INFINITY)
     && rawContentTokens < (rawBudget.softTriggerTokens ?? Number.NEGATIVE_INFINITY)
   ) {
@@ -174,13 +192,16 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
 
   const safeCoverageIndices = findSafeCoverageIndices(input, lineage.runs);
   const targetTokens = rawBudget.targetTokens ?? Number.NEGATIVE_INFINITY;
-  const candidates = input.snapshot.checkpoints
+  const candidates = input.trigger === "provider_overflow"
+    ? []
+    : input.snapshot.checkpoints
     .map((checkpoint) => createCheckpointCandidate(
       checkpoint,
       input,
       lineage,
       safeCoverageIndices,
       safetyStateTokens,
+      retainedModelInputTokens,
     ))
     .filter((candidate): candidate is CheckpointCandidate =>
       candidate !== null && candidate.contentTokens <= targetTokens,
@@ -251,6 +272,15 @@ function assertPlannerInput(input: ContextPlannerInput): void {
   }
   if (!isNonnegativeInteger(input.reservedOutputTokens)) {
     throw new Error("Context planner reservedOutputTokens must be a non-negative safe integer");
+  }
+  if (
+    input.retainedModelInput !== undefined
+    && (
+      !isNonnegativeInteger(input.retainedModelInput.estimatedTokens)
+      || input.retainedModelInput.contentHash.length === 0
+    )
+  ) {
+    throw new Error("Context planner retained model input is invalid");
   }
   const policy = input.policy;
   if (
@@ -326,13 +356,19 @@ function resolveActiveLineage(input: ContextPlannerInput): ResolvedContextLineag
   return { runs, messagesByRun };
 }
 
-function messagesForRuns(lineage: ResolvedContextLineage, runs: readonly Run[]): Message[] {
+function messagesForRuns(
+  lineage: ResolvedContextLineage,
+  runs: readonly Run[],
+  excludeAssistantMessageId?: MessageId,
+): Message[] {
   return runs.flatMap((run) => {
     const messages = lineage.messagesByRun.get(run.id);
     if (!messages) {
       throw new Error(`Context planner Run messages are unavailable: ${run.id}`);
     }
-    return messages;
+    return messages[1].id === excludeAssistantMessageId
+      ? [messages[0]]
+      : messages;
   });
 }
 
@@ -409,6 +445,7 @@ function createCheckpointCandidate(
   lineage: ResolvedContextLineage,
   safeCoverageIndices: readonly number[],
   safetyStateTokens: number,
+  retainedModelInputTokens: number,
 ): CheckpointCandidate | null {
   if (
     checkpoint.conversationId !== input.snapshot.conversation.id
@@ -435,8 +472,12 @@ function createCheckpointCandidate(
   if (rawRuns.length < input.policy.minRawRuns) {
     return null;
   }
-  const rawMessages = messagesForRuns(lineage, rawRuns);
-  const rawTokens = estimateMessagesTokens(rawMessages);
+  const rawMessages = messagesForRuns(
+    lineage,
+    rawRuns,
+    input.excludeAssistantMessageId,
+  );
+  const rawTokens = estimateMessagesTokens(rawMessages) + retainedModelInputTokens;
   const checkpointTokens = CONTEXT_ESTIMATOR_OVERHEAD.message
     + CONTEXT_ESTIMATOR_OVERHEAD.part
     + estimateTextTokens(checkpoint.summary);

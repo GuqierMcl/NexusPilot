@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ModelMessage } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 
 import {
@@ -1224,6 +1225,65 @@ describe("ContextCompactionService", () => {
 });
 
 describe("ModelContextManager", () => {
+  test("appends exact retained model input and binds it to the durable plan identity", async () => {
+    const { db, store } = createHistory();
+    const currentAssistant = store.getMessage("msg_assistant_c");
+    if (!currentAssistant || currentAssistant.role !== "assistant") {
+      throw new Error("Missing current Assistant fixture");
+    }
+    store.saveMessage({
+      ...currentAssistant,
+      parts: currentAssistant.parts.map((part) =>
+        part.type === "text"
+          ? { ...part, text: "CURRENT_ASSISTANT_MUST_NOT_REPLAY" }
+          : part
+      ),
+    });
+    const ids = deterministicIds();
+    const service = new ContextCompactionService({
+      store,
+      generator: async () => { throw new Error("mid-turn must not summarize"); },
+      createId: ids,
+    });
+    const manager = new ModelContextManager({
+      store,
+      compactionService: service,
+      createId: ids,
+    });
+    const common = {
+      contextWindow: 100_000,
+      trigger: "auto_mid_turn" as const,
+      excludeAssistantMessageId: currentAssistant.id,
+    };
+    const baseline = await manager.prepare(preparation("auto_pre_turn", {
+      ...common,
+      requestIndex: 0,
+    }));
+    const retainedMessages: ModelMessage[] = [{
+      role: "assistant",
+      content: "EXACT_RETAINED_MODEL_RESPONSE",
+    }];
+    const retained = await manager.prepare(preparation("auto_pre_turn", {
+      ...common,
+      requestIndex: 1,
+      retainedMessages,
+    }));
+
+    expect(JSON.stringify(retained.messages)).not.toContain(
+      "CURRENT_ASSISTANT_MUST_NOT_REPLAY",
+    );
+    expect(retained.messages.at(-1)).toBe(retainedMessages[0]);
+    expect(retained.plan.budget.rawHistoryTokens).toBeGreaterThan(
+      baseline.plan.budget.rawHistoryTokens,
+    );
+    await expect(manager.prepare(preparation("auto_pre_turn", {
+      ...common,
+      requestIndex: 1,
+      retainedMessages: [{ role: "assistant", content: "CHANGED_RETAINED_RESPONSE" }],
+    }))).rejects.toThrow("does not match the durable Context plan");
+    db.close();
+  });
+
   test("rethrows an already-aborted reason before any Store access or derived writes", async () => {
     const { db, store } = createHistory();
     const storeAccesses: string[] = [];

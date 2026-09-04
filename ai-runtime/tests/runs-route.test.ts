@@ -261,6 +261,12 @@ describe("runs route", () => {
       type: "text",
       text: "Hello from route",
     });
+    expect(store.getLatestContextUsage(conversationId as never)).toMatchObject({
+      runId,
+      requestIndex: 0,
+      view: "raw",
+      estimateSource: "estimate",
+    });
 
     db.close();
   });

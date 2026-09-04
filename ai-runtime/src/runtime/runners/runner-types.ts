@@ -188,6 +188,13 @@ export interface RuntimeRunnerStore {
   releaseContextPreparationClaim(claim: ContextPreparationClaimRelease): boolean;
   listContextPlansByRun(runId: Run["id"]): ContextPlan[];
   getLatestContextUsage(conversationId: ConversationId): ContextUsage | null;
+  getContextUsageByRunRequest(runId: RunId, requestIndex: number): ContextUsage | null;
+  listContextUsagesByRun(runId: RunId): ContextUsage[];
+  updateContextUsageProviderObservation(input: {
+    runId: RunId;
+    requestIndex: number;
+    providerObservation: NonNullable<ContextUsage["providerObservation"]>;
+  }): ContextUsage;
   commitContextCheckpoint(input: ContextCheckpointCommit): "committed" | "stale";
   saveContextPlan(input: ContextPlanCommit): void;
   saveContextUsage(usage: ContextUsage): void;

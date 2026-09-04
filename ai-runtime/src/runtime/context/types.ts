@@ -5,6 +5,7 @@ import type {
   Conversation,
   ConversationId,
   Message,
+  MessageId,
   Permission,
   Run,
   RunId,
@@ -286,4 +287,11 @@ export interface ContextPlannerInput {
   planId: ContextPlanId;
   createdAt: number;
   safetyStateMaxTokens?: number;
+  /** Durable Assistant replaced by the exact in-flight AI SDK suffix. */
+  excludeAssistantMessageId?: MessageId;
+  /** Exact projected suffix already retained by the AI SDK for this request. */
+  retainedModelInput?: {
+    estimatedTokens: number;
+    contentHash: string;
+  };
 }

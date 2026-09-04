@@ -1,7 +1,7 @@
 import type { LanguageModel, LanguageModelUsage, ModelMessage } from "ai";
 
 import { createRuntimeId, type RuntimeId, type RuntimeIdPrefix } from "../core/ids";
-import type { ConversationId, Run, RunId } from "../core/types";
+import type { ConversationId, MessageId, Run, RunId } from "../core/types";
 import type { RuntimeRunnerStore } from "../runners/runner-types";
 import {
   computeContextLineageHash,
@@ -60,6 +60,11 @@ export interface ContextCompactionRequest {
   candidateCoverageThroughRunId?: RunId;
   policy: ContextCompactionPolicy;
   safetyStateMaxTokens?: number;
+  excludeAssistantMessageId?: MessageId;
+  retainedModelInput?: {
+    estimatedTokens: number;
+    contentHash: string;
+  };
   abortSignal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -140,7 +145,15 @@ export class ContextCompactionService {
       planId: this.createId("ctxplan"),
       createdAt: this.now(),
       safetyStateMaxTokens: input.safetyStateMaxTokens,
+      excludeAssistantMessageId: input.excludeAssistantMessageId,
+      retainedModelInput: input.retainedModelInput,
     });
+    if (
+      input.trigger === "provider_overflow"
+      && plan.reason !== "compaction_required"
+    ) {
+      throw new Error("Provider context overflow has no safe compaction boundary");
+    }
     if (plan.reason !== "compaction_required" || !plan.eligibleCoverageThroughRunId) {
       return { status: "not_needed" };
     }

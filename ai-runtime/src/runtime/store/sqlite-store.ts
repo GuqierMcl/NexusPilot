@@ -897,6 +897,28 @@ export class RuntimeSqliteStore {
     return row ? contextUsageSchema.parse(JSON.parse(row.payload_json)) as ContextUsage : null;
   }
 
+  getContextUsageByRunRequest(runId: RunId, requestIndex: number): ContextUsage | null {
+    const row = this.db
+      .query<ContextPayloadRow, [string, number]>(
+        `SELECT payload_json FROM runtime_context_usage
+         WHERE run_id = ? AND request_index = ?
+         LIMIT 1`,
+      )
+      .get(runId, requestIndex);
+    return row ? contextUsageSchema.parse(JSON.parse(row.payload_json)) as ContextUsage : null;
+  }
+
+  listContextUsagesByRun(runId: RunId): ContextUsage[] {
+    return this.db
+      .query<ContextPayloadRow, [string]>(
+        `SELECT payload_json FROM runtime_context_usage
+         WHERE run_id = ?
+         ORDER BY request_index ASC, created_at ASC, id ASC`,
+      )
+      .all(runId)
+      .map((row) => contextUsageSchema.parse(JSON.parse(row.payload_json)) as ContextUsage);
+  }
+
   commitContextCheckpoint(input: ContextCheckpointCommit): "committed" | "stale" {
     const checkpoint = contextCheckpointSchema.parse(input.checkpoint) as ContextCheckpoint;
     let committedEvent: Event | null = null;
@@ -1168,6 +1190,52 @@ export class RuntimeSqliteStore {
         encode(parsed),
         parsed.time.created,
       );
+  }
+
+  updateContextUsageProviderObservation(input: {
+    runId: RunId;
+    requestIndex: number;
+    providerObservation: NonNullable<ContextUsage["providerObservation"]>;
+  }): ContextUsage {
+    const current = this.getContextUsageByRunRequest(input.runId, input.requestIndex);
+    if (!current) {
+      throw new Error(
+        `Context usage estimate was not found: ${input.runId}/${input.requestIndex}`,
+      );
+    }
+    if (current.providerObservation) {
+      if (
+        JSON.stringify(current.providerObservation)
+        !== JSON.stringify(input.providerObservation)
+      ) {
+        throw new Error("Context usage Provider observation is immutable");
+      }
+      return current;
+    }
+    const updated = contextUsageSchema.parse({
+      ...current,
+      providerObservation: input.providerObservation,
+    }) as ContextUsage;
+    const result = this.db
+      .query(
+        `UPDATE runtime_context_usage
+         SET payload_json = ?
+         WHERE run_id = ? AND request_index = ?
+           AND json_extract(payload_json, '$.providerObservation') IS NULL`,
+      )
+      .run(encode(updated), input.runId, input.requestIndex);
+    if (result.changes === 0) {
+      const raced = this.getContextUsageByRunRequest(input.runId, input.requestIndex);
+      if (
+        raced?.providerObservation
+        && JSON.stringify(raced.providerObservation)
+          === JSON.stringify(input.providerObservation)
+      ) {
+        return raced;
+      }
+      throw new Error("Context usage Provider observation is immutable");
+    }
+    return updated;
   }
 
   private validateContextPlan(plan: ContextPlan): void {

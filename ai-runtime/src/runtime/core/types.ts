@@ -864,7 +864,8 @@ export type TraceEventType =
   | "tool.executed"
   | "stream.started"
   | "stream.finished"
-  | "stream.failed";
+  | "stream.failed"
+  | "context.overflow.recovered";
 
 export type RuntimeError =
   | ProviderAuthError

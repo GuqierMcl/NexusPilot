@@ -7,3 +7,4 @@ export * from "./planner";
 export * from "./summary-prompt";
 export * from "./compaction-service";
 export * from "./model-context-manager";
+export * from "./overflow-recovery";

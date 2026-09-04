@@ -76,6 +76,18 @@ import type {
   RuntimeNetworkPolicy,
   RuntimeToolApprovalPolicy,
 } from "../../settings/contracts";
+import type {
+  ContextCompactionMarker,
+  ModelContextManager,
+  PreparedModelContext,
+} from "../context/model-context-manager";
+import {
+  recoverContextOverflow,
+  type ContextOverflowRetryGate,
+} from "../context/overflow-recovery";
+import { DEFAULT_CONTEXT_COMPACTION_POLICY } from "../context/policy";
+import type { ContextPlan, ContextUsage } from "../context/types";
+import { stableStringifyJson } from "../context/token-estimator";
 
 export interface RuntimeResolvedLanguageModel {
   languageModel: LanguageModel;
@@ -206,6 +218,16 @@ export interface RuntimeStreamFinishEvent {
   stepCount?: number;
 }
 
+export interface RuntimePrepareStepEvent {
+  stepNumber: number;
+  messages: ModelMessage[];
+}
+
+export interface RuntimeStepEndEvent {
+  stepNumber: number;
+  usage?: LanguageModelUsage;
+}
+
 export interface RuntimeStreamAbortEvent {
   reason?: string;
 }
@@ -253,6 +275,11 @@ export interface RuntimeStreamTextInput {
   onAbort?: (event: RuntimeStreamAbortEvent) => void | Promise<void>;
   onToolCallStart?: (event: RuntimeToolCallStartEvent) => void | Promise<void>;
   onToolCallFinish?: (event: RuntimeToolCallFinishEvent) => void | Promise<void>;
+  prepareStep?: (
+    event: RuntimePrepareStepEvent,
+  ) => Promise<{ messages?: ModelMessage[] } | void>;
+  onStepEnd?: (event: RuntimeStepEndEvent) => void | Promise<void>;
+  messageMetadata?: () => Record<string, unknown> | undefined;
 }
 
 export interface RuntimeUIMessageStreamResponseOptions extends ResponseInit {
@@ -261,15 +288,25 @@ export interface RuntimeUIMessageStreamResponseOptions extends ResponseInit {
   }) => PromiseLike<void> | void;
   generateMessageId?: IdGenerator;
   onError?: (error: unknown) => string;
+  messageMetadata?: () => Record<string, unknown> | undefined;
 }
 
 export interface RuntimeStreamTextResult {
+  /** Resolves once this attempt can be exposed without losing a safe replacement. */
+  responseReady?: PromiseLike<void>;
   toUIMessageStreamResponse(options?: RuntimeUIMessageStreamResponseOptions): Response;
 }
 
 export type RuntimeStreamText = (
   input: RuntimeStreamTextInput,
 ) => RuntimeStreamTextResult | Promise<RuntimeStreamTextResult>;
+
+type StreamCoordinatorState =
+  | "attempt0"
+  | "recovering"
+  | "attempt1"
+  | "committed"
+  | "terminal";
 
 export interface RuntimeTextRunnerDependencies {
   store: RuntimeRunnerStore;
@@ -292,6 +329,7 @@ export interface RuntimeTextRunnerDependencies {
   getToolApprovalPolicy?: () => RuntimeToolApprovalPolicy;
   getNetworkPolicy?: () => RuntimeNetworkPolicy;
   getErrorMessageSecrets?: () => readonly string[];
+  contextManager?: Pick<ModelContextManager, "prepare">;
 }
 
 export interface RuntimeTextRunResult {
@@ -682,6 +720,9 @@ export class RuntimeTextRunner {
     const createId = this.deps.createId ?? createRuntimeId;
     let finalText = "";
     let terminalWritten = false;
+    let coordinatorState: StreamCoordinatorState = "attempt0";
+    let committedAttempt: 0 | 1 = 0;
+    let recoveryInvalidated = false;
     let unregisterActiveRun: (() => void) | undefined;
     let releasePendingContinuation = releaseContinuation;
     const abortController = new AbortController();
@@ -790,6 +831,7 @@ export class RuntimeTextRunner {
       }
 
       terminalWritten = true;
+      coordinatorState = "terminal";
       cleanupActiveRun();
       cleanupPreparedRun();
       const completedAt = now();
@@ -1064,6 +1106,7 @@ export class RuntimeTextRunner {
       }
 
       terminalWritten = true;
+      coordinatorState = "terminal";
       cleanupActiveRun();
       cleanupPreparedRun();
       const parts = createSemanticParts(now());
@@ -1100,9 +1143,73 @@ export class RuntimeTextRunner {
 
     let result: RuntimeStreamTextResult;
     let streamedStepCount = 0;
+    let latestContextUsage: ContextUsage | undefined;
+    let latestContextMarker: ContextCompactionMarker | undefined;
+    const initialToolCalls = this.deps.store.listToolCallsByRun(started.run.id);
+    const overflowGate: ContextOverflowRetryGate = {
+      runId: started.run.id,
+      attempted: false,
+      modelOutputObserved: false,
+      toolLifecycleObserved: initialToolCalls.length > 0,
+      permissionObserved: this.deps.store.listPermissionsByRun(started.run.id).length > 0,
+      sideEffectObserved: hasDurableSideEffectFact(initialToolCalls),
+    };
+    let retryResult: RuntimeStreamTextResult | undefined;
     try {
-      const messages = continuationMessages ??
-        await projectModelHistory(
+      const prepareManagedContext = async (
+        requestIndex: number,
+        trigger: "auto_pre_turn" | "auto_mid_turn" | "provider_overflow",
+        retainedMessages: ModelMessage[],
+      ): Promise<PreparedModelContext | undefined> => {
+        if (!this.deps.contextManager) return undefined;
+        return this.deps.contextManager.prepare({
+          conversationId: started.conversation.id,
+          runId: started.run.id,
+          requestIndex,
+          providerId: request.providerId,
+          modelId: request.modelId,
+          model: resolved.languageModel,
+          contextWindow: resolved.runtimeContext.provider.contextLength,
+          reservedOutputTokens: remainingOutputTokens(
+            policy.limits.maxOutputTokens,
+            previousUsage,
+          ) ?? resolved.runtimeContext.provider.outputLength ?? 0,
+          systemPrompt: policy.prompt.system,
+          toolSchemas: policy.toolResolution.snapshot,
+          trigger,
+          policy: DEFAULT_CONTEXT_COMPACTION_POLICY,
+          abortSignal: abortSignalLink.signal,
+          timeoutMs: remainingRunTimeout(
+            policy.limits.timeoutMs,
+            started.run.time.started,
+            now(),
+          ),
+          excludeAssistantMessageId: started.assistantMessage.id,
+          retainedMessages,
+        });
+      };
+      let retainedModelMessages = [...(continuationResponsePrefix ?? [])];
+      const initialPrepared = await prepareManagedContext(
+        previousStepCount,
+        continuationMessages ? "auto_mid_turn" : "auto_pre_turn",
+        retainedModelMessages,
+      );
+      if (initialPrepared) {
+        latestContextUsage = persistContextUsageEstimate({
+          store: this.deps.store,
+          createId,
+          started,
+          plan: initialPrepared.plan,
+          providerId: request.providerId,
+          modelId: request.modelId,
+          createdAt: now(),
+        });
+        latestContextMarker = initialPrepared.marker;
+      }
+      const managedMessages = initialPrepared?.messages;
+      const messages = managedMessages
+        ? managedMessages
+        : continuationMessages ?? await projectModelHistory(
           this.deps.store.listActiveLineageMessages(started.conversation.id),
           {
             attachmentService: this.deps.attachmentService,
@@ -1112,6 +1219,311 @@ export class RuntimeTextRunner {
             },
           },
         );
+      let lastPreparedModelMessages = messages;
+      let streamInput: RuntimeStreamTextInput | undefined;
+      const ownsStreamAttempt = (attempt: 0 | 1): boolean =>
+        (coordinatorState === "attempt0" && attempt === 0)
+        || (coordinatorState === "attempt1" && attempt === 1)
+        || (coordinatorState === "committed" && committedAttempt === attempt);
+      const quarantineStaleAttempt = (attempt: 0 | 1): void => {
+        if (attempt === 0 && coordinatorState === "recovering") {
+          recoveryInvalidated = true;
+        }
+      };
+      const bindStreamAttempt = (
+        attemptInput: RuntimeStreamTextInput,
+        attempt: 0 | 1,
+      ): RuntimeStreamTextInput => {
+        const toolApproval = attemptInput.toolApproval;
+        return {
+          ...attemptInput,
+          ...(typeof toolApproval === "function"
+            ? {
+                toolApproval: ((options: Parameters<typeof toolApproval>[0]) => {
+                  if (ownsStreamAttempt(attempt)) return toolApproval(options);
+                  quarantineStaleAttempt(attempt);
+                  return "denied" as const;
+                }) as typeof toolApproval,
+              }
+            : {}),
+          onChunk: attemptInput.onChunk
+            ? (event) => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onChunk?.(event);
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
+          onFinish: attemptInput.onFinish
+            ? (event) => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onFinish?.(event);
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
+          onError: attemptInput.onError
+            ? (event) => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onError?.(event);
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
+          onAbort: attemptInput.onAbort
+            ? (event) => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onAbort?.(event);
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
+          onToolCallStart: attemptInput.onToolCallStart
+            ? (event) => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onToolCallStart?.(event);
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
+          onToolCallFinish: attemptInput.onToolCallFinish
+            ? (event) => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onToolCallFinish?.(event);
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
+          prepareStep: attemptInput.prepareStep
+            ? async (event) => {
+                if (ownsStreamAttempt(attempt)) return await attemptInput.prepareStep?.(event);
+                quarantineStaleAttempt(attempt);
+                return undefined;
+              }
+            : undefined,
+          onStepEnd: attemptInput.onStepEnd
+            ? (event) => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onStepEnd?.(event);
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
+          messageMetadata: attemptInput.messageMetadata
+            ? () => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.messageMetadata?.();
+                quarantineStaleAttempt(attempt);
+                return undefined;
+              }
+            : undefined,
+          };
+      };
+      const createManagedPrepareStep = (
+        baseRequestIndex: number,
+        firstMessages: ModelMessage[],
+        firstPrepared: boolean,
+      ): NonNullable<RuntimeStreamTextInput["prepareStep"]> => async (event) => {
+        const requestIndex = baseRequestIndex + event.stepNumber;
+        if (event.stepNumber === 0 && firstPrepared) {
+          lastPreparedModelMessages = firstMessages;
+          return { messages: firstMessages };
+        }
+        const inFlightSuffix = event.messages.slice(lastPreparedModelMessages.length);
+        retainedModelMessages = [
+          ...retainedModelMessages,
+          ...inFlightSuffix,
+        ];
+        const prepared = await prepareManagedContext(
+          requestIndex,
+          "auto_mid_turn",
+          retainedModelMessages,
+        );
+        if (!prepared) return undefined;
+        const nextMessages = prepared.messages;
+        latestContextUsage = persistContextUsageEstimate({
+          store: this.deps.store,
+          createId,
+          started,
+          plan: prepared.plan,
+          providerId: request.providerId,
+          modelId: request.modelId,
+          createdAt: now(),
+        });
+        latestContextMarker = prepared.marker ?? latestContextMarker;
+        // Preserve the AI SDK's exact accumulated response/tool/Permission suffix.
+        lastPreparedModelMessages = nextMessages;
+        return { messages: nextMessages };
+      };
+      const createManagedOnStepEnd = (
+        baseRequestIndex: number,
+      ): NonNullable<RuntimeStreamTextInput["onStepEnd"]> => async (event) => {
+        const observation = toContextProviderObservation(event.usage);
+        if (!observation) return;
+        latestContextUsage = this.deps.store.updateContextUsageProviderObservation({
+          runId: started.run.id,
+          requestIndex: baseRequestIndex + event.stepNumber,
+          providerObservation: observation,
+        });
+      };
+      const createFinalErrorResult = (finalError: unknown): RuntimeStreamTextResult => ({
+        toUIMessageStreamResponse: () => new Response(
+          `data: ${JSON.stringify({
+            type: "error",
+            errorText: modelErrorMessage(
+              finalError,
+              this.deps.getErrorMessageSecrets?.() ?? [],
+            ),
+          })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      });
+      const adoptDurableTerminalState = (): void => {
+        terminalWritten = true;
+        coordinatorState = "terminal";
+        cleanupActiveRun();
+        cleanupPreparedRun();
+      };
+      const retryContextOverflow = async (error: unknown): Promise<boolean> => {
+        if (coordinatorState !== "attempt0") return false;
+        const currentRun = this.deps.store.getRun(started.run.id);
+        const currentConversation = this.deps.store.getConversation(started.conversation.id);
+        if (!currentRun || !currentConversation || !this.deps.contextManager) return false;
+        if (isTerminalRunStatus(currentRun.status)) {
+          adoptDurableTerminalState();
+          return true;
+        }
+        if (currentRun.status !== "running") return false;
+        const currentToolCalls = this.deps.store.listToolCallsByRun(started.run.id);
+        overflowGate.toolLifecycleObserved ||= currentToolCalls.length > 0;
+        overflowGate.permissionObserved ||=
+          this.deps.store.listPermissionsByRun(started.run.id).length > 0;
+        overflowGate.sideEffectObserved ||= hasDurableSideEffectFact(currentToolCalls);
+        if (currentConversation.revision !== started.conversation.revision) return false;
+        const decision = recoverContextOverflow({
+          error,
+          gate: overflowGate,
+          currentRun,
+          currentConversation,
+        });
+        if (overflowGate.attempted) coordinatorState = "recovering";
+        if (await decision !== "retry") {
+          coordinatorState = "attempt0";
+          return false;
+        }
+
+        finalText = "";
+        for (let index = semanticParts.length - 1; index >= 0; index -= 1) {
+          const part = semanticParts[index]!;
+          if (
+            ((part.type === "text" || part.type === "reasoning") && part.text.length === 0)
+            || part.type === "step-start"
+          ) {
+            semanticParts.splice(index, 1);
+          }
+        }
+        streamedStepCount = 0;
+        resetActiveStreamParts();
+
+        const requestIndex = previousStepCount + 1;
+        let prepared: PreparedModelContext;
+        try {
+          prepared = await prepareManagedContext(
+            requestIndex,
+            "provider_overflow",
+            [],
+          ) as PreparedModelContext;
+        } catch {
+          const failedRecoveryRun = this.deps.store.getRun(started.run.id);
+          if (failedRecoveryRun && isTerminalRunStatus(failedRecoveryRun.status)) {
+            adoptDurableTerminalState();
+            return true;
+          }
+          if (abortSignal?.aborted || abortSignalLink.signal.aborted) {
+            const message = abortReasonMessage(
+              abortSignal?.reason ?? abortSignalLink.signal.reason,
+            );
+            writeInterruption(mapStreamAbortReason(message), message);
+            return true;
+          }
+          coordinatorState = "attempt0";
+          writeFailure(error);
+          return true;
+        }
+        const applicableRun = this.deps.store.getRun(started.run.id);
+        const applicableConversation = this.deps.store.getConversation(
+          started.conversation.id,
+        );
+        const applicablePermissions = this.deps.store.listPermissionsByRun(started.run.id);
+        const applicableToolCalls = this.deps.store.listToolCallsByRun(started.run.id);
+        overflowGate.permissionObserved ||= applicablePermissions.length > 0;
+        overflowGate.toolLifecycleObserved ||= applicableToolCalls.length > 0;
+        overflowGate.sideEffectObserved ||= hasDurableSideEffectFact(applicableToolCalls);
+        if (abortSignal?.aborted || abortSignalLink.signal.aborted) {
+          const message = abortReasonMessage(
+            abortSignal?.reason ?? abortSignalLink.signal.reason,
+          );
+          writeInterruption(mapStreamAbortReason(message), message);
+          return true;
+        }
+        if (applicableRun && isTerminalRunStatus(applicableRun.status)) {
+          adoptDurableTerminalState();
+          return true;
+        }
+        if (
+          recoveryInvalidated
+          || !prepared.marker
+          || !applicableRun
+          || !applicableConversation
+          || applicableConversation.activeHeadRunId !== started.run.id
+          || applicableConversation.revision !== started.conversation.revision
+          || prepared.plan.sourceHeadRunId !== started.run.id
+          || prepared.plan.sourceConversationRevision !== applicableConversation.revision
+          || overflowGate.permissionObserved
+          || overflowGate.toolLifecycleObserved
+          || overflowGate.sideEffectObserved
+        ) {
+          coordinatorState = "attempt0";
+          writeFailure(error);
+          return true;
+        }
+        if (!streamInput) {
+          coordinatorState = "attempt0";
+          writeFailure(error);
+          return true;
+        }
+        latestContextUsage = persistContextUsageEstimate({
+          store: this.deps.store,
+          createId,
+          started,
+          plan: prepared.plan,
+          providerId: request.providerId,
+          modelId: request.modelId,
+          createdAt: now(),
+        });
+        latestContextMarker = prepared.marker ?? latestContextMarker;
+        this.deps.store.appendTrace({
+          id: createId("trace"),
+          conversationId: started.conversation.id,
+          runId: started.run.id,
+          type: "context.overflow.recovered",
+          level: "warn",
+          time: now(),
+          payload: {
+            error: toRuntimeModelError(
+              error,
+              this.deps.getErrorMessageSecrets?.() ?? [],
+            ),
+            requestIndex,
+            sourceHeadRunId: prepared.plan.sourceHeadRunId,
+            sourceConversationRevision: prepared.plan.sourceConversationRevision,
+            checkpointId: prepared.marker.checkpointId,
+            beforeEstimatedInputTokens: prepared.marker.beforeEstimatedInputTokens,
+            afterEstimatedInputTokens: prepared.marker.afterEstimatedInputTokens,
+          },
+        });
+        lastPreparedModelMessages = prepared.messages;
+        const replacementInput: RuntimeStreamTextInput = {
+          ...streamInput,
+          messages: prepared.messages,
+          prompt: undefined,
+          prepareStep: createManagedPrepareStep(requestIndex, prepared.messages, true),
+          onStepEnd: createManagedOnStepEnd(requestIndex),
+        };
+        coordinatorState = "attempt1";
+        try {
+          retryResult = await this.streamTextImpl(bindStreamAttempt(replacementInput, 1));
+        } catch (replacementError) {
+          writeFailure(replacementError);
+          retryResult = createFinalErrorResult(replacementError);
+        }
+        return true;
+      };
       const aiSdkTools = this.deps.toolRegistry
         ? runtimeToolsToAiSdkToolSet({
             registry: this.deps.toolRegistry,
@@ -1140,7 +1552,7 @@ export class RuntimeTextRunner {
             },
           })
         : undefined;
-      result = await this.streamTextImpl({
+      streamInput = {
         model: resolved.languageModel,
         system: policy.prompt.system,
         ...(messages.length > 0 ? { messages } : { prompt: request.text ?? "" }),
@@ -1165,7 +1577,45 @@ export class RuntimeTextRunner {
           now(),
         ),
         abortSignal: abortSignalLink.signal,
+        prepareStep: this.deps.contextManager
+          ? createManagedPrepareStep(
+              previousStepCount,
+              messages,
+              initialPrepared !== undefined,
+            )
+          : undefined,
+        onStepEnd: this.deps.contextManager
+          ? createManagedOnStepEnd(previousStepCount)
+          : undefined,
+        messageMetadata: this.deps.contextManager
+          ? () => projectSafeContextMetadata(
+              latestContextUsage,
+              latestContextMarker,
+            )
+          : undefined,
         onChunk: ({ chunk }) => {
+          if (
+            (chunk.type === "text-delta" || chunk.type === "reasoning-delta")
+            && chunk.text.length > 0
+          ) {
+            overflowGate.modelOutputObserved = true;
+          }
+          if (chunk.type === "source-url") overflowGate.modelOutputObserved = true;
+          if (
+            chunk.type === "tool-input-start"
+            || chunk.type === "tool-input-delta"
+            || chunk.type === "tool-input-end"
+            || chunk.type === "tool-call"
+            || chunk.type === "tool-result"
+            || chunk.type === "tool-error"
+          ) {
+            overflowGate.toolLifecycleObserved = true;
+          }
+          if (
+            chunk.type === "tool-approval-request"
+            || chunk.type === "tool-approval-response"
+            || chunk.type === "tool-output-denied"
+          ) overflowGate.permissionObserved = true;
           switch (chunk.type) {
             case "text-start":
               startTextPart(
@@ -1534,6 +1984,7 @@ export class RuntimeTextRunner {
           }
 
           terminalWritten = true;
+          coordinatorState = "terminal";
           cleanupActiveRun();
           const completedAt = now();
           const semanticParts = createSemanticParts(completedAt);
@@ -1567,13 +2018,15 @@ export class RuntimeTextRunner {
             appendTextPart: !semanticParts.some((part) => part.type === "text"),
           });
         },
-        onError: ({ error }) => {
-          writeFailure(error);
+        onError: async ({ error }) => {
+          if (!await retryContextOverflow(error)) writeFailure(error);
         },
         onAbort: ({ reason }) => {
           writeInterruption(mapStreamAbortReason(reason), reason ?? "stream aborted");
         },
         onToolCallStart: (event) => {
+          overflowGate.toolLifecycleObserved = true;
+          overflowGate.sideEffectObserved = true;
           const startedAt = now();
           const input = toRecord(event.toolCall.input);
           const slot = ensureToolSlot({
@@ -1603,6 +2056,8 @@ export class RuntimeTextRunner {
 
         },
         onToolCallFinish: (event) => {
+          overflowGate.toolLifecycleObserved = true;
+          overflowGate.sideEffectObserved = true;
           const completedAt = now();
           const input = toRecord(event.toolCall.input);
           if (!event.success) {
@@ -1654,9 +2109,16 @@ export class RuntimeTextRunner {
             insertSourcePartAfterTool(event.toolCall.toolCallId, toolPart, sourcePart);
           }
         },
-      });
+      };
+      result = await this.streamTextImpl(bindStreamAttempt(streamInput, 0));
+      await result.responseReady;
     } catch (error) {
-      writeFailure(error);
+      if (abortSignalLink.signal.aborted) {
+        const message = abortReasonMessage(abortSignalLink.signal.reason);
+        writeInterruption(mapStreamAbortReason(message), message);
+      } else {
+        writeFailure(error);
+      }
       return {
         started,
         response: withRuntimeHeaders(createUIMessageStreamResponse({
@@ -1680,10 +2142,13 @@ export class RuntimeTextRunner {
       };
     }
 
+    const responseResult = retryResult ?? result;
+    committedAttempt = retryResult ? 1 : 0;
+    if (!terminalWritten) coordinatorState = "committed";
     return {
       started,
       response: withRuntimeHeaders(
-        result.toUIMessageStreamResponse({
+        responseResult.toUIMessageStreamResponse({
           consumeSseStream: consumeStream,
           generateMessageId: () => started.assistantMessage.id,
           onError: (streamError) => {
@@ -1695,6 +2160,10 @@ export class RuntimeTextRunner {
               this.deps.getErrorMessageSecrets?.() ?? [],
             );
           },
+          messageMetadata: () => projectSafeContextMetadata(
+            latestContextUsage,
+            latestContextMarker,
+          ),
         }),
         started,
       ),
@@ -1968,6 +2437,179 @@ function deepFreezeValue<T>(value: T): T {
   return Object.freeze(value);
 }
 
+function persistContextUsageEstimate(input: {
+  store: RuntimeRunnerStore;
+  createId: <TPrefix extends RuntimeIdPrefix>(prefix: TPrefix) => RuntimeId<TPrefix>;
+  started: RuntimeRunStarted;
+  plan: ContextPlan;
+  providerId: string;
+  modelId: string;
+  createdAt: number;
+}): ContextUsage {
+  const budget = input.plan.budget;
+  const expected: ContextUsageEstimateIdentity = {
+    conversationId: input.started.conversation.id,
+    runId: input.started.run.id,
+    requestIndex: input.plan.requestIndex,
+    providerId: input.providerId,
+    modelId: input.modelId,
+    ...(budget.contextWindow ? { contextWindow: budget.contextWindow } : {}),
+    estimatedInputTokens: budget.estimatedInputTokens,
+    estimateSource: "estimate",
+    reservedOutputTokens: budget.reservedOutputTokens,
+    view: input.plan.view,
+    ...(input.plan.checkpointId ? { checkpointId: input.plan.checkpointId } : {}),
+    breakdown: {
+      rawTokens: budget.rawHistoryTokens,
+      checkpointTokens: budget.checkpointTokens,
+      safetyStateTokens: budget.safetyStateTokens,
+      systemPromptTokens: budget.systemPromptTokens,
+      toolSchemaTokens: budget.toolSchemaTokens,
+    },
+    estimatorVersion: DEFAULT_CONTEXT_COMPACTION_POLICY.estimatorVersion,
+    policyVersion: DEFAULT_CONTEXT_COMPACTION_POLICY.version,
+    checkpointFormatVersion:
+      DEFAULT_CONTEXT_COMPACTION_POLICY.checkpointFormatVersion,
+  };
+  const existing = input.store.getContextUsageByRunRequest(
+    input.started.run.id,
+    input.plan.requestIndex,
+  );
+  if (existing) {
+    assertContextUsageEstimateMatches(existing, expected);
+    return existing;
+  }
+  const usage: ContextUsage = {
+    id: input.createId("ctxuse"),
+    ...expected,
+    time: { created: input.createdAt },
+  };
+  try {
+    input.store.saveContextUsage(usage);
+    return usage;
+  } catch (error) {
+    if (!isContextUsageRequestUniqueConstraint(error)) throw error;
+    const raced = input.store.getContextUsageByRunRequest(
+      input.started.run.id,
+      input.plan.requestIndex,
+    );
+    if (!raced) throw error;
+    assertContextUsageEstimateMatches(raced, expected);
+    return raced;
+  }
+}
+
+// A racing writer may allocate a different record ID/time, and a Provider
+// observation may land before the re-read. Every request-scoped estimate field
+// remains immutable and must agree exactly.
+type ContextUsageEstimateIdentity = Omit<
+  ContextUsage,
+  "id" | "providerObservation" | "time"
+>;
+
+function assertContextUsageEstimateMatches(
+  actual: ContextUsage,
+  expected: ContextUsageEstimateIdentity,
+): void {
+  const actualEstimate: ContextUsageEstimateIdentity = {
+    conversationId: actual.conversationId,
+    runId: actual.runId,
+    requestIndex: actual.requestIndex,
+    providerId: actual.providerId,
+    modelId: actual.modelId,
+    ...(actual.contextWindow === undefined
+      ? {}
+      : { contextWindow: actual.contextWindow }),
+    estimatedInputTokens: actual.estimatedInputTokens,
+    estimateSource: actual.estimateSource,
+    reservedOutputTokens: actual.reservedOutputTokens,
+    view: actual.view,
+    ...(actual.checkpointId === undefined
+      ? {}
+      : { checkpointId: actual.checkpointId }),
+    breakdown: actual.breakdown,
+    estimatorVersion: actual.estimatorVersion,
+    policyVersion: actual.policyVersion,
+    checkpointFormatVersion: actual.checkpointFormatVersion,
+  };
+  if (stableStringifyJson(actualEstimate) !== stableStringifyJson(expected)) {
+    throw new Error("Context usage estimate conflicts with the durable request row");
+  }
+}
+
+function isContextUsageRequestUniqueConstraint(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && error.code === "SQLITE_CONSTRAINT_UNIQUE"
+    && "message" in error
+    && typeof error.message === "string"
+    && error.message.includes(
+      "UNIQUE constraint failed: runtime_context_usage.run_id, runtime_context_usage.request_index",
+    );
+}
+
+function toContextProviderObservation(
+  usage: LanguageModelUsage | undefined,
+): NonNullable<ContextUsage["providerObservation"]> | undefined {
+  if (
+    typeof usage?.inputTokens !== "number"
+    || !Number.isSafeInteger(usage.inputTokens)
+    || usage.inputTokens < 0
+  ) {
+    return undefined;
+  }
+  const cacheReadTokens = usage.inputTokenDetails.cacheReadTokens;
+  const cacheWriteTokens = usage.inputTokenDetails.cacheWriteTokens;
+  return {
+    source: "provider",
+    inputTokens: usage.inputTokens,
+    ...(typeof cacheReadTokens === "number"
+      && Number.isSafeInteger(cacheReadTokens)
+      && cacheReadTokens >= 0
+      ? { cacheReadTokens }
+      : {}),
+    ...(typeof cacheWriteTokens === "number"
+      && Number.isSafeInteger(cacheWriteTokens)
+      && cacheWriteTokens >= 0
+      ? { cacheWriteTokens }
+      : {}),
+  };
+}
+
+function projectSafeContextMetadata(
+  usage: ContextUsage | undefined,
+  marker: ContextCompactionMarker | undefined,
+): Record<string, unknown> | undefined {
+  if (!usage && !marker) return undefined;
+  const nexus: Record<string, unknown> = {};
+  if (usage) {
+    const providerInputTokens = usage.providerObservation?.inputTokens;
+    const activeInputTokens = providerInputTokens ?? usage.estimatedInputTokens;
+    nexus.contextUsage = {
+      ...(usage.contextWindow ? { contextWindow: usage.contextWindow } : {}),
+      estimatedInputTokens: usage.estimatedInputTokens,
+      ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
+      reservedOutputTokens: usage.reservedOutputTokens,
+      activeTokens: activeInputTokens + usage.reservedOutputTokens,
+      source: providerInputTokens === undefined ? "estimate" : "provider",
+      view: usage.view,
+      ...(usage.checkpointId ? { checkpointId: usage.checkpointId } : {}),
+    };
+  }
+  if (marker) {
+    nexus.compaction = {
+      trigger: marker.trigger,
+      createdAt: marker.time.created,
+      coverageThroughRunId: marker.coverageThroughRunId,
+      beforeTokens: marker.beforeEstimatedInputTokens,
+      afterTokens: marker.afterEstimatedInputTokens,
+      status: marker.status,
+    };
+  }
+  return { nexus, custom: { nexus } };
+}
+
 function scheduleConversationTitleGeneration(input: {
   generateConversationTitle: GenerateConversationTitle | undefined;
   store: RuntimeRunnerStore;
@@ -2020,14 +2662,27 @@ function scheduleConversationTitleGeneration(input: {
 
 const defaultStreamText: RuntimeStreamText = async (input) => {
   const activeTools = input.activeTools?.length ? (input.activeTools as never) : undefined;
-  const onEnd: GenerateTextOnEndCallback<ToolSet> | undefined = input.onFinish
-    ? (event) =>
-        input.onFinish?.({
+  let callbackFailure: { error: unknown } | undefined;
+  const recordCallbackFailure = (error: unknown): void => {
+    callbackFailure ??= { error };
+  };
+  const throwIfCallbackFailed = (): void => {
+    if (callbackFailure) throw callbackFailure.error;
+  };
+  const onEnd: GenerateTextOnEndCallback<ToolSet> | undefined =
+    input.onFinish || input.onError
+    ? async (event) => {
+        if (callbackFailure) {
+          await input.onError?.({ error: callbackFailure.error });
+          return;
+        }
+        await input.onFinish?.({
           finishReason: event.finishReason,
           totalUsage: event.totalUsage,
           responseMessages: event.responseMessages,
           stepCount: event.steps.length,
-        })
+        });
+      }
     : undefined;
   const prompt = input.messages && input.messages.length > 0
     ? { messages: input.messages }
@@ -2044,12 +2699,33 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
     topP: input.topP,
     toolChoice: input.toolChoice,
     toolApproval: input.toolApproval,
+    prepareStep: input.prepareStep || input.onStepEnd
+      ? async (event) => {
+          throwIfCallbackFailed();
+          return (await input.prepareStep?.({
+            stepNumber: event.stepNumber,
+            messages: event.messages,
+          })) ?? {};
+        }
+      : undefined,
   });
   const result = await agent.stream({
     ...prompt,
     abortSignal: input.abortSignal,
     timeout: input.timeout,
     onEnd,
+    onStepEnd: input.onStepEnd
+      ? async (event) => {
+          try {
+            await input.onStepEnd?.({
+              stepNumber: event.stepNumber,
+              usage: event.usage,
+            });
+          } catch (error) {
+            recordCallbackFailure(error);
+          }
+        }
+      : undefined,
     onToolExecutionStart: input.onToolCallStart
       ? (event) => input.onToolCallStart?.({
           toolCall: {
@@ -2087,19 +2763,34 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
         }
       : undefined,
   });
+  let markResponseReady!: () => void;
+  const responseReady = new Promise<void>((resolve) => {
+    markResponseReady = resolve;
+  });
   const runtimeFactsSettled = input.onChunk
     ? consumeRuntimeFullStream(
       result.fullStream,
       input.onChunk,
       input.onError,
       input.onAbort,
+      markResponseReady,
     )
-    : Promise.resolve();
+    : Promise.resolve().then(markResponseReady);
 
   return {
+    responseReady,
     toUIMessageStreamResponse: (options) => withRuntimeFactsBarrier(
-      result.toUIMessageStreamResponse(options),
+      result.toUIMessageStreamResponse({
+        ...options,
+        messageMetadata: input.messageMetadata
+          ? ({ part }) =>
+              part.type === "start" || part.type === "finish"
+                ? input.messageMetadata?.()
+                : undefined
+          : undefined,
+      }),
       runtimeFactsSettled,
+      () => callbackFailure,
     ),
   };
 };
@@ -2107,6 +2798,7 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
 function withRuntimeFactsBarrier(
   response: Response,
   runtimeFactsSettled: PromiseLike<void>,
+  getCallbackFailure?: () => { error: unknown } | undefined,
 ): Response {
   if (!response.body) {
     return response;
@@ -2118,6 +2810,8 @@ function withRuntimeFactsBarrier(
     },
     async flush() {
       await runtimeFactsSettled;
+      const failure = getCallbackFailure?.();
+      if (failure) throw failure.error;
     },
   }));
   return new Response(body, {
@@ -2132,25 +2826,58 @@ async function consumeRuntimeFullStream(
   onChunk: NonNullable<RuntimeStreamTextInput["onChunk"]>,
   onError?: RuntimeStreamTextInput["onError"],
   onAbort?: RuntimeStreamTextInput["onAbort"],
+  onResponseReady?: () => void,
 ): Promise<void> {
   try {
     for await (const part of stream) {
       if (part.type === "error") {
         await onError?.({ error: part.error });
+        onResponseReady?.();
         continue;
       }
       if (part.type === "abort") {
         await onAbort?.({ reason: "stream aborted" });
+        onResponseReady?.();
         continue;
       }
       const chunk = toRuntimeTextChunk(part);
       if (chunk) {
         await onChunk({ chunk });
+        if (isPublishableRuntimeChunk(chunk)) onResponseReady?.();
       }
+      if (part.type === "finish") onResponseReady?.();
     }
   } catch (error) {
     await onError?.({ error });
+  } finally {
+    onResponseReady?.();
   }
+}
+
+function isPublishableRuntimeChunk(chunk: RuntimeTextChunk): boolean {
+  if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
+    return chunk.text.length > 0;
+  }
+  return chunk.type !== "text-start"
+    && chunk.type !== "text-end"
+    && chunk.type !== "reasoning-start"
+    && chunk.type !== "reasoning-end"
+    && chunk.type !== "start-step"
+    && chunk.type !== "finish-step";
+}
+
+function hasDurableSideEffectFact(toolCalls: readonly ToolCall[]): boolean {
+  return toolCalls.some((toolCall) =>
+    toolCall.time.started !== undefined
+    || toolCall.state === "running"
+    || toolCall.state === "completed"
+    || toolCall.result !== undefined
+    || toolCall.error?.outcome === "unknown"
+  );
+}
+
+function isTerminalRunStatus(status: Run["status"]): boolean {
+  return status === "completed" || status === "failed" || status === "interrupted";
 }
 
 function extractTextContent(message: Message): string | null {
@@ -2722,4 +3449,14 @@ function mapStreamAbortReason(reason: string | undefined): InterruptReason {
   }
 
   return "client_disconnect";
+}
+
+function abortReasonMessage(reason: unknown): string {
+  if (typeof reason === "string" && reason.length > 0) {
+    return reason;
+  }
+  if (reason instanceof Error && reason.message.length > 0) {
+    return reason.message;
+  }
+  return "stream aborted";
 }

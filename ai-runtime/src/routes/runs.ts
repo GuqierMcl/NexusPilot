@@ -35,6 +35,7 @@ import {
   type RuntimeAttachmentService,
   RuntimeAttachmentError,
   attachmentErrorEnvelope,
+  type ModelContextManager,
 } from "../runtime";
 import {
   jsonRequestBody,
@@ -70,6 +71,7 @@ export interface RunRouteDeps {
   getToolApprovalPolicy?: () => RuntimeToolApprovalPolicy;
   getNetworkPolicy?: () => RuntimeNetworkPolicy;
   attachmentService?: RuntimeAttachmentService | null;
+  contextManager?: Pick<ModelContextManager, "prepare">;
 }
 
 export function runRoutes(deps: RunRouteDeps) {
@@ -122,6 +124,7 @@ export function runRoutes(deps: RunRouteDeps) {
           getNetworkPolicy: deps.getNetworkPolicy,
           getErrorMessageSecrets,
           attachmentService: deps.attachmentService ?? undefined,
+          contextManager: deps.contextManager,
         });
 
         if (parsed.responseMode === "stream") {
@@ -205,6 +208,7 @@ export function runRoutes(deps: RunRouteDeps) {
           getNetworkPolicy: deps.getNetworkPolicy,
           getErrorMessageSecrets,
           attachmentService: deps.attachmentService ?? undefined,
+          contextManager: deps.contextManager,
         });
         return (
           await runner.continueText(

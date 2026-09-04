@@ -1,18 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { simulateReadableStream } from "ai";
+import { simulateReadableStream, type ModelMessage } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { z } from "zod";
 import {
   RuntimeSqliteStore,
+  RuntimeRunner,
   RuntimeTextRunner,
   ActiveRunRegistry,
   RuntimeToolRegistry,
+  ContextCompactionService,
+  ModelContextManager,
   projectMessageToAiSdkUIMessage,
   type GenerateConversationTitle,
   type RuntimeStreamText,
   type RuntimeTextRunnerDependencies,
   type RuntimeToolNamespace,
 } from "../src/runtime";
+import { traceEventSchema } from "../src/runtime/core/schemas";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
 
 function createWebRegistry(): RuntimeToolRegistry {
@@ -112,6 +116,96 @@ function abortedStream(reason: string): RuntimeStreamText {
   };
 }
 
+function preparedTestContext(
+  requestIndex: number,
+  messages: ModelMessage[] = [{ role: "user", content: "managed context" }],
+) {
+  return {
+    plan: {
+      id: `ctxplan_test_${requestIndex}`,
+      conversationId: "conv_test",
+      runId: "run_test",
+      requestIndex,
+      sourceHeadRunId: "run_test",
+      sourceConversationRevision: 1,
+      trigger: "auto_pre_turn" as const,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      budget: {
+        estimatedInputTokens: 10,
+        reservedOutputTokens: 4,
+        rawHistoryTokens: 4,
+        checkpointTokens: 0,
+        safetyStateTokens: 0,
+        systemPromptTokens: 1,
+        toolSchemaTokens: 1,
+      },
+      view: "raw" as const,
+    },
+    messages,
+  };
+}
+
+function managedPreparedTestContext(input: {
+  conversationId: string;
+  runId: string;
+  requestIndex: number;
+  trigger: "auto_pre_turn" | "auto_mid_turn" | "provider_overflow";
+}, marker?: Record<string, unknown>) {
+  const prepared = preparedTestContext(input.requestIndex);
+  const resolvedMarker = marker ?? (input.trigger === "provider_overflow"
+    ? {
+        checkpointId: `ckpt_test_${input.requestIndex}`,
+        trigger: "provider_overflow" as const,
+        auto: true,
+        coverageThroughRunId: input.runId,
+        beforeEstimatedInputTokens: 100,
+        afterEstimatedInputTokens: 10,
+        status: "created" as const,
+        time: { created: 2_000 + input.requestIndex },
+      }
+    : undefined);
+  return {
+    ...prepared,
+    plan: {
+      ...prepared.plan,
+      conversationId: input.conversationId,
+      runId: input.runId,
+      sourceHeadRunId: input.runId,
+      sourceConversationRevision: 1,
+      requestIndex: input.requestIndex,
+      trigger: input.trigger,
+    },
+    ...(resolvedMarker ? { marker: resolvedMarker } : {}),
+  };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function sdkModelUsage(inputTokens: number, outputTokens = 2) {
+  return {
+    inputTokens: {
+      total: inputTokens,
+      noCache: inputTokens,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: {
+      total: outputTokens,
+      text: outputTokens,
+      reasoning: 0,
+    },
+  };
+}
+
 function createRunner(
   streamText: RuntimeStreamText,
   toolRegistry?: RuntimeToolRegistry,
@@ -122,6 +216,7 @@ function createRunner(
   },
   resolveLanguageModel?: RuntimeTextRunnerDependencies["resolveLanguageModel"],
   getErrorMessageSecrets?: () => readonly string[],
+  contextManager?: unknown,
 ) {
   const db = openRuntimeDatabase(":memory:");
   const store = new RuntimeSqliteStore(db);
@@ -153,6 +248,7 @@ function createRunner(
     generateConversationTitle,
     getToolApprovalPolicy,
     getErrorMessageSecrets,
+    contextManager: contextManager as never,
   });
 
   return { db, store, runner };
@@ -189,6 +285,8 @@ function createRunnerWithActiveRegistry(streamText: RuntimeStreamText) {
 function createRunnerWithModel(
   model: MockLanguageModelV3,
   toolRegistry?: RuntimeToolRegistry,
+  contextManager?: unknown,
+  getErrorMessageSecrets?: () => readonly string[],
 ) {
   const db = openRuntimeDatabase(":memory:");
   const store = new RuntimeSqliteStore(db);
@@ -206,11 +304,15 @@ function createRunnerWithModel(
         provider: {
           providerId: "openai",
           modelId: "gpt-4o",
+          contextLength: 128_000,
+          outputLength: 4_096,
           supportsTools: true,
         },
       },
     }),
     toolRegistry,
+    contextManager: contextManager as never,
+    getErrorMessageSecrets,
   });
 
   return { db, store, runner };
@@ -280,9 +382,1863 @@ function createRunnerWithDefaultTools(
 }
 
 describe("RuntimeTextRunner", () => {
+  test("retries one pre-output context overflow with the same selected model", async () => {
+    let requests = 0;
+    const preparations: Array<{ requestIndex: number; trigger: string }> = [];
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+        preparations.push(input);
+        return managedPreparedTestContext(input);
+      },
+    };
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      if (requests === 1) {
+        await input.onError?.({
+          error: { name: "ProviderError", message: "context_length_exceeded" },
+        });
+        return { toUIMessageStreamResponse: () => new Response("data: first\n\n") };
+      }
+      await input.onChunk?.({ chunk: { type: "text-delta", text: "Recovered" } });
+      await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
+      return { toUIMessageStreamResponse: () => new Response("data: recovered\n\n") };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Recover this request",
+    });
+    await result.response.text();
+
+    expect(requests).toBe(2);
+    expect(preparations.map((item) => item.trigger)).toEqual([
+      "auto_pre_turn",
+      "provider_overflow",
+    ]);
+    expect(store.getRun(result.started.run.id)?.status).toBe("completed");
+    expect(store.getMessage(result.started.assistantMessage.id)?.parts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "text", text: "Recovered" })]),
+    );
+    expect(store.listEvents(result.started.conversation.id).filter((event) => event.type === "runtime.error"))
+      .toHaveLength(0);
+    db.close();
+  });
+
+  test("does not retry a context overflow after visible model output", async () => {
+    let requests = 0;
+    const contextManager = {
+      prepare: async (input: { requestIndex: number; trigger: string }) =>
+        preparedTestContext(input.requestIndex),
+    };
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      await input.onChunk?.({ chunk: { type: "text-delta", text: "Partial" } });
+      await input.onError?.({
+        error: { name: "ProviderError", message: "maximum context length exceeded" },
+      });
+      return { toUIMessageStreamResponse: () => new Response("data: failure\n\n") };
+    };
+    const { db, store, runner } = createRunner(
+      streamText, undefined, undefined, false, undefined, undefined, undefined, contextManager,
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Do not retry after output",
+    });
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: { data: { message: "maximum context length exceeded" } },
+    });
+    db.close();
+  });
+
+  test("surfaces the second overflow byte-for-byte and never issues a third request", async () => {
+    const firstError = Object.assign(new Error("maximum context length exceeded"), {
+      name: "FirstContextError",
+      statusCode: 400,
+    });
+    const secondMessage = "  context window exceeded\n\nrequest   id:\tsecond-42  ";
+    const secondError = Object.assign(new Error(secondMessage), {
+      name: "SecondContextError",
+      statusCode: 400,
+      isRetryable: false,
+    });
+    let requests = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [{
+            type: "error" as const,
+            error: ++requests === 1 ? firstError : secondError,
+          }],
+        }),
+      }),
+    });
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input),
+    };
+    const { db, store, runner } = createRunnerWithModel(
+      model,
+      undefined,
+      contextManager,
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Retry at most once",
+    });
+    const body = await result.response.text();
+    const wireErrors = body
+      .split("\n\n")
+      .filter((chunk) => chunk.startsWith("data: {") && chunk.includes("\"type\":\"error\""))
+      .map((chunk) => JSON.parse(chunk.slice("data: ".length)));
+
+    expect(requests).toBe(2);
+    expect(body).not.toContain(firstError.message);
+    expect(wireErrors).toEqual([{ type: "error", errorText: secondMessage }]);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: {
+        name: "SecondContextError",
+        data: { message: secondMessage, statusCode: 400, isRetryable: false },
+      },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    expect(store.listMessages(result.started.conversation.id).filter(
+      (message) => message.role === "assistant" && message.status.type === "error",
+    )).toHaveLength(1);
+    const recovery = store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    );
+    expect(recovery).toHaveLength(1);
+    expect(JSON.stringify(recovery[0])).toContain(firstError.message);
+    expect(JSON.stringify(recovery[0])).not.toContain(secondMessage);
+    db.close();
+  });
+
+  test("replaces a lazy default AI SDK overflow stream without leaking the first attempt", async () => {
+    const firstError = Object.assign(
+      new Error("maximum context length exceeded\nFIRST_ATTEMPT_ONLY"),
+      { name: "LazyContextError", statusCode: 400 },
+    );
+    let requests = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        requests += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: (requests === 1
+              ? [
+                  { type: "text-start" as const, id: "first-transient" },
+                  { type: "error" as const, error: firstError },
+                ]
+              : [
+                  { type: "text-start" as const, id: "replacement-text" },
+                  {
+                    type: "text-delta" as const,
+                    id: "replacement-text",
+                    delta: "replacement success",
+                  },
+                  { type: "text-end" as const, id: "replacement-text" },
+                  {
+                    type: "finish" as const,
+                    finishReason: { unified: "stop" as const, raw: undefined },
+                    logprobs: undefined,
+                    usage: {
+                      inputTokens: {
+                        total: 4,
+                        noCache: 4,
+                        cacheRead: undefined,
+                        cacheWrite: undefined,
+                      },
+                      outputTokens: { total: 2, text: 2, reasoning: 0 },
+                    },
+                  },
+                ]) as never,
+          }),
+        };
+      },
+    });
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input),
+    };
+    const { db, store, runner } = createRunnerWithModel(model, undefined, contextManager);
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Exercise the real lazy SDK stream",
+    });
+    const body = await result.response.text();
+
+    expect(requests).toBe(2);
+    expect(body).toContain("replacement success");
+    expect(body).not.toContain("FIRST_ATTEMPT_ONLY");
+    expect(body).not.toContain("first-transient");
+    expect((body.match(/\"type\":\"error\"/g) ?? [])).toHaveLength(0);
+    expect((body.match(/\"type\":\"start\"/g) ?? [])).toHaveLength(1);
+    expect((body.match(/\"type\":\"finish\"/g) ?? [])).toHaveLength(1);
+    expect((body.match(/\"messageMetadata\":/g) ?? [])).toHaveLength(2);
+    expect(body).toContain("provider_overflow");
+    expect(store.getRun(result.started.run.id)?.status).toBe("completed");
+    const assistant = store.getMessage(result.started.assistantMessage.id);
+    expect(assistant?.role === "assistant" ? assistant.status.type : undefined).toBe("complete");
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(0);
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(1);
+    db.close();
+  });
+
+  test("owns a request-2 construction rejection and never falls back to attempt 0", async () => {
+    const firstError = Object.assign(new Error("maximum context length exceeded\nFIRST_ONLY"), {
+      name: "FirstConstructionContextError",
+    });
+    const secondMessage = "  replacement construction failed\nrequest 2  ";
+    const secondError = Object.assign(new Error(secondMessage), {
+      name: "ReplacementConstructionError",
+      statusCode: 503,
+    });
+    let requests = 0;
+    const streamText: RuntimeStreamText = (input) => {
+      requests += 1;
+      if (requests === 2) throw secondError;
+      const responseReady = Promise.resolve()
+        .then(() => input.onError?.({ error: firstError }))
+        .then(() => undefined, () => undefined);
+      return {
+        responseReady,
+        toUIMessageStreamResponse: (options) => new Response(
+          `data: ${JSON.stringify({
+            type: "error",
+            errorText: options?.onError?.(firstError) ?? firstError.message,
+          })}\n\n`,
+        ),
+      };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      { prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input) },
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Own replacement construction failure",
+    });
+    const body = await result.response.text();
+    const wireError = JSON.parse(body.split("\n\n")[0]!.slice("data: ".length));
+
+    expect(requests).toBe(2);
+    expect(wireError).toEqual({ type: "error", errorText: secondMessage });
+    expect(body).not.toContain(firstError.message);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: {
+        name: "ReplacementConstructionError",
+        data: { message: secondMessage, statusCode: 503 },
+      },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    expect(store.listMessages(result.started.conversation.id).filter(
+      (message) => message.role === "assistant" && message.status.type === "error",
+    )).toHaveLength(1);
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )[0]?.payload).toMatchObject({
+      error: { data: { message: firstError.message } },
+    });
+    db.close();
+  });
+
+  test("treats a UI-only overflow without responseReady as terminal after commit", async () => {
+    const providerError = Object.assign(
+      new Error("  context window exceeded\nUI_ONLY_FINAL  "),
+      { name: "UiOnlyContextError" },
+    );
+    let requests = 0;
+    const streamText: RuntimeStreamText = () => {
+      requests += 1;
+      return {
+        toUIMessageStreamResponse: (options) => new Response(
+          `data: ${JSON.stringify({
+            type: "error",
+            errorText: options?.onError?.(providerError) ?? providerError.message,
+          })}\n\n`,
+        ),
+      };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      { prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input) },
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Commit before UI-only error",
+    });
+    const body = await result.response.text();
+    await Promise.resolve();
+    await Promise.resolve();
+    const wireError = JSON.parse(body.split("\n\n")[0]!.slice("data: ".length));
+
+    expect(requests).toBe(1);
+    expect(wireError).toEqual({ type: "error", errorText: providerError.message });
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: { name: "UiOnlyContextError", data: { message: providerError.message } },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    db.close();
+  });
+
+  test("does not double-retry when fullStream and UI observe an overflow at commit", async () => {
+    const providerError = Object.assign(
+      new Error("maximum context length exceeded\nDUAL_OBSERVER"),
+      { name: "DualObserverContextError" },
+    );
+    let requests = 0;
+    let fullStreamErrors = 0;
+    let uiErrors = 0;
+    const streamText: RuntimeStreamText = (input) => {
+      requests += 1;
+      if (requests === 1) {
+        queueMicrotask(() => {
+          fullStreamErrors += 1;
+          void input.onError?.({ error: providerError });
+        });
+      }
+      return {
+        toUIMessageStreamResponse: (options) => {
+          uiErrors += 1;
+          return new Response(
+            `data: ${JSON.stringify({
+              type: "error",
+              errorText: options?.onError?.(providerError) ?? providerError.message,
+            })}\n\n`,
+          );
+        },
+      };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      { prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input) },
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Observe at both stream boundaries",
+    });
+    await result.response.text();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(requests).toBe(1);
+    expect(fullStreamErrors).toBe(1);
+    expect(uiErrors).toBe(1);
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(0);
+    db.close();
+  });
+
+  test.each([
+    ["auth", { name: "ProviderAuthError", message: "unauthorized", statusCode: 401 }],
+    ["network", { name: "NetworkError", message: "socket disconnected" }],
+    ["rate", { name: "RateLimitError", message: "rate limit exceeded", statusCode: 429 }],
+    ["tool", { name: "InvalidToolInputError", message: "invalid tool input" }],
+    ["attachment", { name: "UnsupportedAttachmentError", message: "unsupported attachment" }],
+    ["unsupported model", {
+      name: "UnsupportedModelError",
+      message: "  prompt too long\nunsupported model  ",
+    }],
+    ["missing model", {
+      name: "ModelNotFoundError",
+      message: "maximum context length\nmodel not found",
+    }],
+    ["disabled model", {
+      name: "ModelDisabledError",
+      message: "context window exceeded\nmodel disabled",
+    }],
+    ["tool execution", {
+      name: "ToolExecutionError",
+      message: "too many tokens\ntool execution failed",
+    }],
+    ["model code", {
+      name: "ProviderError",
+      code: "model_not_found",
+      message: "context length exceeded",
+    }],
+    ["tool code", {
+      name: "ProviderError",
+      code: "tool_execution_error",
+      message: "prompt too long",
+    }],
+  ] as const)("does not retry a representative %s runner error", async (_kind, providerError) => {
+    let requests = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        requests += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [{ type: "error" as const, error: providerError }],
+          }),
+        };
+      },
+    });
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input),
+    };
+    const { db, store, runner } = createRunnerWithModel(model, undefined, contextManager);
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Do not retry this failure",
+    });
+    const body = await result.response.text();
+    const wireErrors = body
+      .split("\n\n")
+      .filter((chunk) => chunk.startsWith("data: {") && chunk.includes("\"type\":\"error\""))
+      .map((chunk) => JSON.parse(chunk.slice("data: ".length)));
+
+    expect(requests).toBe(1);
+    expect(wireErrors).toEqual([{ type: "error", errorText: providerError.message }]);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: {
+        name: providerError.name,
+        data: {
+          message: providerError.message,
+          ...("statusCode" in providerError ? { statusCode: providerError.statusCode } : {}),
+        },
+      },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    expect(store.listMessages(result.started.conversation.id).filter(
+      (message) => message.role === "assistant" && message.status.type === "error",
+    )).toHaveLength(1);
+    db.close();
+  });
+
+  test.each([
+    ["nonempty text", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({ chunk: { type: "text-delta", text: "visible" } });
+    }],
+    ["nonempty reasoning", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({ chunk: { type: "reasoning-delta", text: "reason" } });
+    }],
+    ["source", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({
+        chunk: { type: "source-url", sourceId: "source-1", url: "https://example.com" },
+      });
+    }],
+    ["tool-input-start", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-input-start",
+          toolCallId: "call_fact",
+          toolName: "np__web__fetch",
+        },
+      });
+    }],
+    ["tool-input-delta", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({
+        chunk: { type: "tool-input-delta", toolCallId: "call_fact", delta: "{" },
+      });
+    }],
+    ["tool-input-end", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({ chunk: { type: "tool-input-end", toolCallId: "call_fact" } });
+    }],
+    ["tool-call", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-call",
+          toolCallId: "call_fact",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+        },
+      });
+    }],
+    ["tool-result", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-result",
+          toolCallId: "call_fact",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+          output: {
+            ok: true,
+            output: { data: {}, display: { summary: "done" } },
+            metadata: { started: 1, completed: 2, durationMs: 1 },
+          },
+        },
+      });
+    }],
+    ["tool-error", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-error",
+          toolCallId: "call_fact",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+          error: new Error("tool failed"),
+        },
+      });
+    }],
+    ["tool execution start", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onToolCallStart?.({
+        toolCall: {
+          toolCallId: "call_execution",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+        },
+      });
+    }],
+    ["tool execution finish", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onToolCallFinish?.({
+        toolCall: {
+          toolCallId: "call_execution",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+        },
+        durationMs: 1,
+        success: true,
+        output: {
+          ok: true,
+          output: { data: {}, display: { summary: "done" } },
+          metadata: { started: 1, completed: 2, durationMs: 1 },
+        },
+      });
+    }],
+    ["Permission response", async (input: Parameters<RuntimeStreamText>[0]) => {
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-approval-response",
+          approvalId: "approval_fact",
+          toolCallId: "call_fact",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+          approved: true,
+        },
+      });
+    }],
+  ] as const)("does not retry after the production %s mapping observes a fact", async (_name, emitFact) => {
+    const providerError = Object.assign(new Error("context length exceeded\nFACT_ERROR"), {
+      name: "ContextFactError",
+    });
+    let requests = 0;
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      await emitFact(input);
+      await input.onError?.({ error: providerError });
+      return {
+        toUIMessageStreamResponse: (options) => new Response(
+          `data: ${JSON.stringify({
+            type: "error",
+            errorText: options?.onError?.(providerError) ?? providerError.message,
+          })}\n\n`,
+        ),
+      };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      createWebRegistry(),
+      undefined,
+      true,
+      () => ({ autoApproveMaxRisk: "none" }),
+      undefined,
+      undefined,
+      { prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input) },
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Do not retry after facts",
+      agentMode: "agent",
+    });
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(store.getRun(result.started.run.id)?.error).toEqual({
+      name: "ContextFactError",
+      data: { message: providerError.message },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    db.close();
+  });
+
+  test("does not retry after the production Permission request mapping", async () => {
+    const providerError = Object.assign(new Error("prompt too long\nPERMISSION_REQUEST"), {
+      name: "PermissionContextError",
+    });
+    let requests = 0;
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      const toolCall = {
+        type: "tool-call" as const,
+        toolCallId: "call_permission_fact",
+        toolName: "np__web__fetch",
+        input: { url: "https://example.com" },
+      };
+      await input.onChunk?.({ chunk: toolCall });
+      const approve = input.toolApproval as unknown as (value: {
+        toolCall: typeof toolCall;
+        tools: unknown;
+        toolsContext: Record<string, never>;
+        runtimeContext: undefined;
+        messages: [];
+      }) => Promise<unknown>;
+      expect(await approve({
+        toolCall,
+        tools: input.tools,
+        toolsContext: {},
+        runtimeContext: undefined,
+        messages: [],
+      })).toBe("user-approval");
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-approval-request",
+          approvalId: "approval_permission_fact",
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.toolName,
+          input: toolCall.input,
+        },
+      });
+      await input.onError?.({ error: providerError });
+      return { toUIMessageStreamResponse: () => new Response("data: permission-error\n\n") };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      createWebRegistry(),
+      undefined,
+      true,
+      () => ({ autoApproveMaxRisk: "none" }),
+      undefined,
+      undefined,
+      { prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input) },
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Request approval",
+      agentMode: "agent",
+    });
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(store.getRun(result.started.run.id)?.error?.data).toEqual({
+      message: providerError.message,
+    });
+    db.close();
+  });
+
+  test("does not retry when a durable side-effect ledger fact exists", async () => {
+    const runId = "run_side_effect_overflow" as never;
+    const providerError = Object.assign(new Error("too many tokens\nSIDE_EFFECT"), {
+      name: "SideEffectContextError",
+    });
+    let requests = 0;
+    let storeRef: RuntimeSqliteStore;
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      const run = storeRef.getRun(runId)!;
+      storeRef.saveToolCall({
+        id: "tool_side_effect_overflow" as never,
+        conversationId: run.conversationId,
+        runId,
+        messageId: run.assistantMessageId!,
+        toolName: "web.fetch",
+        input: { url: "https://example.com" },
+        state: "running",
+        time: { created: 10, started: 11 },
+      });
+      await input.onError?.({ error: providerError });
+      return { toUIMessageStreamResponse: () => new Response("data: side-effect-error\n\n") };
+    };
+    const created = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      { prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input) },
+    );
+    storeRef = created.store;
+
+    const result = await created.runner.streamText({
+      runId,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Never retry a side effect",
+    });
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(created.store.getRun(runId)?.error?.data).toEqual({
+      message: providerError.message,
+    });
+    created.db.close();
+  });
+
+  test.each(["active head", "revision"] as const)(
+    "fails the first error when the %s changes during recovery preparation",
+    async (changedField) => {
+    const providerError = Object.assign(
+      new Error("context_length_exceeded\nREVISION_RACE"),
+      { name: "RevisionRaceContextError" },
+    );
+    let requests = 0;
+    let storeRef: RuntimeSqliteStore;
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      if (requests === 1) {
+        await input.onError?.({ error: providerError });
+      } else {
+        await input.onChunk?.({ chunk: { type: "text-delta", text: "stale retry" } });
+        await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
+      }
+      return { toUIMessageStreamResponse: () => new Response("data: revision-race\n\n") };
+    };
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+        const before = storeRef.getConversation(input.conversationId as never)!;
+        if (input.trigger === "provider_overflow") {
+          storeRef.saveConversation({
+            ...before,
+            ...(changedField === "active head" ? { activeHeadRunId: undefined } : {}),
+            revision: before.revision + (changedField === "revision" ? 1 : 0),
+          });
+        }
+        return {
+          ...managedPreparedTestContext(input),
+          plan: {
+            ...managedPreparedTestContext(input).plan,
+            sourceConversationRevision: before.revision,
+          },
+        };
+      },
+    };
+    const created = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+    storeRef = created.store;
+
+    const result = await created.runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Race the recovery",
+    });
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(created.store.listContextUsagesByRun(result.started.run.id)).toHaveLength(1);
+    expect(created.store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(0);
+    expect(created.store.getRun(result.started.run.id)?.error).toEqual({
+      name: "RevisionRaceContextError",
+      data: { message: providerError.message },
+    });
+    expect(created.store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    created.db.close();
+    },
+  );
+
+  test.each(["finish", "abort"] as const)(
+    "quarantines an attempt-0 %s callback while overflow compaction is deferred",
+    async (callbackKind) => {
+      const providerError = Object.assign(
+        new Error(`context length exceeded\nSTALE_${callbackKind.toUpperCase()}`),
+        { name: "DeferredCallbackContextError" },
+      );
+      const preparationEntered = createDeferred<void>();
+      const releasePreparation = createDeferred<void>();
+      let firstInput: Parameters<RuntimeStreamText>[0] | undefined;
+      let requests = 0;
+      const streamText: RuntimeStreamText = (input) => {
+        requests += 1;
+        if (requests === 1) {
+          firstInput = input;
+          const responseReady = Promise.resolve()
+            .then(() => input.onError?.({ error: providerError }))
+            .then(() => undefined);
+          return {
+            responseReady,
+            toUIMessageStreamResponse: (options) => new Response(
+              `data: ${JSON.stringify({
+                type: "error",
+                errorText: options?.onError?.(providerError) ?? providerError.message,
+              })}\n\n`,
+            ),
+          };
+        }
+        return streamFromText("stale replacement")(input);
+      };
+      const contextManager = {
+        prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+          if (input.trigger === "provider_overflow") {
+            preparationEntered.resolve(undefined);
+            await releasePreparation.promise;
+          }
+          return managedPreparedTestContext(input);
+        },
+      };
+      const { db, store, runner } = createRunner(
+        streamText,
+        undefined,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        contextManager,
+      );
+
+      const runPromise = runner.streamText({
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: "Defer overflow compaction",
+      });
+      await preparationEntered.promise;
+      if (!firstInput) throw new Error("Attempt 0 input was not captured");
+      if (callbackKind === "finish") {
+        await firstInput.onFinish?.({ finishReason: "stop", stepCount: 1 });
+      } else {
+        await firstInput.onAbort?.({ reason: "stale attempt abort" });
+      }
+      releasePreparation.resolve(undefined);
+      const result = await runPromise;
+      const body = await result.response.text();
+      const wireError = JSON.parse(body.split("\n\n")[0]!.slice("data: ".length));
+
+      expect(requests).toBe(1);
+      expect(wireError).toEqual({ type: "error", errorText: providerError.message });
+      expect(store.getRun(result.started.run.id)).toMatchObject({
+        status: "failed",
+        error: {
+          name: "DeferredCallbackContextError",
+          data: { message: providerError.message },
+        },
+      });
+      expect(store.listEventsByRun(result.started.run.id).filter(
+        (event) => event.type === "runtime.error",
+      )).toHaveLength(1);
+      expect(store.listTraces(result.started.run.id).filter(
+        (trace) => trace.type === "context.overflow.recovered",
+      )).toHaveLength(0);
+      expect(store.listContextUsagesByRun(result.started.run.id)).toHaveLength(1);
+      db.close();
+    },
+  );
+
+  test("honors an abort signal while overflow compaction is deferred", async () => {
+    const controller = new AbortController();
+    const providerError = Object.assign(new Error("prompt too long\nDEFERRED_ABORT"), {
+      name: "DeferredAbortContextError",
+    });
+    const preparationEntered = createDeferred<void>();
+    const releasePreparation = createDeferred<void>();
+    let requests = 0;
+    const streamText: RuntimeStreamText = (input) => {
+      requests += 1;
+      if (requests === 1) {
+        return {
+          responseReady: Promise.resolve()
+            .then(() => input.onError?.({ error: providerError }))
+            .then(() => undefined),
+          toUIMessageStreamResponse: () => new Response("data: aborted\n\n"),
+        };
+      }
+      return streamFromText("must not run")(input);
+    };
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+        if (input.trigger === "provider_overflow") {
+          preparationEntered.resolve(undefined);
+          await releasePreparation.promise;
+        }
+        return managedPreparedTestContext(input);
+      },
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+
+    const runPromise = runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Abort deferred recovery",
+    }, controller.signal);
+    await preparationEntered.promise;
+    controller.abort("user stopped deferred recovery");
+    releasePreparation.resolve(undefined);
+    const result = await runPromise;
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "interrupted",
+      finish: "interrupted",
+      metadata: {
+        interrupt: {
+          reason: "user_stop",
+          message: "user stopped deferred recovery",
+        },
+      },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(0);
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(0);
+    expect(store.listContextUsagesByRun(result.started.run.id)).toHaveLength(1);
+    db.close();
+  });
+
+  test.each([
+    ["interrupted", "resolves"],
+    ["failed", "resolves"],
+    ["completed", "resolves"],
+    ["completed", "rejects"],
+  ] as const)(
+    "does not replace an externally %s Run when deferred overflow compaction %s",
+    async (terminalStatus, compactionOutcome) => {
+      const providerError = Object.assign(new Error("too many tokens\nTERMINAL_RACE"), {
+        name: "TerminalRaceContextError",
+      });
+      const externalError = {
+        name: "ExternalTerminalError",
+        data: { message: "external terminal owner" },
+      };
+      const preparationEntered = createDeferred<void>();
+      const releasePreparation = createDeferred<void>();
+      let requests = 0;
+      const streamText: RuntimeStreamText = (input) => {
+        requests += 1;
+        if (requests === 1) {
+          return {
+            responseReady: Promise.resolve()
+              .then(() => input.onError?.({ error: providerError }))
+              .then(() => undefined),
+            toUIMessageStreamResponse: (options) => new Response(
+              `data: ${JSON.stringify({
+                type: "error",
+                errorText: options?.onError?.(providerError) ?? providerError.message,
+              })}\n\n`,
+            ),
+          };
+        }
+        return streamFromText("must not replace terminal Run")(input);
+      };
+      const contextManager = {
+        prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+          if (input.trigger === "provider_overflow") {
+            preparationEntered.resolve(undefined);
+            await releasePreparation.promise;
+          }
+          return managedPreparedTestContext(input);
+        },
+      };
+      const { db, store, runner } = createRunner(
+        streamText,
+        undefined,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        contextManager,
+      );
+      const runId = `run_external_${terminalStatus}` as never;
+      const runPromise = runner.streamText({
+        runId,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: "Race an external terminal owner",
+      });
+      await preparationEntered.promise;
+      const run = store.getRun(runId)!;
+      const conversation = store.getConversation(run.conversationId)!;
+      const userMessage = store.getMessage(run.parentMessageId!)!;
+      const assistantMessage = store.getMessage(run.assistantMessageId!)!;
+      if (userMessage.role !== "user" || assistantMessage.role !== "assistant") {
+        throw new Error("Invalid deferred terminal fixture");
+      }
+      let externalId = 0;
+      const terminalRunner = new RuntimeRunner({
+        store,
+        now: () => 4_000,
+        createId: (prefix) =>
+          `${prefix}_external_${terminalStatus}_${++externalId}` as never,
+      });
+      const started = { conversation, run, userMessage, assistantMessage };
+      if (terminalStatus === "interrupted") {
+        terminalRunner.interrupt(started, {
+          reason: "user_stop",
+          message: "external interruption",
+        });
+      } else if (terminalStatus === "failed") {
+        terminalRunner.fail(started, externalError);
+      } else {
+        terminalRunner.completeText(started, "external completion");
+      }
+      if (compactionOutcome === "rejects") {
+        releasePreparation.reject(new Error("deferred compaction rejected"));
+      } else {
+        releasePreparation.resolve(undefined);
+      }
+      const result = await runPromise;
+      await result.response.text();
+
+      expect(requests).toBe(1);
+      expect(store.getRun(runId)?.status).toBe(terminalStatus);
+      if (terminalStatus === "failed") {
+        expect(store.getRun(runId)?.error).toEqual(externalError);
+      }
+      expect(store.listEventsByRun(runId).filter(
+        (event) => event.type === "runtime.error",
+      )).toHaveLength(terminalStatus === "failed" ? 1 : 0);
+      expect(store.listTraces(runId).filter(
+        (trace) => trace.type === "context.overflow.recovered",
+      )).toHaveLength(0);
+      expect(store.listContextUsagesByRun(runId)).toHaveLength(1);
+      db.close();
+    },
+  );
+
+  test("fails closed when a pending Permission appears during overflow compaction", async () => {
+    const providerError = Object.assign(new Error("context window exceeded\nPERMISSION_RACE"), {
+      name: "PermissionRaceContextError",
+    });
+    const preparationEntered = createDeferred<void>();
+    const releasePreparation = createDeferred<void>();
+    let requests = 0;
+    const streamText: RuntimeStreamText = (input) => {
+      requests += 1;
+      if (requests === 1) {
+        return {
+          responseReady: Promise.resolve()
+            .then(() => input.onError?.({ error: providerError }))
+            .then(() => undefined),
+          toUIMessageStreamResponse: () => new Response("data: permission-race\n\n"),
+        };
+      }
+      return streamFromText("must not run")(input);
+    };
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+        if (input.trigger === "provider_overflow") {
+          preparationEntered.resolve(undefined);
+          await releasePreparation.promise;
+        }
+        return managedPreparedTestContext(input);
+      },
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+    const runId = "run_permission_race" as never;
+    const runPromise = runner.streamText({
+      runId,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Add Permission during compaction",
+    });
+    await preparationEntered.promise;
+    const run = store.getRun(runId)!;
+    store.saveToolCall({
+      id: "tool_permission_race" as never,
+      conversationId: run.conversationId,
+      runId,
+      messageId: run.assistantMessageId!,
+      toolName: "web.fetch",
+      input: { url: "https://example.com" },
+      state: "waiting_for_permission",
+      permissionId: "perm_permission_race" as never,
+      time: { created: 3_000 },
+    });
+    store.savePermission({
+      id: "perm_permission_race" as never,
+      conversationId: run.conversationId,
+      runId,
+      messageId: run.assistantMessageId!,
+      toolCallId: "tool_permission_race" as never,
+      status: "pending",
+      toolId: "web.fetch",
+      title: "Fetch protected resource",
+      risk: { level: "low", reversible: true, sideEffects: ["external_network"] },
+      confirmation: { level: "standard" },
+      createdAt: 3_000,
+    });
+    releasePreparation.resolve(undefined);
+    const result = await runPromise;
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(store.getRun(runId)).toMatchObject({
+      status: "failed",
+      error: { name: "PermissionRaceContextError", data: { message: providerError.message } },
+    });
+    expect(store.listEventsByRun(runId).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    expect(store.listTraces(runId).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(0);
+    expect(store.listContextUsagesByRun(runId)).toHaveLength(1);
+    db.close();
+  });
+
+  test.each(["running", "completed", "unknown-outcome"] as const)(
+    "fails closed when a %s ToolCall appears during overflow compaction",
+    async (toolState) => {
+      const providerError = Object.assign(new Error("maximum context length\nTOOL_RACE"), {
+        name: "DurableFactContextError",
+      });
+      const preparationEntered = createDeferred<void>();
+      const releasePreparation = createDeferred<void>();
+      let requests = 0;
+      const streamText: RuntimeStreamText = (input) => {
+        requests += 1;
+        if (requests === 1) {
+          return {
+            responseReady: Promise.resolve()
+              .then(() => input.onError?.({ error: providerError }))
+              .then(() => undefined),
+            toUIMessageStreamResponse: () => new Response("data: tool-race\n\n"),
+          };
+        }
+        return streamFromText("must not run")(input);
+      };
+      const contextManager = {
+        prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+          if (input.trigger === "provider_overflow") {
+            preparationEntered.resolve(undefined);
+            await releasePreparation.promise;
+          }
+          return managedPreparedTestContext(input);
+        },
+      };
+      const { db, store, runner } = createRunner(
+        streamText,
+        undefined,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        contextManager,
+      );
+      const runId = `run_tool_race_${toolState}` as never;
+      const runPromise = runner.streamText({
+        runId,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: "Add ToolCall during compaction",
+      });
+      await preparationEntered.promise;
+      const run = store.getRun(runId)!;
+      const common = {
+        id: `tool_race_${toolState}` as never,
+        conversationId: run.conversationId,
+        runId,
+        messageId: run.assistantMessageId!,
+        toolName: "web.fetch",
+        input: { url: "https://example.com" },
+      };
+      store.saveToolCall(toolState === "running"
+        ? { ...common, state: "running", time: { created: 3_000, started: 3_001 } }
+        : toolState === "completed"
+          ? {
+              ...common,
+              state: "completed",
+              result: { ok: true, summary: "completed", data: {} },
+              time: { created: 3_000, started: 3_001, completed: 3_002 },
+            }
+          : {
+              ...common,
+              state: "error",
+              error: {
+                code: "TOOL_FAILED",
+                message: "outcome unknown",
+                retryable: false,
+                outcome: "unknown",
+              },
+              time: { created: 3_000, started: 3_001, completed: 3_002 },
+            });
+      releasePreparation.resolve(undefined);
+      const result = await runPromise;
+      await result.response.text();
+
+      expect(requests).toBe(1);
+      expect(store.getRun(runId)).toMatchObject({
+        status: "failed",
+        error: { name: "DurableFactContextError", data: { message: providerError.message } },
+      });
+      expect(store.listEventsByRun(runId).filter(
+        (event) => event.type === "runtime.error",
+      )).toHaveLength(1);
+      expect(store.listTraces(runId).filter(
+        (trace) => trace.type === "context.overflow.recovered",
+      )).toHaveLength(0);
+      expect(store.listContextUsagesByRun(runId)).toHaveLength(1);
+      db.close();
+    },
+  );
+
+  test("keeps an abort during overflow preparation as an interruption", async () => {
+    const controller = new AbortController();
+    const providerError = Object.assign(new Error("context length exceeded\nABORT_RACE"), {
+      name: "AbortRaceContextError",
+    });
+    let requests = 0;
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      await input.onError?.({ error: providerError });
+      return { toUIMessageStreamResponse: () => new Response("data: abort-race\n\n") };
+    };
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+        if (input.trigger === "provider_overflow") {
+          controller.abort("user stopped during overflow compaction");
+          throw new Error("compaction aborted");
+        }
+        return managedPreparedTestContext(input);
+      },
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Abort recovery",
+    }, controller.signal);
+    await result.response.text();
+
+    expect(requests).toBe(1);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "interrupted",
+      finish: "interrupted",
+      metadata: {
+        interrupt: {
+          reason: "user_stop",
+          message: "user stopped during overflow compaction",
+        },
+      },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(0);
+    db.close();
+  });
+
+  test("enforces and persists the recovery audit allowlist with exact secret redaction", async () => {
+    const secret = "sk-overflow-secret";
+    const providerError = {
+      name: "ProviderContextError",
+      message: `maximum context length; key=${secret}`,
+      statusCode: 400,
+      isRetryable: false,
+      stack: `stack ${secret}`,
+      headers: { authorization: `Bearer ${secret}` },
+      requestBody: `request ${secret}`,
+      responseBody: `response ${secret}`,
+      providerMetadata: { raw: secret },
+      summary: secret,
+      safetyState: { details: secret },
+      credentials: secret,
+    };
+    for (const forbidden of [
+      "stack",
+      "headers",
+      "requestBody",
+      "responseBody",
+      "providerMetadata",
+      "summary",
+      "safetyState",
+      "credentials",
+    ]) {
+      expect(() => traceEventSchema.parse({
+        id: "trace_forbidden",
+        conversationId: "conv_forbidden",
+        runId: "run_forbidden",
+        type: "context.overflow.recovered",
+        level: "warn",
+        time: 1,
+        payload: {
+          error: { name: providerError.name, data: { message: providerError.message } },
+          requestIndex: 1,
+          sourceHeadRunId: "run_forbidden",
+          sourceConversationRevision: 1,
+          checkpointId: "ckpt_forbidden",
+          beforeEstimatedInputTokens: 100,
+          afterEstimatedInputTokens: 10,
+          [forbidden]: providerError[forbidden as keyof typeof providerError],
+        },
+      })).toThrow();
+    }
+
+    let requests = 0;
+    const streamText: RuntimeStreamText = async (input) => {
+      requests += 1;
+      if (requests === 1) {
+        await input.onError?.({ error: providerError });
+      } else {
+        await input.onChunk?.({ chunk: { type: "text-delta", text: "recovered" } });
+        await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
+      }
+      return { toUIMessageStreamResponse: () => new Response("data: audit\n\n") };
+    };
+    let storeRef: RuntimeSqliteStore;
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+        const marker = input.trigger === "provider_overflow"
+          ? {
+              checkpointId: "ckpt_overflow_audit",
+              trigger: "provider_overflow" as const,
+              auto: true,
+              coverageThroughRunId: input.runId,
+              beforeEstimatedInputTokens: 12_345,
+              afterEstimatedInputTokens: 2_345,
+              status: "created" as const,
+              time: { created: 2_000 },
+            }
+          : undefined;
+        const revision = storeRef.getConversation(input.conversationId as never)?.revision ?? 1;
+        const prepared = managedPreparedTestContext(input, marker);
+        return {
+          ...prepared,
+          plan: { ...prepared.plan, sourceConversationRevision: revision },
+        };
+      },
+    };
+    const created = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      () => [secret],
+      contextManager,
+    );
+    storeRef = created.store;
+
+    const result = await created.runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Audit recovery",
+    });
+    await result.response.text();
+
+    const traces = created.store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    );
+    expect(traces).toHaveLength(1);
+    expect(traces[0]?.payload).toEqual({
+      error: {
+        name: "ProviderContextError",
+        data: {
+          message: "maximum context length; key=[REDACTED]",
+          statusCode: 400,
+          isRetryable: false,
+        },
+      },
+      requestIndex: 1,
+      sourceHeadRunId: result.started.run.id,
+      sourceConversationRevision: 1,
+      checkpointId: "ckpt_overflow_audit",
+      beforeEstimatedInputTokens: 12_345,
+      afterEstimatedInputTokens: 2_345,
+    });
+    expect(JSON.stringify(traces[0])).not.toContain(secret);
+    for (const forbidden of [
+      "stack",
+      "headers",
+      "requestBody",
+      "responseBody",
+      "providerMetadata",
+      "summary",
+      "safetyState",
+      "credentials",
+    ]) {
+      expect(JSON.stringify(traces[0])).not.toContain(forbidden);
+    }
+    created.db.close();
+  });
+
+  test("preserves Task 5 planning and usage across a recovered real ToolLoop", async () => {
+    const firstError = Object.assign(new Error("maximum context length exceeded"), {
+      name: "ReplacementContextError",
+    });
+    let modelCalls = 0;
+    const prompts: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: async (options) => {
+        modelCalls += 1;
+        prompts.push(structuredClone(options.prompt));
+        if (modelCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [{ type: "error" as const, error: firstError }],
+            }),
+          };
+        }
+        const content = modelCalls === 2
+          ? [{
+              type: "tool-call" as const,
+              toolCallId: "call_recovered_tool_loop",
+              toolName: "np__web__fetch",
+              input: JSON.stringify({ url: "https://example.com" }),
+            }]
+          : [
+              { type: "text-start" as const, id: "replacement-final" },
+              {
+                type: "text-delta" as const,
+                id: "replacement-final",
+                delta: "replacement tool loop complete",
+              },
+              { type: "text-end" as const, id: "replacement-final" },
+            ];
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              ...content,
+              {
+                type: "finish" as const,
+                finishReason: {
+                  unified: modelCalls === 2 ? "tool-calls" as const : "stop" as const,
+                  raw: undefined,
+                },
+                logprobs: undefined,
+                usage: sdkModelUsage(modelCalls === 2 ? 21 : 22),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const preparations: Array<{
+      requestIndex: number;
+      trigger: string;
+      providerId: string;
+      modelId: string;
+      retainedMessages: ModelMessage[];
+    }> = [];
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0] & {
+        providerId: string;
+        modelId: string;
+        retainedMessages?: ModelMessage[];
+      }) => {
+        preparations.push({
+          requestIndex: input.requestIndex,
+          trigger: input.trigger,
+          providerId: input.providerId,
+          modelId: input.modelId,
+          retainedMessages: structuredClone(input.retainedMessages ?? []),
+        });
+        const prepared = managedPreparedTestContext(input);
+        return {
+          ...prepared,
+          messages: [
+            { role: "user" as const, content: `managed ${input.trigger}` },
+            ...(input.retainedMessages ?? []),
+          ],
+        };
+      },
+    };
+    const { db, store, runner } = createRunnerWithModel(
+      model,
+      createWebRegistry(),
+      contextManager,
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Recover and run a tool",
+      agentMode: "agent",
+    });
+    const startingLimits = structuredClone(result.started.run.limits);
+    const body = await result.response.text();
+
+    expect(modelCalls).toBe(3);
+    expect(body).toContain("replacement tool loop complete");
+    expect(preparations.map(({ requestIndex, trigger, providerId, modelId }) => ({
+      requestIndex,
+      trigger,
+      providerId,
+      modelId,
+    }))).toEqual([
+      { requestIndex: 0, trigger: "auto_pre_turn", providerId: "openai", modelId: "gpt-4o" },
+      { requestIndex: 1, trigger: "provider_overflow", providerId: "openai", modelId: "gpt-4o" },
+      { requestIndex: 2, trigger: "auto_mid_turn", providerId: "openai", modelId: "gpt-4o" },
+    ]);
+    const laterRetained = preparations[2]?.retainedMessages;
+    expect(JSON.stringify(laterRetained)).toContain("call_recovered_tool_loop");
+    expect(JSON.stringify(laterRetained)).toContain("Example page");
+    expect(JSON.stringify(prompts[2])).toContain("call_recovered_tool_loop");
+    expect(store.listContextUsagesByRun(result.started.run.id).map((usage) => ({
+      requestIndex: usage.requestIndex,
+      providerInputTokens: usage.providerObservation?.inputTokens,
+    }))).toEqual([
+      { requestIndex: 0, providerInputTokens: undefined },
+      { requestIndex: 1, providerInputTokens: 21 },
+      { requestIndex: 2, providerInputTokens: 22 },
+    ]);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "completed",
+      limits: startingLimits,
+    });
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(1);
+    db.close();
+  });
+
+  test("compacts completed ancestors while preserving the current raw turn and transcript", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const resolveLanguageModel: RuntimeTextRunnerDependencies["resolveLanguageModel"] = () => ({
+      languageModel: new MockLanguageModelV3(),
+      runtimeContext: {
+        provider: {
+          providerId: "openai",
+          modelId: "gpt-4o",
+          contextLength: 25_000,
+          outputLength: 4_096,
+        },
+      },
+    });
+    const seedRunner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      resolveLanguageModel,
+      streamText: streamFromText("seed answer"),
+    });
+    let conversationId: string | undefined;
+    for (let index = 0; index < 6; index += 1) {
+      const seeded = await seedRunner.streamText({
+        conversationId: conversationId as never,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: `OLD_USER_${index}_${"x".repeat(6_000)}`,
+      });
+      await seeded.response.text();
+      conversationId = seeded.started.conversation.id;
+    }
+    const transcriptBefore = structuredClone(
+      store.listTranscriptMessages(conversationId as never),
+    );
+    let summaryCalls = 0;
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => {
+        summaryCalls += 1;
+        return { text: "CHECKPOINT_SUMMARY" };
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    let mainMessages: unknown[] | undefined;
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      resolveLanguageModel,
+      contextManager,
+      streamText: async (input) => {
+        mainMessages = input.messages;
+        await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
+        return { toUIMessageStreamResponse: () => new Response("data: {}\\n\\n") };
+      },
+    });
+    const current = await runner.streamText({
+      conversationId: conversationId as never,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "CURRENT_RAW_USER",
+    });
+    await current.response.text();
+
+    const serializedMainMessages = JSON.stringify(mainMessages);
+    expect(summaryCalls).toBe(1);
+    expect(serializedMainMessages).toContain("CHECKPOINT_SUMMARY");
+    expect(serializedMainMessages).toContain("Runtime Safety State");
+    expect(serializedMainMessages).toContain("CURRENT_RAW_USER");
+    expect(serializedMainMessages).not.toContain("OLD_USER_0");
+    const checkpoint = store.listContextCheckpoints(conversationId as never)[0]!;
+    expect(checkpoint.coverageThroughRunId).not.toBe(current.started.run.id);
+    expect(
+      store.listTranscriptMessages(conversationId as never).slice(0, transcriptBefore.length),
+    ).toEqual(transcriptBefore);
+    db.close();
+  });
+
+  test("runs the context manager after durable Run start before the main model request", async () => {
+    let prepareCalls = 0;
+    let observedRunStatus: string | undefined;
+    let mainMessages: unknown;
+    let storeRef: RuntimeSqliteStore | undefined;
+    const contextManager = {
+      prepare: async (input: { runId: string; requestIndex: number }) => {
+        prepareCalls += 1;
+        observedRunStatus = storeRef?.getRun(input.runId as never)?.status;
+        return {
+          plan: {
+            id: "ctxplan_test",
+            requestIndex: input.requestIndex,
+            budget: {
+              estimatedInputTokens: 12,
+              reservedOutputTokens: 4,
+              rawHistoryTokens: 4,
+              checkpointTokens: 4,
+              safetyStateTokens: 0,
+              systemPromptTokens: 0,
+              toolSchemaTokens: 0,
+            },
+            view: "raw",
+          },
+          messages: [{ role: "system", content: "checkpoint summary" }],
+        };
+      },
+    };
+    const streamText: RuntimeStreamText = async (input) => {
+      mainMessages = input.messages;
+      await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
+      return {
+        toUIMessageStreamResponse: () => new Response("data: {}\\n\\n"),
+      };
+    };
+    const created = createRunner(
+      streamText,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+    storeRef = created.store;
+    await (await created.runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "new turn",
+    })).response.text();
+
+    expect(prepareCalls).toBe(1);
+    expect(observedRunStatus).toBe("running");
+    expect(mainMessages).toEqual([{ role: "system", content: "checkpoint summary" }]);
+  });
+
+  test("records an already-aborted normal preparation as a client interruption", async () => {
+    let modelStarted = false;
+    const controller = new AbortController();
+    controller.abort("client disconnected before context preparation");
+    const contextManager = {
+      prepare: async (input: { abortSignal?: AbortSignal }) => {
+        input.abortSignal?.throwIfAborted();
+        return preparedTestContext(0);
+      },
+    };
+    const { db, store, runner } = createRunner(
+      async () => {
+        modelStarted = true;
+        throw new Error("model must not start");
+      },
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "abort before model",
+    }, controller.signal);
+    await result.response.text();
+
+    expect(modelStarted).toBe(false);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "interrupted",
+      finish: "interrupted",
+      metadata: {
+        interrupt: {
+          reason: "client_disconnect",
+          message: "client disconnected before context preparation",
+        },
+      },
+    });
+    const storedAssistant = store.getMessage(result.started.assistantMessage.id);
+    expect(storedAssistant?.role).toBe("assistant");
+    if (storedAssistant?.role !== "assistant") {
+      throw new Error("expected stored Assistant Message");
+    }
+    expect(storedAssistant.status).toMatchObject({
+      type: "incomplete",
+      reason: "interrupted",
+    });
+    db.close();
+  });
+
   test("waits for permission and continues the same Run with one approved execution", async () => {
     let executions = 0;
     let segment = 0;
+    const preparationTriggers: string[] = [];
+    const retainedModelInputs: ModelMessage[][] = [];
+    const contextManager = {
+      prepare: async (input: {
+        trigger: string;
+        requestIndex: number;
+        retainedMessages?: ModelMessage[];
+      }) => {
+        preparationTriggers.push(input.trigger);
+        if (input.trigger === "auto_mid_turn") {
+          retainedModelInputs.push(structuredClone(input.retainedMessages ?? []));
+        }
+        return {
+          plan: {
+            id: `ctxplan_${preparationTriggers.length}`,
+            requestIndex: input.requestIndex,
+            budget: {
+              estimatedInputTokens: 10,
+              reservedOutputTokens: 4,
+              rawHistoryTokens: 4,
+              checkpointTokens: 0,
+              safetyStateTokens: 0,
+              systemPromptTokens: 1,
+              toolSchemaTokens: 1,
+            },
+            view: "raw",
+          },
+          messages: [
+            { role: "system", content: "managed context" },
+            ...(input.retainedMessages ?? []),
+          ],
+        };
+      },
+    };
+    let continuationRequest: {
+      messages: ModelMessage[];
+      maxSteps: number | undefined;
+      maxOutputTokens: number | undefined;
+      timeout: number | undefined;
+    } | undefined;
     let autoApproveMaxRisk: "low" | "medium" = "low";
     const namespace: RuntimeToolNamespace = {
       id: "web",
@@ -372,6 +2328,15 @@ describe("RuntimeTextRunner", () => {
           },
         });
       } else {
+        continuationRequest = {
+          messages: structuredClone(input.messages ?? []),
+          maxSteps: input.maxSteps,
+          maxOutputTokens: input.maxOutputTokens,
+          timeout: input.timeout,
+        };
+        expect(JSON.stringify(input.messages)).toContain("managed context");
+        expect(JSON.stringify(input.messages)).toContain("call_approval");
+        expect(JSON.stringify(input.messages)).toContain("approval_1");
         const execute = input.tools?.np__web__fetch?.execute as unknown as (
           toolInput: { url: string },
           options: {
@@ -428,6 +2393,9 @@ describe("RuntimeTextRunner", () => {
       undefined,
       true,
       () => ({ autoApproveMaxRisk }),
+      undefined,
+      undefined,
+      contextManager,
     );
 
     const initial = await runner.streamText({
@@ -439,6 +2407,14 @@ describe("RuntimeTextRunner", () => {
     await initial.response.text();
     const waitingRun = store.getRun(initial.started.run.id)!;
     const permission = store.listPendingPermissionsByRun(waitingRun.id)[0]!;
+    const continuationBefore = structuredClone(
+      waitingRun.metadata?.continuation as {
+        responseMessages: ModelMessage[];
+        stepCount: number;
+      },
+    );
+    const limitsBefore = structuredClone(waitingRun.limits);
+    const usageBefore = structuredClone(waitingRun.usage!);
 
     expect(waitingRun.status).toBe("waiting_for_permission");
     expect(waitingRun.input.tools?.approvalPolicy).toEqual({
@@ -474,6 +2450,36 @@ describe("RuntimeTextRunner", () => {
     expect(continued.started.assistantMessage.id).toBe(
       initial.started.assistantMessage.id,
     );
+    const expectedContinuationPrefix: ModelMessage[] = [
+      ...continuationBefore.responseMessages,
+      {
+        role: "tool",
+        content: [{
+          type: "tool-approval-response",
+          approvalId: "approval_1",
+          approved: true,
+        }],
+      },
+    ];
+    expect(retainedModelInputs).toEqual([expectedContinuationPrefix]);
+    expect(continuationRequest?.messages).toEqual([
+      { role: "system", content: "managed context" },
+      ...expectedContinuationPrefix,
+    ]);
+    expect(continuationRequest?.maxSteps).toBe(
+      limitsBefore.maxSteps - continuationBefore.stepCount,
+    );
+    expect(continuationRequest?.maxOutputTokens).toBe(
+      limitsBefore.maxOutputTokens === undefined
+        ? undefined
+        : limitsBefore.maxOutputTokens - usageBefore.output,
+    );
+    if (limitsBefore.timeoutMs === undefined) {
+      expect(continuationRequest?.timeout).toBeUndefined();
+    } else {
+      expect(continuationRequest?.timeout).toBeGreaterThan(0);
+      expect(continuationRequest?.timeout).toBeLessThanOrEqual(limitsBefore.timeoutMs);
+    }
     expect(store.getRun(waitingRun.id)).toMatchObject({
       status: "completed",
       usage: { input: 5, output: 3, total: 8 },
@@ -483,6 +2489,7 @@ describe("RuntimeTextRunner", () => {
         },
       },
     });
+    expect(store.getRun(waitingRun.id)?.limits).toEqual(limitsBefore);
     expect(store.getToolCall(permission.toolCallId)).toMatchObject({
       state: "completed",
       permissionId: permission.id,
@@ -491,7 +2498,139 @@ describe("RuntimeTextRunner", () => {
     expect(store.getPermission(permission.id)?.decision).toMatchObject({
       confirmationVerified: true,
     });
+    expect(preparationTriggers).toEqual(["auto_pre_turn", "auto_mid_turn"]);
 
+    db.close();
+  });
+
+  test("records an aborted Permission continuation preparation on the same Run", async () => {
+    let modelSegments = 0;
+    const toolCall = {
+      type: "tool-call" as const,
+      toolCallId: "call_abort_continuation",
+      toolName: "np__web__fetch",
+      input: { url: "https://example.com" },
+    };
+    const registry = new RuntimeToolRegistry([{
+      id: "web",
+      title: "Web",
+      description: "Continuation abort test tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Approval Fetch",
+        description: "Approval-gated operation.",
+        inputSchema: z.object({ url: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "medium",
+          reversible: true,
+          sideEffect: "external_network",
+        },
+        execute: async () => ({ summary: "executed", data: { value: "ok" } }),
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    }]);
+    const contextManager = {
+      prepare: async (input: {
+        requestIndex: number;
+        abortSignal?: AbortSignal;
+      }) => {
+        input.abortSignal?.throwIfAborted();
+        return preparedTestContext(input.requestIndex);
+      },
+    };
+    const streamText: RuntimeStreamText = async (input) => {
+      modelSegments += 1;
+      if (modelSegments !== 1) {
+        throw new Error("continuation model must not start");
+      }
+      await input.onChunk?.({ chunk: toolCall });
+      const approve = input.toolApproval as unknown as (approvalInput: {
+        toolCall: typeof toolCall;
+        tools: unknown;
+        toolsContext: Record<string, never>;
+        runtimeContext: undefined;
+        messages: [];
+      }) => Promise<unknown>;
+      expect(await approve({
+        toolCall,
+        tools: input.tools,
+        toolsContext: {},
+        runtimeContext: undefined,
+        messages: [],
+      })).toBe("user-approval");
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-approval-request",
+          approvalId: "approval_abort_continuation",
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.toolName,
+          input: toolCall.input,
+        },
+      });
+      await input.onFinish?.({
+        finishReason: "tool-calls",
+        stepCount: 1,
+        responseMessages: [{
+          role: "assistant",
+          content: [
+            toolCall,
+            {
+              type: "tool-approval-request",
+              approvalId: "approval_abort_continuation",
+              toolCallId: toolCall.toolCallId,
+            },
+          ],
+        }],
+      });
+      return {
+        toUIMessageStreamResponse: () => new Response("data: {}\n\n"),
+      };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      registry,
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+    const initial = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "wait for approval",
+      agentMode: "agent",
+    });
+    await initial.response.text();
+    const permission = store.listPendingPermissionsByRun(initial.started.run.id)[0]!;
+    const controller = new AbortController();
+    controller.abort("client disconnected during permission continuation preparation");
+
+    const continued = await runner.continueText(initial.started.run.id, [{
+      permissionId: permission.id,
+      approved: true,
+    }], controller.signal);
+    await continued.response.text();
+
+    expect(modelSegments).toBe(1);
+    expect(continued.started.run.id).toBe(initial.started.run.id);
+    expect(continued.started.assistantMessage.id).toBe(initial.started.assistantMessage.id);
+    expect(store.getRun(initial.started.run.id)).toMatchObject({
+      status: "interrupted",
+      finish: "interrupted",
+      metadata: {
+        interrupt: {
+          reason: "client_disconnect",
+          message: "client disconnected during permission continuation preparation",
+        },
+      },
+    });
+    expect(store.getPermission(permission.id)?.status).toBe("approved");
+    expect(store.getToolCall(permission.toolCallId)?.state).toBe("interrupted");
     db.close();
   });
 

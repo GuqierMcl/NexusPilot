@@ -393,6 +393,45 @@ describe("context lineage hash", () => {
 });
 
 describe("pure context window planner", () => {
+  test("budgets retained model input while excluding the current Assistant from the durable base", () => {
+    const fixture = history(["a", "b", "c"]);
+    const currentAssistant = fixture.messages.find(
+      (message): message is AssistantMessage =>
+        message.role === "assistant" && message.runId === "run_c",
+    )!;
+    const retainedModelInput = {
+      estimatedTokens: 2_000,
+      contentHash: `sha256:${"a".repeat(64)}`,
+    };
+    const input = {
+      ...plannerInput(fixture, {
+        contextWindow: 1_500,
+        reservedOutputTokens: 0,
+        trigger: "auto_mid_turn",
+      }),
+      excludeAssistantMessageId: currentAssistant.id,
+      retainedModelInput,
+    } as ContextPlannerInput;
+
+    const planned = runtime.planContextWindow(input);
+    const contentChanged = runtime.planContextWindow({
+      ...input,
+      planId: "ctxplan_content_changed",
+      retainedModelInput: {
+        ...retainedModelInput,
+        contentHash: `sha256:${"b".repeat(64)}`,
+      },
+    } as ContextPlannerInput);
+
+    // Six two-byte text messages cost 7 tokens each. The current Assistant
+    // is excluded (42 - 7), and the exact retained suffix costs 2,000.
+    expect(planned.budget.rawHistoryTokens).toBe(2_035);
+    expect(planned.reason).toBe("compaction_required");
+    expect(planned.view).toBe("raw");
+    expect(contentChanged.requestHash).not.toBe(planned.requestHash);
+    expect(contentChanged.viewHash).not.toBe(planned.viewHash);
+  });
+
   test.each([
     ["negative", -1],
     ["fractional", 1.5],

@@ -889,7 +889,7 @@ export const eventSchema = z.object({
   time: z.number(),
 });
 
-export const traceEventSchema = z.object({
+const traceEventBaseSchema = z.object({
   id: z.string(),
   conversationId: z.string().optional(),
   runId: z.string().optional(),
@@ -903,8 +903,44 @@ export const traceEventSchema = z.object({
     "stream.started",
     "stream.finished",
     "stream.failed",
+    "context.overflow.recovered",
   ]),
   level: z.enum(["debug", "info", "warn", "error"]),
   time: z.number(),
   payload: unknownRecordSchema,
+});
+
+const contextOverflowRecoveredTracePayloadSchema = z
+  .object({
+    error: z
+      .object({
+        name: z.string().min(1),
+        data: z
+          .object({
+            message: z.string(),
+            statusCode: z.number().finite().optional(),
+            isRetryable: z.boolean().optional(),
+          })
+          .strict(),
+      })
+      .strict(),
+    requestIndex: z.number().int().nonnegative(),
+    sourceHeadRunId: z.string().startsWith("run_"),
+    sourceConversationRevision: z.number().int().nonnegative(),
+    checkpointId: z.string().startsWith("ckpt_"),
+    beforeEstimatedInputTokens: nonnegativeTokenCountSchema,
+    afterEstimatedInputTokens: nonnegativeTokenCountSchema,
+  })
+  .strict();
+
+export const traceEventSchema = traceEventBaseSchema.superRefine((trace, context) => {
+  if (trace.type !== "context.overflow.recovered") return;
+  const parsed = contextOverflowRecoveredTracePayloadSchema.safeParse(trace.payload);
+  if (parsed.success) return;
+  for (const issue of parsed.error.issues) {
+    context.addIssue({
+      ...issue,
+      path: ["payload", ...issue.path],
+    });
+  }
 });
