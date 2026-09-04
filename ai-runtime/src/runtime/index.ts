@@ -25,3 +25,4 @@ export * from "./runners/run-continuation-registry";
 export * from "./runners/model-error";
 export * from "./runners/text-runner";
 export * from "./attachments";
+export * from "./context";

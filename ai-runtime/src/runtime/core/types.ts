@@ -18,6 +18,9 @@ export type UploadId = RuntimeId<"upl">;
 export type AttachmentId = RuntimeId<"att">;
 export type BlobId = RuntimeId<"blob">;
 export type DiagnosticId = RuntimeId<"diag">;
+export type ContextCheckpointId = RuntimeId<"ckpt">;
+export type ContextPlanId = RuntimeId<"ctxplan">;
+export type ContextUsageId = RuntimeId<"ctxuse">;
 export type MessageHistoryView = "active" | "transcript";
 
 export interface TimeCreated {
@@ -496,6 +499,23 @@ export interface ToolStateInterrupted {
   time: Required<TimeSpan>;
 }
 
+export interface ToolCallAuthorizationSnapshot {
+  readonly version: "1";
+  readonly risk: PermissionResolvedRisk;
+  readonly presentation?: ToolCallAuthorizationPresentationSnapshot;
+}
+
+export interface ToolCallAuthorizationPresentationSnapshot {
+  readonly target?: PermissionTargetPresentation;
+  readonly sql?: {
+    readonly identifiedTargets?: readonly string[];
+  };
+  readonly keyValue?: {
+    readonly key: string;
+    readonly newKey?: string;
+  };
+}
+
 export interface ToolCall {
   id: ToolCallId;
   conversationId: ConversationId;
@@ -505,6 +525,7 @@ export interface ToolCall {
   toolName: string;
   input: Record<string, unknown>;
   state: ToolState["status"];
+  readonly authorization?: ToolCallAuthorizationSnapshot;
   permissionId?: PermissionId;
   result?: RuntimeToolResult<unknown>;
   error?: RuntimeToolError;
@@ -716,6 +737,8 @@ export type Event =
   | EventPermissionResolved
   | EventPermissionUpdated
   | EventPermissionReplied
+  | EventContextCheckpointCreated
+  | EventContextPlanCreated
   | EventRuntimeError;
 
 export interface BaseEvent<TType extends string, TProperties> {
@@ -765,6 +788,61 @@ export type EventPermissionReplied = BaseEvent<
 export type EventRuntimeError = BaseEvent<
   "runtime.error",
   { conversationId?: ConversationId; runId?: RunId; error: RuntimeError }
+>;
+export type EventContextCheckpointCreated = BaseEvent<
+  "context.checkpoint.created",
+  {
+    checkpointId: ContextCheckpointId;
+    conversationId: ConversationId;
+    sourceHeadRunId: RunId;
+    sourceConversationRevision: number;
+    coverageThroughRunId: RunId;
+    parentCheckpointId?: ContextCheckpointId;
+    trigger:
+      | "auto_pre_turn"
+      | "auto_mid_turn"
+      | "manual"
+      | "provider_overflow"
+      | "model_switch";
+    formatVersion: string;
+    compatibility: { kind: string; version: number };
+    budget: {
+      contextWindow?: number;
+      estimatedInputTokens: number;
+      rawHistoryTokens: number;
+      checkpointTokens: number;
+      safetyStateTokens: number;
+      reservedOutputTokens: number;
+    };
+  }
+>;
+export type EventContextPlanCreated = BaseEvent<
+  "context.plan.created",
+  {
+    planId: ContextPlanId;
+    conversationId: ConversationId;
+    runId: RunId;
+    requestIndex: number;
+    sourceHeadRunId: RunId;
+    sourceConversationRevision: number;
+    view: "raw" | "checkpoint";
+    checkpointId?: ContextCheckpointId;
+    reason: string;
+    trigger:
+      | "auto_pre_turn"
+      | "auto_mid_turn"
+      | "manual"
+      | "provider_overflow"
+      | "model_switch";
+    budget: {
+      contextWindow?: number;
+      estimatedInputTokens: number;
+      rawHistoryTokens: number;
+      checkpointTokens: number;
+      safetyStateTokens: number;
+      reservedOutputTokens: number;
+    };
+  }
 >;
 
 export interface TraceEvent {

@@ -4,11 +4,15 @@ import { runtimeEventToEnvelope } from "../events/event-envelope";
 import type { RuntimeEventBus } from "../events/event-bus";
 import {
   conversationSchema,
+  contextCheckpointSchema,
+  contextPlanSchema,
+  contextUsageSchema,
   eventSchema,
   messageSchema,
   partSchema,
   permissionSchema,
   runSchema,
+  toolCallAuthorizationSnapshotSchema,
   traceEventSchema,
 } from "../core/schemas";
 import type {
@@ -30,6 +34,21 @@ import type {
   ToolCallId,
   TraceEvent,
 } from "../core/types";
+import type {
+  ContextCheckpoint,
+  ContextCheckpointCommit,
+  ContextPlan,
+  ContextPlanCommit,
+  ContextPreparationClaim,
+  ContextPreparationClaimRequest,
+  ContextPreparationClaimRelease,
+  ContextPreparationClaimResult,
+  ContextUsage,
+} from "../context/types";
+import { ContextPreparationLeaseLostError } from "../context/types";
+import { computeContextCoverageSourceState } from "../context/boundary-validation";
+import { computeContextLineageHash } from "../context/planner";
+import { buildRuntimeSafetyState } from "../context/safety-state";
 import { ATTACHMENT_LIMITS, RuntimeAttachmentError } from "../attachments";
 
 function encode(value: unknown): string {
@@ -112,6 +131,7 @@ interface ToolCallRow {
   error_json: string | null;
   time_json: string;
   metadata_json: string | null;
+  authorization_json: string | null;
 }
 
 interface PermissionRow {
@@ -154,6 +174,20 @@ interface RuntimeHistoryDiagnosticRow {
   created_at: number;
 }
 
+interface ContextPayloadRow {
+  payload_json: string;
+}
+
+interface ContextPreparationClaimRow {
+  run_id: string;
+  request_index: number;
+  request_hash: string;
+  owner_id: string;
+  fencing_token: number;
+  claimed_at: number;
+  expires_at: number;
+}
+
 interface ResolvedLineageRun {
   run: Run;
   userMessage: UserMessage;
@@ -193,6 +227,7 @@ export interface ListConversationsOptions {
 
 export interface RuntimeSqliteStoreOptions {
   eventBus?: RuntimeEventBus;
+  now?: () => number;
 }
 
 export interface RuntimeToolPermissionRequestCommit {
@@ -684,6 +719,580 @@ export class RuntimeSqliteStore {
     return rows.map(historyDiagnosticFromRow);
   }
 
+  listContextCheckpoints(conversationId: ConversationId): ContextCheckpoint[] {
+    return this.db
+      .query<ContextPayloadRow, [string]>(
+        `SELECT payload_json FROM runtime_context_checkpoints
+         WHERE conversation_id = ?
+         ORDER BY created_at ASC, id ASC`,
+      )
+      .all(conversationId)
+      .map((row) => contextCheckpointSchema.parse(JSON.parse(row.payload_json)) as ContextCheckpoint);
+  }
+
+  getContextPlan(id: ContextPlan["id"]): ContextPlan | null {
+    const row = this.db
+      .query<ContextPayloadRow, [string]>(
+        "SELECT payload_json FROM runtime_context_plans WHERE id = ?",
+      )
+      .get(id);
+    return row ? contextPlanSchema.parse(JSON.parse(row.payload_json)) as ContextPlan : null;
+  }
+
+  getContextPlanByRunRequest(runId: RunId, requestIndex: number): ContextPlan | null {
+    const row = this.db
+      .query<ContextPayloadRow, [string, number]>(
+        `SELECT payload_json FROM runtime_context_plans
+         WHERE run_id = ? AND request_index = ?`,
+      )
+      .get(runId, requestIndex);
+    return row ? contextPlanSchema.parse(JSON.parse(row.payload_json)) as ContextPlan : null;
+  }
+
+  getContextPreparationBrokerKey(): object {
+    return this.db;
+  }
+
+  getContextPreparationClaim(
+    runId: RunId,
+    requestIndex: number,
+  ): ContextPreparationClaim | null {
+    assertContextPreparationRequestKey(runId, requestIndex);
+    const row = this.db
+      .query<ContextPreparationClaimRow, [string, number]>(
+        `SELECT run_id, request_index, request_hash, owner_id, fencing_token, claimed_at, expires_at
+         FROM runtime_context_preparation_claims
+         WHERE run_id = ? AND request_index = ?`,
+      )
+      .get(runId, requestIndex);
+    return row ? contextPreparationClaimFromRow(row) : null;
+  }
+
+  claimContextPreparation(request: ContextPreparationClaimRequest): ContextPreparationClaimResult {
+    assertContextPreparationClaimRequest(request);
+    if (!this.getRun(request.runId)) {
+      throw new Error(`Context preparation claim Run was not found: ${request.runId}`);
+    }
+    const claimedAt = this.contextPreparationNow();
+    const expiresAt = claimedAt + request.ttlMs;
+    if (!Number.isSafeInteger(expiresAt)) {
+      throw new Error("Context preparation claim expiry is invalid");
+    }
+    const claim: ContextPreparationClaim = {
+      runId: request.runId,
+      requestIndex: request.requestIndex,
+      requestHash: request.requestHash,
+      ownerId: request.ownerId,
+      fencingToken: 1,
+      claimedAt,
+      expiresAt,
+    };
+    const tx = this.db.transaction((): ContextPreparationClaimResult => {
+      const inserted = this.db
+        .query(
+          `INSERT OR IGNORE INTO runtime_context_preparation_claims (
+            run_id, request_index, request_hash, owner_id, fencing_token, claimed_at, expires_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          claim.runId,
+          claim.requestIndex,
+          claim.requestHash,
+          claim.ownerId,
+          claim.fencingToken,
+          claim.claimedAt,
+          claim.expiresAt,
+        );
+      if (inserted.changes > 0) return { status: "acquired", claim };
+
+      const existing = this.getContextPreparationClaim(claim.runId, claim.requestIndex);
+      if (!existing) {
+        throw new Error("Context preparation claim disappeared during arbitration");
+      }
+      if (existing.requestHash !== claim.requestHash) {
+        return { status: "conflict", claim: existing };
+      }
+      if (existing.expiresAt > claim.claimedAt) {
+        return { status: "in_progress", claim: existing };
+      }
+      const reclaimed = this.db
+        .query(
+          `UPDATE runtime_context_preparation_claims
+           SET owner_id = ?, fencing_token = fencing_token + 1, claimed_at = ?, expires_at = ?
+           WHERE run_id = ? AND request_index = ?
+             AND request_hash = ? AND expires_at <= ?`,
+        )
+        .run(
+          claim.ownerId,
+          claim.claimedAt,
+          claim.expiresAt,
+          claim.runId,
+          claim.requestIndex,
+          claim.requestHash,
+          claim.claimedAt,
+        );
+      if (reclaimed.changes > 0) {
+        const acquired = this.getContextPreparationClaim(claim.runId, claim.requestIndex);
+        if (!acquired) {
+          throw new Error("Context preparation claim disappeared after reclamation");
+        }
+        return { status: "acquired", claim: acquired };
+      }
+      const winner = this.getContextPreparationClaim(claim.runId, claim.requestIndex);
+      if (!winner) {
+        throw new Error("Context preparation claim disappeared during reclamation");
+      }
+      return winner.requestHash === claim.requestHash
+        ? { status: "in_progress", claim: winner }
+        : { status: "conflict", claim: winner };
+    });
+    return tx();
+  }
+
+  releaseContextPreparationClaim(claim: ContextPreparationClaimRelease): boolean {
+    assertContextPreparationRequestKey(claim.runId, claim.requestIndex);
+    if (
+      !isSha256(claim.requestHash)
+      || claim.ownerId.length === 0
+      || !Number.isSafeInteger(claim.fencingToken)
+      || claim.fencingToken < 1
+    ) {
+      throw new Error("Context preparation claim release is invalid");
+    }
+    return this.db
+      .query(
+        `DELETE FROM runtime_context_preparation_claims
+         WHERE run_id = ? AND request_index = ? AND request_hash = ? AND owner_id = ?
+           AND fencing_token = ?`,
+      )
+      .run(
+        claim.runId,
+        claim.requestIndex,
+        claim.requestHash,
+        claim.ownerId,
+        claim.fencingToken,
+      ).changes > 0;
+  }
+
+  listContextPlansByRun(runId: RunId): ContextPlan[] {
+    return this.db
+      .query<ContextPayloadRow, [string]>(
+        `SELECT payload_json FROM runtime_context_plans
+         WHERE run_id = ?
+         ORDER BY request_index ASC, created_at ASC, id ASC`,
+      )
+      .all(runId)
+      .map((row) => contextPlanSchema.parse(JSON.parse(row.payload_json)) as ContextPlan);
+  }
+
+  getLatestContextUsage(conversationId: ConversationId): ContextUsage | null {
+    const row = this.db
+      .query<ContextPayloadRow, [string]>(
+        `SELECT payload_json FROM runtime_context_usage
+         WHERE conversation_id = ?
+         ORDER BY created_at DESC, request_index DESC, id DESC
+         LIMIT 1`,
+      )
+      .get(conversationId);
+    return row ? contextUsageSchema.parse(JSON.parse(row.payload_json)) as ContextUsage : null;
+  }
+
+  commitContextCheckpoint(input: ContextCheckpointCommit): "committed" | "stale" {
+    const checkpoint = contextCheckpointSchema.parse(input.checkpoint) as ContextCheckpoint;
+    let committedEvent: Event | null = null;
+    const tx = this.db.transaction((): "committed" | "stale" => {
+      this.assertActiveContextPreparationClaim(input.preparationClaim);
+      if (input.preparationClaim.runId !== checkpoint.sourceHeadRunId) {
+        throw new ContextPreparationLeaseLostError(
+          input.preparationClaim.runId,
+          input.preparationClaim.requestIndex,
+        );
+      }
+      const conversation = this.getConversation(checkpoint.conversationId);
+      if (!conversation) {
+        throw new Error(`Context checkpoint Conversation was not found: ${checkpoint.conversationId}`);
+      }
+      if (
+        conversation.activeHeadRunId !== checkpoint.sourceHeadRunId
+        || conversation.revision !== checkpoint.sourceConversationRevision
+      ) {
+        return "stale";
+      }
+
+      let lineage: Run[];
+      try {
+        lineage = this.listLineageRuns(
+          checkpoint.conversationId,
+          checkpoint.sourceHeadRunId,
+        );
+      } catch (error) {
+        if (
+          error instanceof RuntimeHistoryIntegrityError
+          && error.conversationId === checkpoint.conversationId
+        ) {
+          return "stale";
+        }
+        throw error;
+      }
+      const coverageIndex = lineage.findIndex(
+        (run) => run.id === checkpoint.coverageThroughRunId,
+      );
+      if (coverageIndex < 0) {
+        throw new Error("Context checkpoint coverage is not an ancestor of the source head");
+      }
+      const coverageRun = lineage[coverageIndex];
+      if (
+        !coverageRun
+        || !["completed", "failed", "interrupted"].includes(coverageRun.status)
+        || coverageRun.id === checkpoint.sourceHeadRunId
+      ) {
+        throw new Error("Context checkpoint coverage must end after a terminal non-current Run");
+      }
+      const expectedHash = computeContextLineageHash(lineage, checkpoint.coverageThroughRunId);
+      if (checkpoint.lineageHash !== expectedHash) {
+        throw new Error("Context checkpoint lineage hash does not match persisted history");
+      }
+
+      let parentCheckpoint: ContextCheckpoint | undefined;
+      if (checkpoint.parentCheckpointId) {
+        if (checkpoint.parentCheckpointId === checkpoint.id) {
+          throw new Error("Context checkpoint cannot be its own parent");
+        }
+        const parentRow = this.db
+          .query<ContextPayloadRow, [string]>(
+            "SELECT payload_json FROM runtime_context_checkpoints WHERE id = ?",
+          )
+          .get(checkpoint.parentCheckpointId);
+        if (!parentRow) {
+          throw new Error("Context checkpoint parent was not found");
+        }
+        const parent = contextCheckpointSchema.parse(
+          JSON.parse(parentRow.payload_json),
+        ) as ContextCheckpoint;
+        const parentCoverageIndex = lineage.findIndex(
+          (run) => run.id === parent.coverageThroughRunId,
+        );
+        if (
+          parent.conversationId !== checkpoint.conversationId
+          || parentCoverageIndex < 0
+          || parentCoverageIndex >= coverageIndex
+          || parent.lineageHash
+            !== computeContextLineageHash(lineage, parent.coverageThroughRunId)
+        ) {
+          throw new Error("Context checkpoint parent is not on the committed coverage lineage");
+        }
+        parentCheckpoint = parent;
+      }
+
+      const runs = this.listRunsByConversation(checkpoint.conversationId);
+      const toolCalls = runs.flatMap((run) => this.listToolCallsByRun(run.id));
+      const permissions = runs.flatMap((run) => this.listPermissionsByRun(run.id));
+      const snapshot = {
+        conversation,
+        runs,
+        messages: this.listTranscriptMessages(checkpoint.conversationId),
+        toolCalls,
+        permissions,
+        checkpoints: [],
+      };
+      const safetyState = buildRuntimeSafetyState({
+        conversationId: checkpoint.conversationId,
+        activeRunIds: lineage.map((run) => run.id),
+        toolCalls,
+        permissions,
+      });
+      const sourceState = computeContextCoverageSourceState({
+        snapshot,
+        lineageRuns: lineage,
+        coverageIndex,
+        safetyStateHash: safetyState.hash,
+        parentCheckpoint,
+      });
+      if (
+        !sourceState.safe
+        || checkpoint.safetyStateHash !== sourceState.safetyStateHash
+        || checkpoint.sourceStateHash !== sourceState.sourceStateHash
+      ) {
+        return "stale";
+      }
+
+      this.db
+        .query(
+          `INSERT INTO runtime_context_checkpoints (
+            id, conversation_id, coverage_through_run_id, source_head_run_id,
+            source_conversation_revision, parent_checkpoint_id, format_version,
+            compatibility_kind, compatibility_version, payload_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          checkpoint.id,
+          checkpoint.conversationId,
+          checkpoint.coverageThroughRunId,
+          checkpoint.sourceHeadRunId,
+          checkpoint.sourceConversationRevision,
+          checkpoint.parentCheckpointId ?? null,
+          checkpoint.formatVersion,
+          checkpoint.compatibility.kind,
+          checkpoint.compatibility.version,
+          encode(checkpoint),
+          checkpoint.time.created,
+        );
+
+      committedEvent = {
+        id: input.eventId,
+        type: "context.checkpoint.created",
+        properties: {
+          checkpointId: checkpoint.id,
+          conversationId: checkpoint.conversationId,
+          sourceHeadRunId: checkpoint.sourceHeadRunId,
+          sourceConversationRevision: checkpoint.sourceConversationRevision,
+          coverageThroughRunId: checkpoint.coverageThroughRunId,
+          ...(checkpoint.parentCheckpointId
+            ? { parentCheckpointId: checkpoint.parentCheckpointId }
+            : {}),
+          trigger: checkpoint.trigger,
+          formatVersion: checkpoint.formatVersion,
+          compatibility: checkpoint.compatibility,
+          budget: {
+            contextWindow: checkpoint.budget.contextWindow,
+            estimatedInputTokens: checkpoint.budget.estimatedInputTokens,
+            rawHistoryTokens: checkpoint.budget.rawHistoryTokens,
+            checkpointTokens: checkpoint.budget.checkpointTokens,
+            safetyStateTokens: checkpoint.budget.safetyStateTokens,
+            reservedOutputTokens: checkpoint.budget.reservedOutputTokens,
+          },
+        },
+        time: checkpoint.time.created,
+      };
+      this.insertEvent(committedEvent);
+      return "committed";
+    });
+
+    const result = tx();
+    if (result === "committed" && committedEvent) {
+      this.options.eventBus?.publish(runtimeEventToEnvelope(committedEvent));
+    }
+    return result;
+  }
+
+  saveContextPlan(input: ContextPlanCommit): void {
+    const parsed = contextPlanSchema.parse(input.plan) as ContextPlan;
+    const tx = this.db.transaction((): void => {
+      this.assertActiveContextPreparationClaim(input.preparationClaim);
+      if (
+        input.preparationClaim.runId !== parsed.runId
+        || input.preparationClaim.requestIndex !== parsed.requestIndex
+        || input.preparationClaim.requestHash !== parsed.requestHash
+      ) {
+        throw new ContextPreparationLeaseLostError(parsed.runId, parsed.requestIndex);
+      }
+      this.validateContextPlan(parsed);
+      this.db
+        .query(
+          `INSERT INTO runtime_context_plans (
+            id, conversation_id, run_id, request_index, payload_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          parsed.id,
+          parsed.conversationId,
+          parsed.runId,
+          parsed.requestIndex,
+          encode(parsed),
+          parsed.time.created,
+        );
+    });
+    tx();
+  }
+
+  private assertActiveContextPreparationClaim(claim: ContextPreparationClaim): void {
+    assertContextPreparationClaim(claim);
+    const active = this.db
+      .query<{ active: number }, [string, number, string, string, number, number]>(
+        `SELECT 1 AS active
+         FROM runtime_context_preparation_claims
+         WHERE run_id = ? AND request_index = ? AND request_hash = ? AND owner_id = ?
+           AND fencing_token = ? AND expires_at > ?`,
+      )
+      .get(
+        claim.runId,
+        claim.requestIndex,
+        claim.requestHash,
+        claim.ownerId,
+        claim.fencingToken,
+        this.contextPreparationNow(),
+      );
+    if (!active) {
+      throw new ContextPreparationLeaseLostError(claim.runId, claim.requestIndex);
+    }
+  }
+
+  private contextPreparationNow(): number {
+    const now = (this.options.now ?? Date.now)();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new Error("Context preparation clock is invalid");
+    }
+    return now;
+  }
+
+  saveContextUsage(usage: ContextUsage): void {
+    const parsed = contextUsageSchema.parse(usage) as ContextUsage;
+    this.requireContextRunOwnership(
+      parsed.conversationId,
+      parsed.runId,
+      "usage",
+    );
+    if (parsed.view === "checkpoint") {
+      if (!parsed.checkpointId) {
+        throw new Error("Context usage checkpoint view requires a checkpoint");
+      }
+      this.requireContextCheckpointOwnership(
+        parsed.conversationId,
+        parsed.checkpointId,
+        "usage",
+      );
+    } else if (parsed.checkpointId) {
+      throw new Error("Context usage raw view cannot reference a checkpoint");
+    }
+    this.db
+      .query(
+        `INSERT INTO runtime_context_usage (
+          id, conversation_id, run_id, request_index, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        parsed.id,
+        parsed.conversationId,
+        parsed.runId,
+        parsed.requestIndex,
+        encode(parsed),
+        parsed.time.created,
+      );
+  }
+
+  private validateContextPlan(plan: ContextPlan): void {
+    const conversation = this.getConversation(plan.conversationId);
+    if (!conversation) {
+      throw new Error(`Context plan Conversation was not found: ${plan.conversationId}`);
+    }
+    this.requireContextRunOwnership(plan.conversationId, plan.runId, "plan");
+    this.requireContextRunOwnership(
+      plan.conversationId,
+      plan.sourceHeadRunId,
+      "plan source head",
+    );
+    if (conversation.activeHeadRunId !== plan.runId) {
+      throw new Error("Context plan Run is not the active head");
+    }
+    if (plan.sourceHeadRunId !== plan.runId) {
+      throw new Error("Context plan source head does not match its active Run");
+    }
+    if (conversation.revision !== plan.sourceConversationRevision) {
+      throw new Error("Context plan source revision is stale");
+    }
+    if (plan.safetyState.conversationId !== plan.conversationId) {
+      throw new Error("Context plan Safety State does not belong to its Conversation");
+    }
+
+    const lineageRunIds = this.listLineageRuns(
+      plan.conversationId,
+      plan.sourceHeadRunId,
+    ).map((run) => run.id);
+    if (!sameRuntimeIds(plan.lineageRunIds, lineageRunIds)) {
+      throw new Error("Context plan lineage does not match the persisted active lineage");
+    }
+
+    let expectedRawRunIds: RunId[];
+    if (plan.view === "checkpoint") {
+      if (plan.reason !== "checkpoint_selected" || !plan.checkpointId) {
+        throw new Error("Context plan checkpoint view is inconsistent");
+      }
+      const checkpoint = this.requireContextCheckpointOwnership(
+        plan.conversationId,
+        plan.checkpointId,
+        "plan",
+      );
+      const coverageIndex = lineageRunIds.indexOf(checkpoint.coverageThroughRunId);
+      if (coverageIndex < 0) {
+        throw new Error("Context plan checkpoint coverage is not on the active lineage");
+      }
+      expectedRawRunIds = lineageRunIds.slice(coverageIndex + 1);
+    } else {
+      if (plan.reason === "checkpoint_selected" || plan.checkpointId) {
+        throw new Error("Context plan raw view cannot select a checkpoint");
+      }
+      expectedRawRunIds = lineageRunIds;
+    }
+    if (!sameRuntimeIds(plan.rawRunIds, expectedRawRunIds)) {
+      throw new Error("Context plan raw Run tail does not match its selected view");
+    }
+
+    const expectedRawRange = expectedRawRunIds.length === 0
+      ? undefined
+      : {
+          fromRunId: expectedRawRunIds[0]!,
+          throughRunId: expectedRawRunIds.at(-1)!,
+        };
+    if (
+      plan.rawRange?.fromRunId !== expectedRawRange?.fromRunId
+      || plan.rawRange?.throughRunId !== expectedRawRange?.throughRunId
+    ) {
+      throw new Error("Context plan raw range does not match its raw Run tail");
+    }
+
+    if (plan.reason === "compaction_required") {
+      const coverageIndex = plan.eligibleCoverageThroughRunId
+        ? lineageRunIds.indexOf(plan.eligibleCoverageThroughRunId)
+        : -1;
+      if (coverageIndex < 0 || coverageIndex >= lineageRunIds.length - 1) {
+        throw new Error("Context plan eligible coverage is not a non-current ancestor");
+      }
+    } else if (plan.eligibleCoverageThroughRunId) {
+      throw new Error("Context plan has unexpected eligible coverage");
+    }
+  }
+
+  private requireContextRunOwnership(
+    conversationId: ConversationId,
+    runId: RunId,
+    record: string,
+  ): Run {
+    const run = this.getRun(runId);
+    if (!run) {
+      throw new Error(`Context ${record} Run was not found: ${runId}`);
+    }
+    if (run.conversationId !== conversationId) {
+      throw new Error(
+        `Context ${record} Run ${runId} does not belong to Conversation ${conversationId}`,
+      );
+    }
+    return run;
+  }
+
+  private requireContextCheckpointOwnership(
+    conversationId: ConversationId,
+    checkpointId: ContextCheckpoint["id"],
+    record: string,
+  ): ContextCheckpoint {
+    const row = this.db
+      .query<ContextPayloadRow, [string]>(
+        "SELECT payload_json FROM runtime_context_checkpoints WHERE id = ?",
+      )
+      .get(checkpointId);
+    if (!row) {
+      throw new Error(`Context ${record} checkpoint was not found: ${checkpointId}`);
+    }
+    const checkpoint = contextCheckpointSchema.parse(
+      JSON.parse(row.payload_json),
+    ) as ContextCheckpoint;
+    if (checkpoint.conversationId !== conversationId) {
+      throw new Error(
+        `Context ${record} checkpoint ${checkpointId} does not belong to Conversation ${conversationId}`,
+      );
+    }
+    return checkpoint;
+  }
+
   listParts(messageId: MessageId): Part[] {
     return this.db
       .query<PartRow, [string]>(
@@ -694,12 +1303,16 @@ export class RuntimeSqliteStore {
   }
 
   saveToolCall(toolCall: ToolCall): void {
+    const authorization = toolCall.authorization
+      ? toolCallAuthorizationSnapshotSchema.parse(toolCall.authorization)
+      : undefined;
     this.db
       .query(
         `INSERT INTO runtime_tool_calls (
           id, conversation_id, run_id, message_id, part_id, tool_name, state,
-          input_json, permission_id, result_json, error_json, time_json, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          input_json, permission_id, result_json, error_json, time_json, metadata_json,
+          authorization_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           part_id = excluded.part_id,
           state = excluded.state,
@@ -708,7 +1321,11 @@ export class RuntimeSqliteStore {
           result_json = excluded.result_json,
           error_json = excluded.error_json,
           time_json = excluded.time_json,
-          metadata_json = excluded.metadata_json`,
+          metadata_json = excluded.metadata_json,
+          authorization_json = COALESCE(
+            runtime_tool_calls.authorization_json,
+            excluded.authorization_json
+          )`,
       )
       .run(
         toolCall.id,
@@ -724,6 +1341,7 @@ export class RuntimeSqliteStore {
         toolCall.error ? encode(toolCall.error) : null,
         encode(toolCall.time),
         toolCall.metadata ? encode(toolCall.metadata) : null,
+        authorization ? encode(authorization) : null,
       );
   }
 
@@ -1917,6 +2535,9 @@ function toolCallFromRow(row: ToolCallRow): ToolCall {
     error: decode(row.error_json),
     time: decode<ToolCall["time"]>(row.time_json) ?? { created: 0 },
     metadata: decode(row.metadata_json),
+    authorization: row.authorization_json
+      ? toolCallAuthorizationSnapshotSchema.parse(JSON.parse(row.authorization_json))
+      : undefined,
   };
 }
 
@@ -1946,4 +2567,62 @@ function normalizeListLimit(limit: number | undefined): number {
   }
 
   return Math.min(Math.max(Math.trunc(limit), 1), 100);
+}
+
+function sameRuntimeIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+}
+
+function contextPreparationClaimFromRow(
+  row: ContextPreparationClaimRow,
+): ContextPreparationClaim {
+  return {
+    runId: row.run_id as RunId,
+    requestIndex: row.request_index,
+    requestHash: row.request_hash,
+    ownerId: row.owner_id,
+    fencingToken: row.fencing_token,
+    claimedAt: row.claimed_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function assertContextPreparationRequestKey(runId: RunId, requestIndex: number): void {
+  if (!runId.startsWith("run_") || !Number.isSafeInteger(requestIndex) || requestIndex < 0) {
+    throw new Error("Context preparation claim request key is invalid");
+  }
+}
+
+function assertContextPreparationClaimRequest(
+  request: ContextPreparationClaimRequest,
+): void {
+  assertContextPreparationRequestKey(request.runId, request.requestIndex);
+  if (
+    !isSha256(request.requestHash)
+    || request.ownerId.length === 0
+    || !Number.isSafeInteger(request.ttlMs)
+    || request.ttlMs <= 0
+  ) {
+    throw new Error("Context preparation claim request is invalid");
+  }
+}
+
+function assertContextPreparationClaim(claim: ContextPreparationClaim): void {
+  assertContextPreparationRequestKey(claim.runId, claim.requestIndex);
+  if (
+    !isSha256(claim.requestHash)
+    || claim.ownerId.length === 0
+    || !Number.isSafeInteger(claim.fencingToken)
+    || claim.fencingToken < 1
+    || !Number.isSafeInteger(claim.claimedAt)
+    || claim.claimedAt < 0
+    || !Number.isSafeInteger(claim.expiresAt)
+    || claim.expiresAt <= claim.claimedAt
+  ) {
+    throw new Error("Context preparation claim is invalid");
+  }
+}
+
+function isSha256(value: string): boolean {
+  return /^sha256:[a-f0-9]{64}$/.test(value);
 }

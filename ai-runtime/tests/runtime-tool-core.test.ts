@@ -22,6 +22,7 @@ import {
   type RunToolSnapshot,
   type RuntimeToolNamespace,
 } from "../src/runtime/tools";
+import { buildRuntimeSafetyState } from "../src/runtime/context";
 
 const conversationId = "conv_core" as ConversationId;
 const runId = "run_core" as RunId;
@@ -186,6 +187,121 @@ function withApprovalPolicy(
 }
 
 describe("RuntimeToolCore", () => {
+  test("excludes a permissionless default-policy read from Safety State", async () => {
+    const { core, snapshot, store } = harness();
+    const result = await core.dispatch({
+      ...dispatchInput(snapshot),
+      toolCallId: "tool_auto_read",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(store.permissions.size).toBe(0);
+    expect(buildRuntimeSafetyState({
+      conversationId,
+      activeRunIds: [runId],
+      toolCalls: [...store.calls.values()],
+      permissions: [],
+    }).effects).toEqual([]);
+  });
+
+  test("retains a permissionless default-policy write with its resolved risk", async () => {
+    const tool = runtimeTool({
+      id: "test.write",
+      title: "Write",
+      risk: {
+        mode: "static",
+        level: "medium",
+        reversible: true,
+        sideEffect: "business_write",
+      },
+    });
+    const { core, registry, snapshot, store } = harness(tool);
+    const result = await core.dispatch({
+      ...dispatchInput(
+        withApprovalPolicy(snapshot, "medium"),
+        registry.requireProviderName(tool.id),
+      ),
+      toolCallId: "tool_auto_write",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(store.permissions.size).toBe(0);
+    expect(buildRuntimeSafetyState({
+      conversationId,
+      activeRunIds: [runId],
+      toolCalls: [...store.calls.values()],
+      permissions: [],
+    }).effects).toEqual([
+      {
+        toolCallId: "tool_auto_write",
+        runId,
+        operation: "test.write",
+        activeLineage: true,
+        risk: {
+          level: "medium",
+          reversible: true,
+          sideEffects: ["business_write"],
+        },
+        target: { kind: "unknown" },
+        outcome: "completed",
+        certainty: "confirmed",
+      },
+    ]);
+  });
+
+  test("retains an uncertain permissionless write from the real ToolCore error path", async () => {
+    const tool = runtimeTool({
+      id: "test.uncertain_write",
+      title: "Uncertain write",
+      risk: {
+        mode: "static",
+        level: "medium",
+        reversible: false,
+        sideEffect: "business_write",
+      },
+      execute: async () => {
+        throw new RuntimeToolExecutionError(
+          "WRITE_ACK_LOST",
+          "Connection closed before acknowledgement",
+          false,
+          "unknown",
+        );
+      },
+    });
+    const { core, registry, snapshot, store } = harness(tool);
+    const result = await core.dispatch({
+      ...dispatchInput(
+        withApprovalPolicy(snapshot, "medium"),
+        registry.requireProviderName(tool.id),
+      ),
+      toolCallId: "tool_auto_uncertain_write",
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { outcome: "unknown" } });
+    expect(store.permissions.size).toBe(0);
+    expect(buildRuntimeSafetyState({
+      conversationId,
+      activeRunIds: [runId],
+      toolCalls: [...store.calls.values()],
+      permissions: [],
+    }).effects).toEqual([
+      {
+        toolCallId: "tool_auto_uncertain_write",
+        runId,
+        operation: "test.uncertain_write",
+        activeLineage: true,
+        risk: {
+          level: "medium",
+          reversible: false,
+          sideEffects: ["business_write"],
+        },
+        target: { kind: "unknown" },
+        outcome: "possibly_executed",
+        certainty: "uncertain",
+      },
+    ]);
+  });
+
   test.each([
     ["none", "low", "ask"],
     ["none", "medium", "ask"],
@@ -1056,6 +1172,24 @@ describe("RuntimeToolCore", () => {
         sql: { text: sql, analysisStatus: "uncertain" },
       },
     });
+    const call = [...store.calls.values()][0]!;
+    expect(call.authorization).toEqual({
+      version: "1",
+      risk: {
+        level: "critical",
+        reversible: false,
+        sideEffects: ["destructive"],
+      },
+      presentation: {
+        target: {
+          connectionName: "Production",
+          driver: "mysql",
+          database: "app",
+        },
+        sql: { identifiedTargets: ["app.users"] },
+      },
+    });
+    expect(JSON.stringify(call.authorization)).not.toContain(sql);
     expect(JSON.stringify(store.traces)).not.toContain(sql);
   });
 

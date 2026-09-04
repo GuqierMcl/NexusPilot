@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DEFAULT_CONTEXT_COMPACTION_POLICY } from "../context/policy";
 
 const unknownRecordSchema = z.record(z.string(), z.unknown());
 const optionalUnknownRecordSchema = unknownRecordSchema.optional();
@@ -630,6 +631,256 @@ export const permissionSchema = z.object({
     .optional(),
   createdAt: z.number(),
 });
+
+export const toolCallAuthorizationSnapshotSchema = z
+  .object({
+    version: z.literal("1"),
+    risk: permissionSchema.shape.risk,
+    presentation: z
+      .object({
+        target: z
+          .object({
+            profileId: z.string().optional(),
+            connectionName: z.string().optional(),
+            driver: z.string().optional(),
+            environment: z.string().optional(),
+            database: z.string().optional(),
+            schema: z.string().optional(),
+            redisDbIndex: z.number().int().nonnegative().optional(),
+          })
+          .strict()
+          .optional(),
+        sql: z
+          .object({ identifiedTargets: z.array(z.string()).optional() })
+          .strict()
+          .optional(),
+        keyValue: z
+          .object({ key: z.string(), newKey: z.string().optional() })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+const contextCompactionTriggerSchema = z.enum([
+  "auto_pre_turn",
+  "auto_mid_turn",
+  "manual",
+  "provider_overflow",
+  "model_switch",
+]);
+
+const nonnegativeTokenCountSchema = z.number().int().nonnegative();
+
+export const contextBudgetSnapshotSchema = z
+  .object({
+    providerId: z.string().min(1),
+    modelId: z.string().min(1),
+    contextWindow: z.number().finite().positive().optional(),
+    reservedOutputTokens: nonnegativeTokenCountSchema,
+    safetyMarginTokens: nonnegativeTokenCountSchema,
+    systemPromptTokens: nonnegativeTokenCountSchema,
+    toolSchemaTokens: nonnegativeTokenCountSchema,
+    hardInputBudget: z.number().int().optional(),
+    softTriggerTokens: z.number().int().optional(),
+    targetTokens: z.number().int().optional(),
+    rawHistoryTokens: nonnegativeTokenCountSchema,
+    checkpointTokens: nonnegativeTokenCountSchema,
+    safetyStateTokens: nonnegativeTokenCountSchema,
+    estimatedInputTokens: nonnegativeTokenCountSchema,
+  })
+  .strict();
+
+const contextUsageBreakdownSchema = z
+  .object({
+    rawTokens: nonnegativeTokenCountSchema,
+    checkpointTokens: nonnegativeTokenCountSchema,
+    safetyStateTokens: nonnegativeTokenCountSchema,
+    systemPromptTokens: nonnegativeTokenCountSchema,
+    toolSchemaTokens: nonnegativeTokenCountSchema,
+  })
+  .strict();
+
+export const contextUsageSchema = z
+  .object({
+    id: z.string().startsWith("ctxuse_"),
+    conversationId: z.string().startsWith("conv_"),
+    runId: z.string().startsWith("run_"),
+    requestIndex: z.number().int().nonnegative(),
+    providerId: z.string().min(1),
+    modelId: z.string().min(1),
+    contextWindow: z.number().finite().positive().optional(),
+    estimatedInputTokens: nonnegativeTokenCountSchema,
+    estimateSource: z.literal("estimate"),
+    reservedOutputTokens: nonnegativeTokenCountSchema,
+    view: z.enum(["raw", "checkpoint"]),
+    checkpointId: z.string().startsWith("ckpt_").optional(),
+    breakdown: contextUsageBreakdownSchema,
+    providerObservation: z
+      .object({
+        source: z.literal("provider"),
+        inputTokens: nonnegativeTokenCountSchema,
+        cacheReadTokens: nonnegativeTokenCountSchema.optional(),
+        cacheWriteTokens: nonnegativeTokenCountSchema.optional(),
+      })
+      .strict()
+      .optional(),
+    estimatorVersion: z.string().min(1),
+    policyVersion: z.string().min(1),
+    checkpointFormatVersion: z.string().min(1),
+    time: timeCreatedSchema,
+  })
+  .strict();
+
+const runtimeSafetyRiskSchema = z
+  .object({
+    level: z.enum(["unknown", "low", "medium", "high", "critical"]),
+    reversible: z.union([z.boolean(), z.literal("unknown")]),
+    sideEffects: z.array(
+      z.enum([
+        "unknown",
+        "none",
+        "external_network",
+        "runtime_state",
+        "workbench_state",
+        "business_read",
+        "business_write",
+        "destructive",
+      ]),
+    ),
+  })
+  .strict();
+
+const runtimeSafetyTargetSchema = z
+  .object({
+    kind: z.enum(["structured", "unknown"]),
+    profileId: z.string().optional(),
+    connectionName: z.string().optional(),
+    driver: z.string().optional(),
+    environment: z.string().optional(),
+    database: z.string().optional(),
+    schema: z.string().optional(),
+    redisDbIndex: z.number().int().nonnegative().optional(),
+    identifiedTargets: z.array(z.string()).optional(),
+    key: z.string().optional(),
+    newKey: z.string().optional(),
+  })
+  .strict();
+
+export const runtimeSafetyStateSchema = z
+  .object({
+    version: z.string().min(1),
+    conversationId: z.string().startsWith("conv_"),
+    effects: z.array(
+      z
+        .object({
+          toolCallId: z.string().startsWith("tool_"),
+          runId: z.string().startsWith("run_"),
+          operation: z.string().min(1),
+          activeLineage: z.boolean(),
+          risk: runtimeSafetyRiskSchema,
+          target: runtimeSafetyTargetSchema,
+          outcome: z.enum([
+            "completed",
+            "possibly_executed",
+            "running",
+            "waiting",
+            "unknown",
+          ]),
+          certainty: z.enum(["confirmed", "uncertain"]),
+        })
+        .strict(),
+    ),
+    permissions: z.array(
+      z
+        .object({
+          permissionId: z.string().startsWith("perm_"),
+          toolCallId: z.string().startsWith("tool_"),
+          runId: z.string().startsWith("run_"),
+          status: z.enum(["pending", "approved", "denied", "cancelled"]),
+          decisionSource: z.enum(["user", "system"]).optional(),
+          confirmationVerified: z.boolean().optional(),
+          nonTransferable: z.literal(true),
+        })
+        .strict(),
+    ),
+    hash: z.string().startsWith("sha256:"),
+  })
+  .strict();
+
+export const contextCheckpointSchema = z
+  .object({
+    id: z.string().startsWith("ckpt_"),
+    conversationId: z.string().startsWith("conv_"),
+    coverageThroughRunId: z.string().startsWith("run_"),
+    sourceHeadRunId: z.string().startsWith("run_"),
+    sourceConversationRevision: z.number().int().nonnegative(),
+    lineageHash: z.string().startsWith("sha256:"),
+    sourceStateHash: z.string().startsWith("sha256:"),
+    safetyStateHash: z.string().startsWith("sha256:"),
+    parentCheckpointId: z.string().startsWith("ckpt_").optional(),
+    trigger: contextCompactionTriggerSchema,
+    formatVersion: z.string().min(1),
+    compatibility: z
+      .object({ kind: z.string().min(1), version: z.number().int().nonnegative() })
+      .strict(),
+    generatedBy: z.object({ providerId: z.string().min(1), modelId: z.string().min(1) }).strict(),
+    summary: z.string().min(1).max(DEFAULT_CONTEXT_COMPACTION_POLICY.summaryMaxChars),
+    safetyStateVersion: z.string().min(1),
+    budget: contextBudgetSnapshotSchema,
+    usage: contextUsageSchema.optional(),
+    time: timeCreatedSchema,
+  })
+  .strict();
+
+export const contextPlanSchema = z
+  .object({
+    id: z.string().startsWith("ctxplan_"),
+    conversationId: z.string().startsWith("conv_"),
+    runId: z.string().startsWith("run_"),
+    requestIndex: z.number().int().nonnegative(),
+    sourceHeadRunId: z.string().startsWith("run_"),
+    sourceConversationRevision: z.number().int().nonnegative(),
+    trigger: contextCompactionTriggerSchema,
+    providerId: z.string().min(1),
+    modelId: z.string().min(1),
+    view: z.enum(["raw", "checkpoint"]),
+    reason: z.enum([
+      "context_window_unavailable",
+      "raw_within_budget",
+      "raw_compaction_blocked",
+      "checkpoint_selected",
+      "compaction_required",
+    ]),
+    checkpointId: z.string().startsWith("ckpt_").optional(),
+    lineageRunIds: z.array(z.string().startsWith("run_")),
+    rawRunIds: z.array(z.string().startsWith("run_")),
+    rawRange: z
+      .object({
+        fromRunId: z.string().startsWith("run_"),
+        throughRunId: z.string().startsWith("run_"),
+      })
+      .strict()
+      .optional(),
+    eligibleCoverageThroughRunId: z.string().startsWith("run_").optional(),
+    safetyState: runtimeSafetyStateSchema,
+    budget: contextBudgetSnapshotSchema,
+    requestHash: z.string().startsWith("sha256:"),
+    viewHash: z.string().startsWith("sha256:"),
+    time: timeCreatedSchema,
+  })
+  .strict()
+  .superRefine((plan, context) => {
+    if (plan.reason === "compaction_required" && !plan.eligibleCoverageThroughRunId) {
+      context.addIssue({
+        code: "custom",
+        path: ["eligibleCoverageThroughRunId"],
+        message: "A compaction-required plan must name an eligible coverage Run",
+      });
+    }
+  });
 
 export const eventSchema = z.object({
   id: z.string(),

@@ -15,6 +15,58 @@ function createMemoryDb(): Database {
 }
 
 describe("runtime migration manager", () => {
+  test("backfills the initial fencing token for an existing preparation claim", () => {
+    const db = createMemoryDb();
+    runRuntimeMigrations(db, RUNTIME_MIGRATIONS.slice(0, 11));
+    db.query(
+      `INSERT INTO runtime_conversations (
+        id, title, version, status_json, time_json
+      ) VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "conv_fencing_migration",
+      "Fencing migration",
+      "1",
+      JSON.stringify({ type: "idle" }),
+      JSON.stringify({ created: 1, updated: 1 }),
+    );
+    db.query(
+      `INSERT INTO runtime_runs (
+        id, conversation_id, agent_mode, provider_id, model_id, status,
+        input_json, time_json, limits_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "run_fencing_migration",
+      "conv_fencing_migration",
+      "ask",
+      "openai",
+      "gpt-4o",
+      "running",
+      JSON.stringify({ messageIds: [] }),
+      JSON.stringify({ created: 1 }),
+      JSON.stringify({ maxSteps: 1, maxToolCalls: 0, maxOutputTokens: 128 }),
+    );
+    db.query(
+      `INSERT INTO runtime_context_preparation_claims (
+        run_id, request_index, request_hash, owner_id, claimed_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "run_fencing_migration",
+      0,
+      `sha256:${"a".repeat(64)}`,
+      "owner_before_fencing",
+      100,
+      200,
+    );
+
+    runRuntimeMigrations(db, RUNTIME_MIGRATIONS);
+
+    expect(db.query<{ fencing_token: number }, []>(
+      `SELECT fencing_token FROM runtime_context_preparation_claims
+       WHERE run_id = 'run_fencing_migration' AND request_index = 0`,
+    ).get()).toEqual({ fencing_token: 1 });
+    db.close();
+  });
+
   test("backfills deterministic legacy Run lineage and diagnoses incomplete conversations", () => {
     const db = createMemoryDb();
     runRuntimeMigrations(db, RUNTIME_MIGRATIONS.slice(0, 7));
@@ -179,7 +231,9 @@ describe("runtime migration manager", () => {
       runTimeJson: JSON.stringify({}),
     });
 
-    expect(RUNTIME_MIGRATIONS.at(-1)?.id).toBe("0008_runtime_run_dag");
+    expect(RUNTIME_MIGRATIONS.at(-1)?.id).toBe(
+      "0012_runtime_context_preparation_fencing",
+    );
     expect(() => runRuntimeMigrations(db, RUNTIME_MIGRATIONS)).not.toThrow();
 
     const validConversation = db

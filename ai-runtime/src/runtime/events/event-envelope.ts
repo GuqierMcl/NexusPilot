@@ -26,7 +26,7 @@ export function runtimeEventToEnvelope(event: Event): RuntimeEventEnvelope {
     scope: inferRuntimeEventScope(event),
     occurred_at: event.time,
     version: 1,
-    payload: { event },
+    payload: { event: sanitizeEventForEnvelope(event) },
   };
 }
 
@@ -92,6 +92,80 @@ function readRecord(value: unknown): Record<string, unknown> | null {
   }
 
   return value as Record<string, unknown>;
+}
+
+function sanitizeEventForEnvelope(event: Event): Event | Record<string, unknown> {
+  if (event.type !== "context.checkpoint.created" && event.type !== "context.plan.created") {
+    return event;
+  }
+  const source = event.properties as Record<string, unknown>;
+  const properties: Record<string, unknown> = {};
+  const stringKeys = event.type === "context.checkpoint.created"
+    ? [
+        "checkpointId",
+        "conversationId",
+        "sourceHeadRunId",
+        "coverageThroughRunId",
+        "parentCheckpointId",
+        "trigger",
+        "formatVersion",
+      ]
+    : [
+        "planId",
+        "conversationId",
+        "runId",
+        "sourceHeadRunId",
+        "view",
+        "checkpointId",
+        "reason",
+        "trigger",
+      ];
+  for (const key of stringKeys) {
+    if (typeof source[key] === "string") {
+      properties[key] = source[key];
+    }
+  }
+  for (const key of ["sourceConversationRevision", "requestIndex"]) {
+    if (typeof source[key] === "number" && Number.isFinite(source[key])) {
+      properties[key] = source[key];
+    }
+  }
+  const compatibility = readRecord(source.compatibility);
+  if (
+    event.type === "context.checkpoint.created"
+    && compatibility
+    && typeof compatibility.kind === "string"
+    && typeof compatibility.version === "number"
+    && Number.isFinite(compatibility.version)
+  ) {
+    properties.compatibility = {
+      kind: compatibility.kind,
+      version: compatibility.version,
+    };
+  }
+  const budget = readRecord(source.budget);
+  if (budget) {
+    const safeBudget: Record<string, number> = {};
+    for (const key of [
+      "contextWindow",
+      "estimatedInputTokens",
+      "rawHistoryTokens",
+      "checkpointTokens",
+      "safetyStateTokens",
+      "reservedOutputTokens",
+    ]) {
+      if (typeof budget[key] === "number" && Number.isFinite(budget[key])) {
+        safeBudget[key] = budget[key];
+      }
+    }
+    properties.budget = safeBudget;
+  }
+  return {
+    id: event.id,
+    type: event.type,
+    properties,
+    time: event.time,
+  };
 }
 
 function readRuntimeId<TPrefix extends "conv" | "run">(

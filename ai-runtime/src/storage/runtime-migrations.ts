@@ -715,4 +715,102 @@ export const RUNTIME_MIGRATIONS: RuntimeMigration[] = [
         );
     `,
   },
+  {
+    id: "0009_runtime_context_compaction",
+    description: "Persist context checkpoints, request plans, and per-request usage",
+    sql: `
+      CREATE TABLE runtime_context_checkpoints (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        coverage_through_run_id TEXT NOT NULL,
+        source_head_run_id TEXT NOT NULL,
+        source_conversation_revision INTEGER NOT NULL,
+        parent_checkpoint_id TEXT,
+        format_version TEXT NOT NULL,
+        compatibility_kind TEXT NOT NULL,
+        compatibility_version INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (conversation_id) REFERENCES runtime_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (coverage_through_run_id) REFERENCES runtime_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY (source_head_run_id) REFERENCES runtime_runs(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX idx_runtime_context_checkpoints_conversation
+        ON runtime_context_checkpoints(conversation_id, created_at, id);
+      CREATE INDEX idx_runtime_context_checkpoints_coverage
+        ON runtime_context_checkpoints(conversation_id, coverage_through_run_id);
+      CREATE INDEX idx_runtime_context_checkpoints_parent
+        ON runtime_context_checkpoints(parent_checkpoint_id);
+
+      CREATE TABLE runtime_context_plans (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        request_index INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (conversation_id) REFERENCES runtime_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (run_id) REFERENCES runtime_runs(id) ON DELETE CASCADE,
+        UNIQUE (run_id, request_index)
+      );
+
+      CREATE INDEX idx_runtime_context_plans_conversation
+        ON runtime_context_plans(conversation_id, created_at, id);
+      CREATE INDEX idx_runtime_context_plans_run
+        ON runtime_context_plans(run_id, request_index, id);
+
+      CREATE TABLE runtime_context_usage (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        request_index INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (conversation_id) REFERENCES runtime_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (run_id) REFERENCES runtime_runs(id) ON DELETE CASCADE,
+        UNIQUE (run_id, request_index)
+      );
+
+      CREATE INDEX idx_runtime_context_usage_conversation
+        ON runtime_context_usage(conversation_id, created_at, request_index, id);
+      CREATE INDEX idx_runtime_context_usage_run
+        ON runtime_context_usage(run_id, request_index, id);
+    `,
+  },
+  {
+    id: "0010_runtime_tool_call_authorization_snapshot",
+    description: "Persist immutable per-call Runtime Tool authorization facts",
+    sql: `
+      ALTER TABLE runtime_tool_calls
+        ADD COLUMN authorization_json TEXT;
+    `,
+  },
+  {
+    id: "0011_runtime_context_preparation_claims",
+    description: "Coordinate exact context preparation before model generation",
+    sql: `
+      CREATE TABLE runtime_context_preparation_claims (
+        run_id TEXT NOT NULL,
+        request_index INTEGER NOT NULL,
+        request_hash TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        claimed_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (run_id, request_index),
+        FOREIGN KEY (run_id) REFERENCES runtime_runs(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX idx_runtime_context_preparation_claims_expiry
+        ON runtime_context_preparation_claims(expires_at, run_id, request_index);
+    `,
+  },
+  {
+    id: "0012_runtime_context_preparation_fencing",
+    description: "Fence expired or superseded context preparation owners",
+    sql: `
+      ALTER TABLE runtime_context_preparation_claims
+        ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 1;
+    `,
+  },
 ];

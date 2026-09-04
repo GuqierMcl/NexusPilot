@@ -134,4 +134,137 @@ describe("runtime event envelope", () => {
     expect(runtimeEventScopeMatches(sameRun, runEnvelope.scope)).toBe(true);
     expect(runtimeEventScopeMatches(otherRun, runEnvelope.scope)).toBe(false);
   });
+
+  test("whitelists context event identity and budget facts in live envelopes", () => {
+    const event = {
+      id: "evt_context",
+      type: "context.checkpoint.created",
+      properties: {
+        checkpointId: "ckpt_1",
+        conversationId: "conv_live",
+        sourceHeadRunId: "run_live",
+        sourceConversationRevision: 3,
+        coverageThroughRunId: "run_previous",
+        trigger: "auto_pre_turn",
+        formatVersion: "1",
+        compatibility: { kind: "provider-neutral-text", version: 1 },
+        budget: {
+          contextWindow: 10_000,
+          estimatedInputTokens: 7_000,
+          rawHistoryTokens: 6_000,
+          checkpointTokens: 500,
+          safetyStateTokens: 100,
+          reservedOutputTokens: 1_000,
+        },
+        summary: "must not leave the Runtime Store",
+        safetyState: { effects: [{ target: "secret" }] },
+        generatedBy: { providerId: "secret-provider", modelId: "secret-model" },
+        attachmentBytes: "AAEC",
+      },
+      time: 20,
+    } as unknown as Event;
+
+    const envelope = runtimeEventToEnvelope(event);
+    expect(envelope.scope).toEqual({
+      kind: "conversation",
+      conversation_id: "conv_live",
+    });
+    expect(envelope.payload).toEqual({
+      event: {
+        id: "evt_context",
+        type: "context.checkpoint.created",
+        properties: {
+          checkpointId: "ckpt_1",
+          conversationId: "conv_live",
+          sourceHeadRunId: "run_live",
+          sourceConversationRevision: 3,
+          coverageThroughRunId: "run_previous",
+          trigger: "auto_pre_turn",
+          formatVersion: "1",
+          compatibility: { kind: "provider-neutral-text", version: 1 },
+          budget: {
+            contextWindow: 10_000,
+            estimatedInputTokens: 7_000,
+            rawHistoryTokens: 6_000,
+            checkpointTokens: 500,
+            safetyStateTokens: 100,
+            reservedOutputTokens: 1_000,
+          },
+        },
+        time: 20,
+      },
+    });
+  });
+
+  test("whitelists context plan identity, selection, reason, and budget facts", () => {
+    const event = {
+      id: "evt_context_plan",
+      type: "context.plan.created",
+      properties: {
+        planId: "ctxplan_1",
+        conversationId: "conv_live",
+        runId: "run_live",
+        requestIndex: 2,
+        sourceHeadRunId: "run_live",
+        sourceConversationRevision: 4,
+        view: "checkpoint",
+        checkpointId: "ckpt_1",
+        reason: "checkpoint_selected",
+        trigger: "auto_pre_turn",
+        budget: {
+          contextWindow: 10_000,
+          estimatedInputTokens: 4_000,
+          rawHistoryTokens: 2_000,
+          checkpointTokens: 500,
+          safetyStateTokens: 100,
+          reservedOutputTokens: 1_000,
+          secretEstimate: 999,
+        },
+        safetyState: { effects: [{ target: "secret" }] },
+        summary: "must not leave the Runtime Store",
+        generatedBy: { providerId: "secret-provider", modelId: "secret-model" },
+        arbitrary: "must be removed",
+      },
+      time: 21,
+    } as unknown as Event;
+
+    expect(runtimeEventToEnvelope(event)).toEqual({
+      id: "evt_context_plan",
+      type: "context.plan.created",
+      scope: {
+        kind: "run",
+        conversation_id: "conv_live",
+        run_id: "run_live",
+      },
+      occurred_at: 21,
+      version: 1,
+      payload: {
+        event: {
+          id: "evt_context_plan",
+          type: "context.plan.created",
+          properties: {
+            planId: "ctxplan_1",
+            conversationId: "conv_live",
+            runId: "run_live",
+            requestIndex: 2,
+            sourceHeadRunId: "run_live",
+            sourceConversationRevision: 4,
+            view: "checkpoint",
+            checkpointId: "ckpt_1",
+            reason: "checkpoint_selected",
+            trigger: "auto_pre_turn",
+            budget: {
+              contextWindow: 10_000,
+              estimatedInputTokens: 4_000,
+              rawHistoryTokens: 2_000,
+              checkpointTokens: 500,
+              safetyStateTokens: 100,
+              reservedOutputTokens: 1_000,
+            },
+          },
+          time: 21,
+        },
+      },
+    });
+  });
 });

@@ -35,6 +35,8 @@ const DURABLE_EVENTS = new Set([
   "diff.proposed",
   "diff.applied",
   "artifact.created",
+  "context.checkpoint.created",
+  "context.plan.created",
   "runtime.error",
 ]);
 

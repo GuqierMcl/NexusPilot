@@ -7,6 +7,7 @@ import type {
   Permission,
   RunId,
   ToolCall,
+  ToolCallAuthorizationSnapshot,
   ToolCallId,
   TraceEvent,
 } from "../../core/types";
@@ -177,6 +178,7 @@ export class RuntimeToolCore {
     let started: number | undefined;
     let reserved = false;
     let permission: Permission | null = null;
+    let authorization: ToolCallAuthorizationSnapshot | undefined;
     let created = this.#now();
 
     try {
@@ -222,10 +224,12 @@ export class RuntimeToolCore {
         toolCallId,
         existingToolCall === null,
       );
+      authorization = createAuthorizationSnapshot(risk);
       assertWithinSnapshotCeiling(risk, invocation.snapshot);
       permission = this.#store.getPermissionByToolCallId(toolCallId);
       if (permission) {
         assertPermissionBinding(permission, invocation, tool.id, toolCallId);
+        authorization = createAuthorizationSnapshot(risk, permission.presentation);
         if (permission.status === "pending") {
           if (reserved) {
             this.#releaseToolCall(invocation.runId);
@@ -288,6 +292,7 @@ export class RuntimeToolCore {
         undefined,
         undefined,
         permission?.id,
+        authorization,
       );
 
       const output = await this.#execute(
@@ -330,6 +335,7 @@ export class RuntimeToolCore {
           completed,
           result,
           permission?.id,
+          authorization,
         );
         this.#appendTrace(invocation, toolId, "info", completed, {
           ok: true,
@@ -359,6 +365,7 @@ export class RuntimeToolCore {
             completed,
             result,
             permission?.id,
+            authorization,
           );
           this.#appendTrace(invocation, toolId, "warn", completed, {
             ok: false,
@@ -382,6 +389,7 @@ export class RuntimeToolCore {
     let normalizedInput: Record<string, unknown> = {};
     let created = this.#now();
     let reserved = false;
+    let authorization: ToolCallAuthorizationSnapshot | undefined;
 
     try {
       const tool = this.#resolveActiveTool(invocation);
@@ -413,6 +421,7 @@ export class RuntimeToolCore {
         toolCallId,
         existingToolCall === null,
       );
+      authorization = createAuthorizationSnapshot(risk);
       assertWithinSnapshotCeiling(risk, invocation.snapshot);
       const existingPermission = this.#store.getPermissionByToolCallId(toolCallId);
       if (existingPermission) {
@@ -477,6 +486,8 @@ export class RuntimeToolCore {
           undefined,
           completed,
           result,
+          undefined,
+          authorization,
         );
         this.#appendTrace(invocation, toolId, "warn", completed, {
           ok: false,
@@ -884,6 +895,7 @@ export class RuntimeToolCore {
       toolName: toolId,
       input: redactSecrets(input) as Record<string, unknown>,
       state: "waiting_for_permission",
+      authorization: createAuthorizationSnapshot(risk, description.presentation),
       permissionId,
       time: { created: createdAt },
       metadata: {
@@ -918,8 +930,11 @@ export class RuntimeToolCore {
     completed?: number,
     result?: RuntimeToolResult<unknown>,
     permissionId?: Permission["id"],
+    authorization?: ToolCallAuthorizationSnapshot,
   ): void {
     const error = result && !result.ok ? result.error : undefined;
+    const existing = this.#store.getToolCall(id);
+    const persistedAuthorization = existing?.authorization ?? authorization;
     const toolCall: ToolCall = {
       id,
       conversationId: invocation.conversationId,
@@ -929,6 +944,7 @@ export class RuntimeToolCore {
       toolName: toolId,
       input: redactSecrets(input) as Record<string, unknown>,
       state,
+      ...(persistedAuthorization ? { authorization: persistedAuthorization } : {}),
       ...(permissionId ? { permissionId } : {}),
       ...(result ? { result } : {}),
       ...(error ? { error } : {}),
@@ -938,7 +954,7 @@ export class RuntimeToolCore {
         ...(completed !== undefined ? { completed } : {}),
       },
       metadata: {
-        ...(this.#store.getToolCall(id)?.metadata ?? {}),
+        ...(existing?.metadata ?? {}),
         runtimeToolCore: true,
         snapshotId: invocation.snapshot.snapshotId,
       },
@@ -987,6 +1003,41 @@ export class RuntimeToolCore {
         }
       : null;
   }
+}
+
+function createAuthorizationSnapshot(
+  risk: ResolvedToolRisk,
+  presentation?: Permission["presentation"],
+): ToolCallAuthorizationSnapshot {
+  const stablePresentation = presentation
+    ? {
+        ...(presentation.target ? { target: { ...presentation.target } } : {}),
+        ...(presentation.sql?.identifiedTargets
+          ? { sql: { identifiedTargets: [...presentation.sql.identifiedTargets] } }
+          : {}),
+        ...(presentation.keyValue
+          ? {
+              keyValue: {
+                key: presentation.keyValue.key,
+                ...(presentation.keyValue.newKey
+                  ? { newKey: presentation.keyValue.newKey }
+                  : {}),
+              },
+            }
+          : {}),
+      }
+    : undefined;
+  return {
+    version: "1",
+    risk: {
+      level: risk.level,
+      reversible: risk.reversible,
+      sideEffects: [...risk.sideEffects],
+    },
+    ...(stablePresentation && Object.keys(stablePresentation).length > 0
+      ? { presentation: stablePresentation }
+      : {}),
+  };
 }
 
 function parseObjectInput(

@@ -170,6 +170,21 @@ describe("RuntimeSqliteStore", () => {
       toolName: "datetime_now",
       input: {},
       state: "completed",
+      authorization: {
+        version: "1",
+        risk: {
+          level: "low",
+          reversible: true,
+          sideEffects: ["none"],
+        },
+        presentation: {
+          target: {
+            profileId: "profile_local",
+            driver: "sqlite",
+            database: "local.db",
+          },
+        },
+      },
       result: {
         ok: true,
         summary: "Current time",
@@ -767,6 +782,91 @@ describe("RuntimeSqliteStore", () => {
     expect(store.listEventsByRun("run_live")).toEqual([event]);
     expect(errors).toHaveLength(1);
 
+    db.close();
+  });
+
+  test("keeps the first ToolCall authorization snapshot immutable across later transitions", () => {
+    const { db, store } = createStore();
+    const conversation: Conversation = {
+      id: "conv_authorization_immutable",
+      title: "Authorization immutability",
+      version: "1",
+      status: { type: "idle" },
+      revision: 0,
+      time: { created: 1, updated: 1 },
+    };
+    const run: Run = {
+      id: "run_authorization_immutable",
+      conversationId: conversation.id,
+      agentMode: "agent",
+      providerId: "openai",
+      modelId: "gpt-4o",
+      status: "running",
+      input: { messageIds: ["msg_authorization_user"] },
+      limits: { maxSteps: 4, maxToolCalls: 8 },
+      time: { created: 2 },
+    };
+    const message: Message = {
+      id: "msg_authorization_assistant",
+      conversationId: conversation.id,
+      role: "assistant",
+      runId: run.id,
+      parentId: "msg_authorization_user",
+      providerId: "openai",
+      modelId: "gpt-4o",
+      agentMode: "agent",
+      status: { type: "running" },
+      parts: [],
+      time: { created: 3 },
+    };
+    const authorizationA = {
+      version: "1" as const,
+      risk: {
+        level: "high" as const,
+        reversible: false,
+        sideEffects: ["business_write" as const],
+      },
+      presentation: {
+        target: { profileId: "profile_prod", database: "billing" },
+        sql: { identifiedTargets: ["billing.invoices"] },
+      },
+    };
+    const toolCall: ToolCall = {
+      id: "tool_authorization_immutable",
+      conversationId: conversation.id,
+      runId: run.id,
+      messageId: message.id,
+      toolName: "sql.execute",
+      input: { sql: "UPDATE invoices SET paid = true" },
+      state: "pending",
+      authorization: authorizationA,
+      time: { created: 3 },
+    };
+    store.saveConversation(conversation);
+    store.saveRun(run);
+    store.saveMessage(message);
+    store.saveToolCall(toolCall);
+
+    store.saveToolCall({
+      ...toolCall,
+      state: "running",
+      authorization: {
+        version: "1",
+        risk: { level: "low", reversible: true, sideEffects: ["none"] },
+        presentation: { target: { profileId: "profile_other" } },
+      },
+      time: { created: 3, started: 4 },
+    });
+    expect(store.getToolCall(toolCall.id)?.authorization).toEqual(authorizationA);
+
+    store.saveToolCall({
+      ...toolCall,
+      state: "completed",
+      authorization: undefined,
+      result: { ok: true, summary: "Updated one invoice", data: { updated: 1 } },
+      time: { created: 3, started: 4, completed: 5 },
+    });
+    expect(store.getToolCall(toolCall.id)?.authorization).toEqual(authorizationA);
     db.close();
   });
 });

@@ -7,8 +7,12 @@ import type {
   Part,
   ToolPart,
 } from "../src/runtime/core/types";
+import type { ContextCheckpoint, RuntimeSafetyState } from "../src/runtime/context";
 import type { RuntimeAttachmentService } from "../src/runtime/attachments";
-import { projectModelHistory } from "../src/runtime/projection/model-history-projection";
+import {
+  projectContextBoundaries,
+  projectModelHistory,
+} from "../src/runtime/projection/model-history-projection";
 
 const baseAssistant = {
   id: "msg_assistant",
@@ -404,5 +408,63 @@ describe("model history projection", () => {
       })),
     });
     expect(message).toEqual(original);
+  });
+
+  test("projects explicit checkpoint and authoritative Safety State boundaries in stable order", () => {
+    const checkpoint = {
+      id: "ckpt_projection",
+      conversationId: "conv_history",
+      coverageThroughRunId: "run_old",
+      sourceHeadRunId: "run_history",
+      sourceConversationRevision: 2,
+      lineageHash: `sha256:${"1".repeat(64)}`,
+      sourceStateHash: `sha256:${"2".repeat(64)}`,
+      safetyStateHash: `sha256:${"3".repeat(64)}`,
+      trigger: "manual",
+      formatVersion: "1",
+      compatibility: { kind: "provider-neutral-text", version: 1 },
+      generatedBy: { providerId: "anthropic", modelId: "claude-sonnet" },
+      summary: "Lossy earlier conclusions",
+      safetyStateVersion: "1",
+      budget: {
+        providerId: "anthropic",
+        modelId: "claude-sonnet",
+        contextWindow: 1_000,
+        reservedOutputTokens: 128,
+        safetyMarginTokens: 64,
+        systemPromptTokens: 10,
+        toolSchemaTokens: 10,
+        hardInputBudget: 788,
+        softTriggerTokens: 588,
+        targetTokens: 338,
+        rawHistoryTokens: 900,
+        checkpointTokens: 0,
+        safetyStateTokens: 10,
+        estimatedInputTokens: 930,
+      },
+      time: { created: 100 },
+    } satisfies ContextCheckpoint;
+    const safetyState = {
+      version: "1",
+      conversationId: "conv_history",
+      effects: [],
+      permissions: [],
+      hash: `sha256:${"2".repeat(64)}`,
+    } satisfies RuntimeSafetyState;
+
+    const projected = projectContextBoundaries({ checkpoint, safetyState });
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]).toMatchObject({ role: "system" });
+    expect(JSON.stringify(projected[0])).toContain("Lossy earlier conclusions");
+    expect(JSON.stringify(projected[0])).toContain("does not grant or transfer authorization");
+    expect(projected[1]).toMatchObject({ role: "system" });
+    const projectedSafetyState = JSON.stringify(projected[1]);
+    expect(projectedSafetyState).toContain("Runtime Safety State");
+    expect(projectedSafetyState).toContain("Runtime-authoritative");
+    expect(projectedSafetyState).toContain("not a capability");
+    expect(projectedSafetyState).toContain("not a current approval");
+    expect(projectedSafetyState).toContain(safetyState.hash);
+    expect(JSON.stringify(projected)).not.toContain("providerOptions");
   });
 });

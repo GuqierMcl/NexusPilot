@@ -22,6 +22,14 @@ describe("Runtime event classifier", () => {
     });
     expect(classifyRuntimeEvent("permission.resolved").persistence).toBe("durable-event");
     expect(classifyRuntimeEvent("diff.proposed").persistence).toBe("durable-event");
+    expect(classifyRuntimeEvent("context.checkpoint.created")).toEqual({
+      persistence: "durable-event",
+      reason: "runtime semantic boundary",
+    });
+    expect(classifyRuntimeEvent("context.plan.created")).toEqual({
+      persistence: "durable-event",
+      reason: "runtime semantic boundary",
+    });
   });
 
   test("marks current-state snapshots as projection updates", () => {

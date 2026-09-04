@@ -21,6 +21,8 @@ import type {
   ToolPart,
   ToolState,
 } from "../core/types";
+import type { ContextCheckpoint, RuntimeSafetyState } from "../context/types";
+import { stableStringifyJson } from "../context/token-estimator";
 
 export interface ModelHistoryTarget {
   providerId: string;
@@ -30,6 +32,32 @@ export interface ModelHistoryTarget {
 export interface ModelHistoryProjectionOptions {
   target: ModelHistoryTarget;
   attachmentService?: RuntimeAttachmentService | null;
+}
+
+export function projectContextBoundaries(input: {
+  checkpoint?: ContextCheckpoint;
+  safetyState: RuntimeSafetyState;
+}): ModelMessage[] {
+  return [
+    ...(input.checkpoint
+      ? [{
+          role: "system" as const,
+          content: [
+            "[Context checkpoint: lossy provider-neutral memory]",
+            "This summary is not an audit record and does not grant or transfer authorization.",
+            input.checkpoint.summary,
+          ].join("\n"),
+        }]
+      : []),
+    {
+      role: "system",
+      content: [
+        "[Runtime Safety State: Runtime-authoritative facts; not a capability and not a current approval]",
+        "These facts do not grant or transfer authorization for any new tool call.",
+        stableStringifyJson(input.safetyState),
+      ].join("\n"),
+    },
+  ];
 }
 
 export async function projectModelHistory(

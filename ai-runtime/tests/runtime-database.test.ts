@@ -32,6 +32,7 @@ describe("runtime database", () => {
     expect(tables).toContain("runtime_attachment_uploads");
     expect(tables).toContain("runtime_message_attachments");
     expect(tables).toContain("runtime_history_diagnostics");
+    expect(tables).toContain("runtime_context_preparation_claims");
 
     const indexes = db
       .query<{ name: string }, []>(
@@ -75,6 +76,10 @@ describe("runtime database", () => {
       "0006_runtime_tool_permission_confirmation",
       "0007_runtime_chat_attachments",
       "0008_runtime_run_dag",
+      "0009_runtime_context_compaction",
+      "0010_runtime_tool_call_authorization_snapshot",
+      "0011_runtime_context_preparation_claims",
+      "0012_runtime_context_preparation_fencing",
     ]);
 
     const runColumns = db
@@ -87,6 +92,10 @@ describe("runtime database", () => {
       .map((row) => row.name);
     const conversationColumns = db
       .query<{ name: string }, []>("PRAGMA table_info(runtime_conversations)")
+      .all()
+      .map((row) => row.name);
+    const preparationClaimColumns = db
+      .query<{ name: string }, []>("PRAGMA table_info(runtime_context_preparation_claims)")
       .all()
       .map((row) => row.name);
 
@@ -102,6 +111,7 @@ describe("runtime database", () => {
     expect(messageColumns).not.toContain("mode");
     expect(messageColumns).not.toContain("system");
     expect(messageColumns).not.toContain("tools_json");
+    expect(preparationClaimColumns).toContain("fencing_token");
 
     db.close();
   });
@@ -217,6 +227,10 @@ describe("runtime database", () => {
           "0006_runtime_tool_permission_confirmation",
           "0007_runtime_chat_attachments",
           "0008_runtime_run_dag",
+          "0009_runtime_context_compaction",
+          "0010_runtime_tool_call_authorization_snapshot",
+          "0011_runtime_context_preparation_claims",
+          "0012_runtime_context_preparation_fencing",
         ]);
       } finally {
         secondDb.close();

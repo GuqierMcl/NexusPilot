@@ -13,6 +13,9 @@ import { z } from "zod";
 import {
   RuntimeAttachmentError,
   ATTACHMENT_LIMITS,
+  ContextCompactionService,
+  DEFAULT_CONTEXT_COMPACTION_POLICY,
+  ModelContextManager,
   RuntimeAttachmentService,
   RuntimeAttachmentSqliteStore,
   RuntimeRunner,
@@ -23,6 +26,7 @@ import {
   type AssistantMessage,
   type Conversation,
   type Event,
+  type Message,
   type Run,
   type RuntimeStreamText,
   type RuntimeToolNamespace,
@@ -921,5 +925,173 @@ describe("Runtime Attachment Service", () => {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+
+  test("skips two 40 MiB persisted-style attachment projections behind a checkpoint and reads them on raw rehydrate", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    class ProjectionStore extends RuntimeSqliteStore {
+      projectionMessages: Message[] | null = null;
+
+      override listTranscriptMessages(conversationId: Conversation["id"]): Message[] {
+        return this.projectionMessages ?? super.listTranscriptMessages(conversationId);
+      }
+    }
+    const store = new ProjectionStore(db);
+    const conversation: Conversation = {
+      id: "conv_compacted_attachments",
+      title: "Compacted attachments",
+      version: "1",
+      status: { type: "busy", runId: "run_attachment_d" },
+      activeHeadRunId: "run_attachment_d",
+      revision: 4,
+      time: { created: 1, updated: 40 },
+    };
+    store.saveConversation(conversation);
+    const projectedMessages: Message[] = [];
+    const persistPair = (
+      suffix: string,
+      parentRunId: Run["parentRunId"],
+      status: Run["status"],
+      created: number,
+      filePart?: { attachmentId: `att_${string}`; byteLength: number },
+    ): void => {
+      const runId = `run_attachment_${suffix}` as Run["id"];
+      const userId = `msg_attachment_user_${suffix}` as UserMessage["id"];
+      const assistantId = `msg_attachment_assistant_${suffix}` as AssistantMessage["id"];
+      const persistedUser: UserMessage = {
+        id: userId,
+        conversationId: conversation.id,
+        role: "user",
+        agentMode: "ask",
+        parts: [{
+          id: `part_attachment_user_${suffix}`,
+          conversationId: conversation.id,
+          messageId: userId,
+          type: "text",
+          text: `user ${suffix}`,
+        }],
+        time: { created },
+      };
+      const projectedUser: UserMessage = filePart
+        ? {
+            ...persistedUser,
+            parts: [{
+              id: `part_attachment_file_${suffix}`,
+              conversationId: conversation.id,
+              messageId: userId,
+              type: "file",
+              attachmentId: filePart.attachmentId,
+              filename: `${suffix}.bin`,
+              mediaType: "application/octet-stream",
+              byteLength: filePart.byteLength,
+            }],
+          }
+        : persistedUser;
+      const assistant: AssistantMessage = {
+        id: assistantId,
+        conversationId: conversation.id,
+        role: "assistant",
+        runId,
+        parentId: userId,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        agentMode: "ask",
+        status: status === "completed" ? { type: "complete" } : { type: "running" },
+        parts: status === "completed" ? [{
+          id: `part_attachment_assistant_${suffix}`,
+          conversationId: conversation.id,
+          messageId: assistantId,
+          type: "text",
+          text: `assistant ${suffix}`,
+        }] : [],
+        time: { created: created + 1 },
+      };
+      const run: Run = {
+        id: runId,
+        conversationId: conversation.id,
+        parentRunId,
+        parentMessageId: userId,
+        assistantMessageId: assistantId,
+        agentMode: "ask",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        status,
+        input: { messageIds: [userId] },
+        output: { messageId: assistantId, partIds: assistant.parts.map((part) => part.id) },
+        limits: { maxSteps: 1, maxToolCalls: 0, maxOutputTokens: 128 },
+        time: { created, ...(status === "completed" ? { completed: created + 1 } : {}) },
+      };
+      store.saveMessage(persistedUser);
+      store.saveRun(run);
+      store.saveMessage(assistant);
+      projectedMessages.push(projectedUser, assistant);
+    };
+    const fortyMiB = 40 * 1024 * 1024;
+    persistPair("a", undefined, "completed", 10, {
+      attachmentId: "att_compacted_a",
+      byteLength: fortyMiB,
+    });
+    persistPair("b", "run_attachment_a", "completed", 20, {
+      attachmentId: "att_compacted_b",
+      byteLength: fortyMiB,
+    });
+    persistPair("c", "run_attachment_b", "completed", 30);
+    persistPair("d", "run_attachment_c", "running", 40);
+    store.projectionMessages = projectedMessages;
+
+    let reads = 0;
+    const attachmentService = {
+      readBytes: async () => {
+        reads += 1;
+        return new Uint8Array([1]);
+      },
+    } as unknown as RuntimeAttachmentService;
+    const compactionService = new ContextCompactionService({
+      store,
+      generator: async () => ({ text: "The earlier attachment-backed facts are summarized." }),
+    });
+    const manager = new ModelContextManager({ store, compactionService, attachmentService });
+
+    const compacted = await manager.prepare({
+      conversationId: conversation.id,
+      runId: "run_attachment_d",
+      requestIndex: 0,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      model: new MockLanguageModelV3(),
+      contextWindow: 10_000,
+      reservedOutputTokens: 0,
+      systemPrompt: "system",
+      toolSchemas: {},
+      trigger: "auto_pre_turn",
+      policy: { ...DEFAULT_CONTEXT_COMPACTION_POLICY, safetyMarginTokens: 0 },
+    });
+    expect(compacted.plan.view).toBe("checkpoint");
+    expect(compacted.plan.rawRunIds).toEqual(["run_attachment_c", "run_attachment_d"]);
+    expect(reads).toBe(0);
+
+    const rehydrated = await manager.prepare({
+      conversationId: conversation.id,
+      runId: "run_attachment_d",
+      requestIndex: 1,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      model: new MockLanguageModelV3(),
+      contextWindow: 100_000_000,
+      reservedOutputTokens: 0,
+      systemPrompt: "system",
+      toolSchemas: {},
+      trigger: "model_switch",
+      policy: { ...DEFAULT_CONTEXT_COMPACTION_POLICY, safetyMarginTokens: 0 },
+    });
+    expect(rehydrated.plan.view).toBe("raw");
+    expect(rehydrated.plan.rawRunIds).toEqual([
+      "run_attachment_a",
+      "run_attachment_b",
+      "run_attachment_c",
+      "run_attachment_d",
+    ]);
+    expect(reads).toBe(2);
+    db.close();
   });
 });

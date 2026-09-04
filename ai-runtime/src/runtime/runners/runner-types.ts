@@ -15,6 +15,7 @@ import type {
   Permission,
   PromptAssemblySnapshot,
   Run,
+  RunId,
   RunLimits,
   RunStatus,
   RuntimeError,
@@ -27,6 +28,17 @@ import type {
 } from "../core/types";
 import type { RunToolSnapshot } from "../tools/resolution";
 import type { RuntimeAttachmentService } from "../attachments";
+import type {
+  ContextCheckpoint,
+  ContextCheckpointCommit,
+  ContextPlan,
+  ContextPreparationClaim,
+  ContextPreparationClaimRequest,
+  ContextPreparationClaimRelease,
+  ContextPreparationClaimResult,
+  ContextPlanCommit,
+  ContextUsage,
+} from "../context";
 
 export const DEFAULT_RUN_LIMITS: RunLimits = {
   maxSteps: 1,
@@ -111,6 +123,7 @@ export interface RuntimeRunnerStore {
   getConversation(id: ConversationId): Conversation | null;
   saveRun(run: Run): void;
   getRun(id: Run["id"]): Run | null;
+  listRunsByConversation(conversationId: ConversationId): Run[];
   saveMessage(message: Message): void;
   getMessage(id: MessageId): Message | null;
   listTranscriptMessages(conversationId: ConversationId): Message[];
@@ -121,6 +134,7 @@ export interface RuntimeRunnerStore {
   listToolCallsByRun(runId: Run["id"]): ToolCall[];
   getPermissionByToolCallId(toolCallId: ToolCallId): Permission | null;
   listPendingPermissionsByRun(runId: Run["id"]): Permission[];
+  listPermissionsByRun(runId: Run["id"]): Permission[];
   bindPermissionAiSdkApproval(input: {
     permissionId: Permission["id"];
     toolCallId: ToolCallId;
@@ -162,6 +176,21 @@ export interface RuntimeRunnerStore {
   }): unknown;
   appendEvent(event: Event): void;
   appendTrace(trace: TraceEvent): void;
+  listContextCheckpoints(conversationId: ConversationId): ContextCheckpoint[];
+  getContextPlan(id: ContextPlan["id"]): ContextPlan | null;
+  getContextPlanByRunRequest(runId: RunId, requestIndex: number): ContextPlan | null;
+  getContextPreparationBrokerKey(): object;
+  getContextPreparationClaim(
+    runId: RunId,
+    requestIndex: number,
+  ): ContextPreparationClaim | null;
+  claimContextPreparation(claim: ContextPreparationClaimRequest): ContextPreparationClaimResult;
+  releaseContextPreparationClaim(claim: ContextPreparationClaimRelease): boolean;
+  listContextPlansByRun(runId: Run["id"]): ContextPlan[];
+  getLatestContextUsage(conversationId: ConversationId): ContextUsage | null;
+  commitContextCheckpoint(input: ContextCheckpointCommit): "committed" | "stale";
+  saveContextPlan(input: ContextPlanCommit): void;
+  saveContextUsage(usage: ContextUsage): void;
 }
 
 export interface RuntimeRunnerDependencies {
