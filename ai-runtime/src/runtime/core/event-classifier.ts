@@ -35,6 +35,7 @@ const DURABLE_EVENTS = new Set([
   "diff.proposed",
   "diff.applied",
   "artifact.created",
+  "runtime.error",
 ]);
 
 const PROJECTION_EVENTS = new Set([

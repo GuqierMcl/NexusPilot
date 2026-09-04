@@ -784,6 +784,7 @@ export type RuntimeError =
   | MessageAbortedError
   | ToolExecutionError
   | PermissionDeniedError
+  | ModelExecutionError
   | UnknownError;
 
 export interface ProviderAuthError {
@@ -811,9 +812,16 @@ export interface ApiError {
   data: {
     message: string;
     statusCode?: number;
-    isRetryable: boolean;
-    responseHeaders?: Record<string, string>;
-    responseBody?: string;
+    isRetryable?: boolean;
+  };
+}
+
+export interface ModelExecutionError {
+  name: string;
+  data: {
+    message: string;
+    statusCode?: number;
+    isRetryable?: boolean;
   };
 }
 

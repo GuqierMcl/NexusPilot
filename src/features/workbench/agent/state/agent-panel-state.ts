@@ -162,7 +162,11 @@ function readRuntimeErrorMessage(value: unknown): string | null {
   const error = readRecord(value);
   const data = readRecord(error?.data);
 
-  return normalizeOptionalString(data?.message) ?? normalizeOptionalString(error?.message);
+  return readNonEmptyString(data?.message) ?? readNonEmptyString(error?.message);
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function normalizeOptionalString(value: unknown): string | null {

@@ -138,7 +138,7 @@ Model 字段语义：
 
 `supportsTools` 会直接影响 L3 per-Run Tool resolver：模型不支持 tool calling 时，候选 Tool 会以 `provider_tools_unsupported` 进入 Snapshot unavailable facts，Run 仍退化为普通问答。支持工具的模型会由 L5-A adapter 只接收当前 Snapshot active Tools。
 
-`attachment`、`modalities`、`structured_output`、`interleaved` 和 `temperature` 是模型目录与设置页的能力事实。聊天附件入口已经开放，但 `supportsVision`、`supportsAttachments`、`inputModalities` 等目录字段不参与附件上传或发送门禁：Runtime 只验证附件协议、安全、完整性和资源限制，然后把本地 bytes 投影为 AI SDK 标准 `file` part。adapter 或上游 Provider/Model 不接受某种附件时，当前 Run 明确失败并显示脱敏错误；系统不静默删除附件、不自动换模型，也不降级为纯文本重试。
+`attachment`、`modalities`、`structured_output`、`interleaved` 和 `temperature` 是模型目录与设置页的能力事实。聊天附件入口已经开放，但 `supportsVision`、`supportsAttachments`、`inputModalities` 等目录字段不参与附件上传或发送门禁：Runtime 只验证附件协议、安全、完整性和资源限制，然后把本地 bytes 投影为 AI SDK 标准 `file` part。adapter 或上游 Provider/Model 不接受某种附件时，当前 Run 明确失败并显示 Provider/AI SDK 的原始错误 message；只有其中精确命中 Runtime 当前持有的完整 secret 时才替换为 `[REDACTED]`。系统不静默删除附件、不自动换模型，也不降级为纯文本重试。
 
 自定义 OpenAI-compatible 模型的工具能力默认是**开启**：模型定义省略 `capabilities.supports_tools` 时，Runtime 按 `true` 处理。只有显式写入 `false` 才会禁用工具调用。这个默认值适用于历史 `providers.json`，无需迁移；设置页编辑时也必须保留已保存的显式能力值。
 
@@ -317,6 +317,27 @@ Run 创建请求只携带：
 | `openai_compatible` | `createOpenAICompatible({ name, apiKey, baseURL, includeUsage: true }).languageModel(upstreamId)` |
 
 涉及 `ai` 或 `@ai-sdk/*` 的修改必须先查阅 [AI SDK llms.txt](https://ai-sdk.dev/llms.txt)，优先通过官方搜索端点定位当前文档，再修改 adapter、stream 或 tool calling 代码。
+
+### 跨 Run Provider/Model 兼容
+
+Runtime Store 中每条历史 AssistantMessage 已保存其来源 `providerId/modelId`。构造下一 Run 的 AI SDK `ModelMessage[]` 时采用精确 pair 判断：
+
+- 来源与目标 Provider、Model 都相同：reasoning 保持 reasoning 类型，text/reasoning/tool call 的 Provider metadata 作为原 `providerOptions` 重放，并保留 Anthropic signed/adaptive thinking 所需的结构分隔；
+- Provider 或 Model 任一不同：非空 reasoning 转为普通 Assistant text，空白 reasoning 跳过，旧 text/reasoning/tool call 的 Provider metadata 全部移除；普通 Assistant text 和配对的工具调用/结果不丢失。
+
+工具名称也属于持久化的 adapter 事实：Runtime canonical ID 保存在 `ToolPart.toolName`，模型实际看到的名称保存在 `ToolPart.metadata.providerToolName`。后续请求的历史 tool-call 与 tool-result 必须共同使用后者；旧记录缺失该字段时才回退原 `toolName`，不得根据当前 Provider 或 registry 伪造映射。
+
+该策略与 OpenCode `MessageV2.toModelMessages` 的模型切换兼容思路一致，但不是 fallback 机制。Runtime 只向用户本次选择的模型发起一次请求；不自动调用历史模型，不因兼容失败剥离更多历史重试，也不创建隐式摘要。目标 AI SDK/Provider 仍不接受该历史时，原始错误直接进入当前 AssistantMessage 的错误状态。
+
+### Provider/AI SDK 错误边界
+
+模型执行链路保留上游原始 error `name/message`，只保存上游实际给出的可选 `statusCode/isRetryable`。Provider API key 仅在 Runtime 内存中作为精确脱敏候选；若完整 key 出现在 message 中，仅替换该完整值，不向 Store、SSE、metadata 或日志复制 key 本身。stack、headers、request/response body 和完整 Provider response 不属于 RuntimeError 契约。
+
+AI SDK full stream 的标准 `{ type: "error", error }` part 是模型执行失败边界：Runtime 必须在后续 `finishReason: "error"` 之前写入唯一 failed/Assistant error 终态，保留错误前已经产生的 semantic parts，并终态化尚未完成的 ToolPart 与 ToolCall。SDK 的外围 finish、UI stream 或迭代器 catch 再次观察到同一失败时不得重复写入或覆盖首个原文；Snapshot 从该持久化 AssistantMessage 恢复同一错误。默认 adapter 的 UI response 只在 full-stream facts consumer 完成后关闭，因此调用方不需要依赖额外的 event-loop tick 才能读取终态。
+
+上述模型执行错误与 Provider/model 解析阶段的 HTTP 错误、具体 ToolCall 的业务错误、sidecar/transport 可用性错误保持分层。模型错误在消息流原位置显示并可由 Snapshot 恢复；Tool 错误继续留在对应 tool result/card；transport 状态继续使用产品基础设施提示。
+
+当前 Runtime 尚未实现自动上下文压缩或 token-budget 驱动的摘要/裁剪。Provider 的 `contextLength` 仍是能力事实，不代表 Runner 会自动压缩历史；超过目标上下文时，Provider/AI SDK 错误按上述透明路径展示。
 
 ## 与 Agent Definition 的关系
 

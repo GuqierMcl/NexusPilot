@@ -72,6 +72,11 @@ export interface RunRouteDeps {
 }
 
 export function runRoutes(deps: RunRouteDeps) {
+  const getErrorMessageSecrets = deps.providerService
+    ? () => deps.providerService!.listProviders()
+        .flatMap((provider) => provider.apiKey ? [provider.apiKey] : [])
+    : undefined;
+
   return new Elysia({ prefix: "/v1", name: "run-routes" })
     .post("/runs", async ({ request }) => {
       const body = await parseJsonBody(request);
@@ -114,6 +119,7 @@ export function runRoutes(deps: RunRouteDeps) {
           continuations: deps.continuations,
           getToolApprovalPolicy: deps.getToolApprovalPolicy,
           getNetworkPolicy: deps.getNetworkPolicy,
+          getErrorMessageSecrets,
           attachmentService: deps.attachmentService ?? undefined,
         });
 
@@ -186,6 +192,7 @@ export function runRoutes(deps: RunRouteDeps) {
           continuations: deps.continuations,
           getToolApprovalPolicy: deps.getToolApprovalPolicy,
           getNetworkPolicy: deps.getNetworkPolicy,
+          getErrorMessageSecrets,
           attachmentService: deps.attachmentService ?? undefined,
         });
         return (

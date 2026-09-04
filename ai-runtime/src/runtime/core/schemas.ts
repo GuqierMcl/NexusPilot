@@ -12,7 +12,7 @@ export const timeSpanSchema = z.object({
   end: z.number().optional(),
 });
 
-export const runtimeErrorSchema = z.discriminatedUnion("name", [
+export const runtimeErrorSchema = z.union([
   z.object({
     name: z.literal("ProviderAuthError"),
     data: z.object({ providerId: z.string(), message: z.string() }),
@@ -34,9 +34,7 @@ export const runtimeErrorSchema = z.discriminatedUnion("name", [
     data: z.object({
       message: z.string(),
       statusCode: z.number().optional(),
-      isRetryable: z.boolean(),
-      responseHeaders: z.record(z.string(), z.string()).optional(),
-      responseBody: z.string().optional(),
+      isRetryable: z.boolean().optional(),
     }),
   }),
   z.object({
@@ -62,6 +60,14 @@ export const runtimeErrorSchema = z.discriminatedUnion("name", [
   z.object({
     name: z.literal("UnknownError"),
     data: z.object({ message: z.string() }),
+  }),
+  z.object({
+    name: z.string().min(1),
+    data: z.object({
+      message: z.string(),
+      statusCode: z.number().optional(),
+      isRetryable: z.boolean().optional(),
+    }),
   }),
 ]);
 

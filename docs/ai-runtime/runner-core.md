@@ -427,6 +427,40 @@ AI SDK stream 可以先于持久化抵达 UI，但断线、刷新、恢复、统
 
 这条规则是 Store 可恢复性的组成部分，而不是前端渲染细节。若 Runtime Store 已经把 `tool`、`source`、`reasoning` 和 `text` 的顺序写错，前端分组、折叠或 CSS 只能掩盖症状，不能修复历史恢复的一致性问题。
 
+### 跨 Run 模型历史投影
+
+后续 Run 的模型上下文由 Runtime Store 通过唯一的只读 model-history projector 生成，不使用 Frontend 消息数组，也不把 UI projection 误当成模型输入。当前投影保留：
+
+- User Message 中按 Part 排列的非空文本与附件；附件只从 Attachment Store 读取 bytes，并转成 AI SDK 标准 file content；
+- System Message 的 system role 与文本；
+- Assistant Message 中按 Part 和 step 排列的 text、reasoning 与 tool call；
+- 每个工具调用的原 Provider tool name、规范化 input、持久化 output/error 和稳定 AI SDK call ID；旧记录没有 adapter ID 时才回退到稳定 Runtime ToolCall ID；
+- completed、error 与 interrupted 工具的终态结果。历史中的 pending、validating、waiting-for-permission 或 running 调用只在模型视图中确定性收敛为 interrupted error result，确保不存在 dangling tool call。
+
+该投影不会执行工具、创建或消费 Permission、重新打开审批，也不会修改历史 ToolCall。Source、Diff、Retry、Compaction、usage/cost、EventBus/SSE 生命周期、UI 展开状态和调试信息不进入模型上下文。工具输出直接使用 Tool Core 已经持久化的规范化、有界 `ToolOutput`，projector 不再做第二次隐藏摘要或截断。
+
+工具在 Runtime 和模型 adapter 上具有两个不可混淆的稳定身份：`ToolPart.toolName` 保存 Runtime canonical ID（例如 `web.fetch`），供 Tool Core、审计和 UI 使用；`ToolPart.metadata.providerToolName` 保存 AI SDK 实际暴露给模型的名称（例如 `np__web__fetch`）。model-history projector 必须使用已持久化的 Provider tool name，并让 tool-call 与 tool-result 使用同一名称。仅对缺少该 metadata 的旧 ToolPart 回退到 `part.toolName`；Runtime 不迁移旧事实，也不根据当前 registry 猜测旧 Provider 名称。
+
+AssistantMessage 已持久化的 `providerId/modelId` 决定 reasoning 兼容策略。目标 Run 与历史消息的 Provider 和 Model 都完全相同时，reasoning 仍以 reasoning part 重放，text/reasoning/tool call 上 AI SDK 提供的 `providerMetadata` 作为对应 `providerOptions` 重放；Anthropic signed/adaptive thinking 所需的空文本结构分隔会保留为单个空格。任一项不同时，非空 reasoning 降级成普通 Assistant text，空白 reasoning 不注入文本，并移除旧 text/reasoning/tool call 的 Provider metadata；普通文本、工具调用和工具结果继续保留。Runtime 不跨 Provider 翻译或伪造 metadata。
+
+`providerMetadata` 在 AI SDK text、reasoning 与 tool call 的 start/delta/end 生命周期中作为不透明 JSON 聚合：start 建立当前值，后续 delta/end 只有实际携带 metadata 时才覆盖，最终值随 Part 通过 SQLite round-trip 保存。reasoning 文本不做 `trim`，以保持签名块结构和原始块内容。
+
+上述兼容投影只执行一次，随后只请求一次用户选择的目标模型。若 AI SDK 或 Provider 仍拒绝历史，Runtime 不回退旧模型、不删除更多历史重试，也不自动生成兼容摘要。
+
+### 模型执行错误透明性
+
+同步模型调用、AI SDK full stream、UI message stream 和 Permission continuation bootstrap 的失败统一收敛为一个 failed Run 与一个 Assistant error 终态。AI SDK full stream 中标准的 `{ type: "error", error }` part 会立即进入统一失败路径；SDK 随后发送的 `finishReason: "error"` 不得把 failed 终态覆盖为 completed。多层同时观察到同一异常时，Runner 只允许第一次终态写入，并且只产生一个 `runtime.error` durable event。
+
+AI SDK 的 UI `onError` 同时承担模型错误、无效工具输入和工具执行错误的文本序列化，因此 Runtime 必须先区分错误归属：未被工具生命周期表达的 UI stream 错误进入上述 Run 失败路径；`InvalidToolInputError`、`NoSuchToolError`、tool-call repair error 以及已由 Tool Core 观察到的执行错误继续留在对应 ToolPart，不得被重复提升为 Provider error card。两类正文都使用同一逐字符保留与精确 secret 脱敏规则。
+
+失败终态保存错误发生前已经聚合的全部 semantic parts，包括 partial text、reasoning 和工具事实；未终态 ToolPart 在保存 AssistantMessage 前 fail closed 为 error，相应未完成 ToolCall 也收敛到 error。这样 Provider 在输出一部分内容后失败时，Store、Snapshot 和下一 Run 都不会遗失错误前已经发生的语义事实。Conversation 同时退出 busy。默认 adapter 保留 full-stream facts consumer 的完成 Promise；UI response 不缓冲已生成内容，但在关闭前等待该 Promise，保证客户端观察到响应结束时相应终态已经写入 Store。
+
+RuntimeError 保留 AI SDK/Provider 原始 `name` 和逐字符 `message`，只在上游实际提供时保存 `statusCode` 与 `isRetryable`。stack、HTTP headers、request/response body、完整 Provider response 与 credential 不进入 Runtime Store、SSE part 或前端 metadata。若 message 精确包含 Runtime 当前持有的完整 API key，只替换该精确字符串为 `[REDACTED]`；不使用宽泛正则改写 URL、模型名、request ID、状态码或 Provider 解释文本。
+
+SSE 继续使用 AI SDK UI message stream 的 `{ type: "error", errorText: <message> }` envelope。Snapshot 恢复同一 AssistantMessage 时复用 Store 中相同的 message。Workbench 可以在原消息位置添加本地“执行失败”标签、有限高度滚动和复制动作，但正文不翻译、不解释、不截断，也不与 assistant-ui 的通用错误卡重复显示。
+
+自动上下文压缩、token 预算、摘要 checkpoint 和不可压缩工具安全账本尚未实现；它们属于后续独立能力，不能通过退化本节的完整历史 projector 来实现。
+
 ## 事件持久化和磁盘写入策略
 
 Runner Core 必须把磁盘写入压力作为基础设计问题，而不是后期性能优化。SQLite 可以通过 WAL、`synchronous=NORMAL`、`busy_timeout`、合理 cache 和 checkpoint 策略降低写入成本，但这些只能作为第二层保护。第一层保护必须来自事件模型：**不把高频 delta 变成 durable event。**

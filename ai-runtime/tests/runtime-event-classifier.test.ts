@@ -16,6 +16,10 @@ describe("Runtime event classifier", () => {
       persistence: "durable-event",
       reason: "runtime semantic boundary",
     });
+    expect(classifyRuntimeEvent("runtime.error")).toEqual({
+      persistence: "durable-event",
+      reason: "runtime semantic boundary",
+    });
     expect(classifyRuntimeEvent("permission.resolved").persistence).toBe("durable-event");
     expect(classifyRuntimeEvent("diff.proposed").persistence).toBe("durable-event");
   });

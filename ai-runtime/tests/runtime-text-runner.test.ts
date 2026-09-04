@@ -7,6 +7,7 @@ import {
   RuntimeTextRunner,
   ActiveRunRegistry,
   RuntimeToolRegistry,
+  projectMessageToAiSdkUIMessage,
   type GenerateConversationTitle,
   type RuntimeStreamText,
   type RuntimeTextRunnerDependencies,
@@ -84,9 +85,12 @@ function failingStream(error: Error): RuntimeStreamText {
   return (input) => {
     void input.onError?.({ error });
     return {
-      toUIMessageStreamResponse: () =>
+      toUIMessageStreamResponse: (options) =>
         new Response(
-          `data: ${JSON.stringify({ type: "error", message: error.message })}\n\n`,
+          `data: ${JSON.stringify({
+            type: "error",
+            errorText: options?.onError?.(error) ?? error.message,
+          })}\n\n`,
           {
             headers: { "content-type": "text/event-stream" },
           },
@@ -117,6 +121,7 @@ function createRunner(
     autoApproveMaxRisk: "none" | "low" | "medium";
   },
   resolveLanguageModel?: RuntimeTextRunnerDependencies["resolveLanguageModel"],
+  getErrorMessageSecrets?: () => readonly string[],
 ) {
   const db = openRuntimeDatabase(":memory:");
   const store = new RuntimeSqliteStore(db);
@@ -147,6 +152,7 @@ function createRunner(
     streamText,
     generateConversationTitle,
     getToolApprovalPolicy,
+    getErrorMessageSecrets,
   });
 
   return { db, store, runner };
@@ -651,12 +657,38 @@ describe("RuntimeTextRunner", () => {
       permissionId: permission.id,
       approved: true,
     }]);
-    expect(await failedContinuation.response.text()).toContain("模型执行失败");
+    expect(await failedContinuation.response.text()).toContain(
+      "Continuation bootstrap failed",
+    );
 
     expect(store.getRun(waitingRun.id)?.status).toBe("failed");
     expect(store.getConversation(waitingRun.conversationId)?.status.type).toBe("error");
     expect(store.getPermission(permission.id)?.status).toBe("approved");
     expect(getToolCall(permission.toolCallId)?.state).toBe("error");
+    const failedMessage = store.getMessage(
+      failedContinuation.started.assistantMessage.id,
+    );
+    const failedToolPart = failedMessage?.parts.find(
+      (part) => part.type === "tool",
+    );
+    expect(failedToolPart).toMatchObject({
+      type: "tool",
+      state: {
+        status: "error",
+        error: {
+          code: "INTERNAL_ERROR",
+          message: "Continuation bootstrap failed",
+        },
+      },
+    });
+    expect(
+      projectMessageToAiSdkUIMessage(failedMessage!).parts.find(
+        (part) => part.type.startsWith("tool-"),
+      ),
+    ).toMatchObject({
+      state: "output-error",
+      errorText: "Continuation bootstrap failed",
+    });
     expect(modelResolutionCount).toBe(4);
 
     db.close();
@@ -732,6 +764,9 @@ describe("RuntimeTextRunner", () => {
               toolCallId: "call_real_approval",
               toolName: "np__web__fetch",
               input: "{\"url\":\"https://example.com\"}",
+              providerMetadata: {
+                test: { itemId: "provider_tool_call_1" },
+              },
             }]
           : [
               { type: "text-start" as const, id: "text-real-approval" },
@@ -796,6 +831,9 @@ describe("RuntimeTextRunner", () => {
       metadata: {
         aiSdkToolCallId: "call_real_approval",
         aiSdkApprovalId: expect.any(String),
+        providerMetadata: {
+          test: { itemId: "provider_tool_call_1" },
+        },
       },
     });
     expect(executions).toBe(0);
@@ -814,6 +852,11 @@ describe("RuntimeTextRunner", () => {
         expect.objectContaining({
           type: "tool",
           state: expect.objectContaining({ status: "completed" }),
+          metadata: expect.objectContaining({
+            providerMetadata: {
+              test: { itemId: "provider_tool_call_1" },
+            },
+          }),
         }),
         expect.objectContaining({
           type: "text",
@@ -859,6 +902,108 @@ describe("RuntimeTextRunner", () => {
           message: "Denied in test",
         },
       },
+    });
+
+    db.close();
+  });
+
+  test("persists tool-input-end provider metadata as the final tool value", async () => {
+    let modelCalls = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        const content = modelCalls === 1
+          ? [
+              {
+                type: "tool-input-start" as const,
+                id: "call_streamed_metadata",
+                toolName: "np__web__fetch",
+                providerMetadata: { test: { stage: "tool-input-start" } },
+              },
+              {
+                type: "tool-input-delta" as const,
+                id: "call_streamed_metadata",
+                delta: "{\"url\":\"https://example.com\"}",
+                providerMetadata: { test: { stage: "tool-input-delta" } },
+              },
+              {
+                type: "tool-input-end" as const,
+                id: "call_streamed_metadata",
+                providerMetadata: { test: { stage: "tool-input-end" } },
+              },
+              {
+                type: "tool-call" as const,
+                toolCallId: "call_streamed_metadata",
+                toolName: "np__web__fetch",
+                input: "{\"url\":\"https://example.com\"}",
+              },
+            ]
+          : [
+              { type: "text-start" as const, id: "text-after-tool" },
+              {
+                type: "text-delta" as const,
+                id: "text-after-tool",
+                delta: "Tool metadata preserved",
+              },
+              { type: "text-end" as const, id: "text-after-tool" },
+            ];
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              ...content,
+              {
+                type: "finish" as const,
+                finishReason: {
+                  unified: modelCalls === 1
+                    ? "tool-calls" as const
+                    : "stop" as const,
+                  raw: undefined,
+                },
+                logprobs: undefined,
+                usage: {
+                  inputTokens: {
+                    total: 4,
+                    noCache: 4,
+                    cacheRead: undefined,
+                    cacheWrite: undefined,
+                  },
+                  outputTokens: {
+                    total: 2,
+                    text: modelCalls === 1 ? 0 : 2,
+                    reasoning: 0,
+                  },
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const { db, store, runner } = createRunnerWithModel(
+      model,
+      createWebRegistry(),
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Fetch the page",
+      agentMode: "agent",
+    });
+    await result.response.text();
+
+    expect(modelCalls).toBe(2);
+    expect(
+      store
+        .getMessage(result.started.assistantMessage.id)
+        ?.parts.find((part) => part.type === "tool"),
+    ).toMatchObject({
+      type: "tool",
+      metadata: {
+        aiSdkToolCallId: "call_streamed_metadata",
+        providerMetadata: { test: { stage: "tool-input-end" } },
+      },
+      state: { status: "completed" },
     });
 
     db.close();
@@ -1211,8 +1356,26 @@ describe("RuntimeTextRunner", () => {
     db.close();
   });
 
-  test("records failed run state when streamText reports an error", async () => {
-    const { db, store, runner } = createRunner(failingStream(new Error("provider down")));
+  test("records the exact safe provider error once when streamText reports an error", async () => {
+    const providerError = Object.assign(
+      new Error("provider down\nrequest id: req_123; key=sk-runtime-secret"),
+      {
+        name: "APICallError",
+        statusCode: 429,
+        isRetryable: true,
+        headers: { authorization: "Bearer sk-runtime-secret" },
+        responseBody: "must not be persisted",
+      },
+    );
+    const { db, store, runner } = createRunner(
+      failingStream(providerError),
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      () => ["sk-runtime-secret"],
+    );
 
     const result = await runner.streamText({
       providerId: "openai",
@@ -1220,17 +1383,184 @@ describe("RuntimeTextRunner", () => {
       text: "Say hello",
     });
 
-    await result.response.text();
+    const responseText = await result.response.text();
 
     const run = store.getRun(result.started.run.id);
     const message = store.getMessage(result.started.assistantMessage.id);
+    const expectedError = {
+      name: "APICallError",
+      data: {
+        message: "provider down\nrequest id: req_123; key=[REDACTED]",
+        statusCode: 429,
+        isRetryable: true,
+      },
+    };
 
     expect(run?.status).toBe("failed");
-    expect(run?.error?.name).toBe("APIError");
+    expect(run?.error).toEqual(expectedError);
+    expect(responseText).toContain(
+      JSON.stringify({
+        type: "error",
+        errorText: "provider down\nrequest id: req_123; key=[REDACTED]",
+      }),
+    );
     expect(message?.role).toBe("assistant");
+    expect(message && "status" in message ? message.status : undefined).toEqual({
+      type: "error",
+      error: expectedError,
+    });
+    expect(store.listMessages(result.started.conversation.id).filter(
+      (candidate) => candidate.role === "assistant" && candidate.status.type === "error",
+    )).toHaveLength(1);
+    expect(projectMessageToAiSdkUIMessage(message!).metadata?.custom).toMatchObject({
+      nexus: {
+        status: {
+          type: "error",
+          error: expectedError,
+        },
+      },
+    });
+
+    db.close();
+  });
+
+  test("persists a UI message stream error through the unified failure path", async () => {
+    const uiStreamError = new Error(
+      "UI message conversion failed\nrequest id: ui_stream_1",
+    );
+    uiStreamError.name = "UIMessageStreamError";
+    const streamText: RuntimeStreamText = () => ({
+      toUIMessageStreamResponse: (options) => {
+        const errorText = options?.onError?.(uiStreamError) ?? uiStreamError.message;
+        return new Response(
+          `data: ${JSON.stringify({ type: "error", errorText })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const { db, store, runner } = createRunner(streamText);
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Trigger a UI stream failure",
+    });
+    const responseText = await result.response.text();
+
+    expect(responseText).toContain(
+      "UI message conversion failed\\nrequest id: ui_stream_1",
+    );
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      finish: "error",
+      error: {
+        name: "UIMessageStreamError",
+        data: { message: uiStreamError.message },
+      },
+    });
+    expect(store.getMessage(result.started.assistantMessage.id)).toMatchObject({
+      role: "assistant",
+      status: {
+        type: "error",
+        error: {
+          name: "UIMessageStreamError",
+          data: { message: uiStreamError.message },
+        },
+      },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+
+    db.close();
+  });
+
+  test("preserves and terminalizes a Provider tool part emitted before failure", async () => {
+    const error = new Error("provider failed after emitting a tool call");
+    const streamText: RuntimeStreamText = async (input) => {
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-call",
+          toolCallId: "call_before_failure",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+        },
+      });
+      await input.onError?.({ error });
+      return {
+        toUIMessageStreamResponse: (options) => new Response(
+          `data: ${JSON.stringify({
+            type: "error",
+            errorText: options?.onError?.(error) ?? error.message,
+          })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      createWebRegistry(),
+      undefined,
+      true,
+    );
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Fetch a URL",
+      agentMode: "agent",
+    });
+    await result.response.text();
+
+    const message = store.getMessage(result.started.assistantMessage.id);
     expect(message && "status" in message ? message.status.type : undefined).toBe(
       "error",
     );
+    expect(message?.parts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "tool",
+        toolName: "web.fetch",
+        metadata: expect.objectContaining({
+          aiSdkToolCallId: "call_before_failure",
+          providerToolName: "np__web__fetch",
+        }),
+        state: expect.objectContaining({
+          status: "error",
+          input: { url: "https://example.com" },
+        }),
+      }),
+    ]));
+
+    db.close();
+  });
+
+  test("uses the exact provider message when streamText throws synchronously", async () => {
+    const error = new Error("maximum context length exceeded\nrequest id: sync_1");
+    error.name = "ContextLengthError";
+    const streamText: RuntimeStreamText = () => {
+      throw error;
+    };
+    const { db, store, runner } = createRunner(streamText);
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Say hello",
+    });
+    const responseText = await result.response.text();
+
+    expect(responseText).toContain(
+      JSON.stringify({
+        type: "error",
+        errorText: "maximum context length exceeded\nrequest id: sync_1",
+      }),
+    );
+    expect(store.getRun(result.started.run.id)?.error).toEqual({
+      name: "ContextLengthError",
+      data: {
+        message: "maximum context length exceeded\nrequest id: sync_1",
+      },
+    });
 
     db.close();
   });
@@ -1408,10 +1738,111 @@ describe("RuntimeTextRunner", () => {
 
     expect(capturedInputs[1]?.prompt).toBeUndefined();
     expect(capturedInputs[1]?.messages).toEqual([
-      { role: "user", content: "我的名字叫 Alice。" },
-      { role: "assistant", content: "Answer" },
-      { role: "user", content: "我叫什么名字？" },
+      {
+        role: "user",
+        content: [{ type: "text", text: "我的名字叫 Alice。" }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Answer" }],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "我叫什么名字？" }],
+      },
     ]);
+
+    db.close();
+  });
+
+  test("replays persisted provider metadata only to the exact same model", async () => {
+    const capturedMessages: unknown[][] = [];
+    let callCount = 0;
+    const streamText: RuntimeStreamText = (input) => {
+      callCount += 1;
+      capturedMessages.push(structuredClone(input.messages ?? []));
+      if (callCount === 1) {
+        void input.onChunk?.({
+          chunk: { type: "reasoning-start", id: "reasoning-history" },
+        });
+        void input.onChunk?.({
+          chunk: {
+            type: "reasoning-delta",
+            id: "reasoning-history",
+            text: "Stored reasoning",
+          },
+        });
+        void input.onChunk?.({
+          chunk: {
+            type: "reasoning-end",
+            id: "reasoning-history",
+            providerMetadata: { test: { signature: "stored-signature" } },
+          },
+        });
+        void input.onChunk?.({
+          chunk: {
+            type: "text-delta",
+            id: "text-history",
+            text: "Stored answer",
+            providerMetadata: { test: { itemId: "stored-text" } },
+          },
+        });
+      } else {
+        void input.onChunk?.({ chunk: { type: "text-delta", text: "Next" } });
+      }
+      void input.onFinish?.({ finishReason: "stop" });
+      return {
+        toUIMessageStreamResponse: () => new Response("data: {}\n\n", {
+          headers: { "content-type": "text/event-stream" },
+        }),
+      };
+    };
+    const { db, runner } = createRunner(streamText);
+
+    const first = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "First",
+    });
+    await first.response.text();
+    const sameModel = await runner.streamText({
+      conversationId: first.started.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Second",
+    });
+    await sameModel.response.text();
+    const switchedModel = await runner.streamText({
+      conversationId: first.started.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-5",
+      text: "Third",
+    });
+    await switchedModel.response.text();
+
+    expect(capturedMessages[1]?.[1]).toEqual({
+      role: "assistant",
+      content: [
+        {
+          type: "reasoning",
+          text: "Stored reasoning",
+          providerOptions: { test: { signature: "stored-signature" } },
+        },
+        {
+          type: "text",
+          text: "Stored answer",
+          providerOptions: { test: { itemId: "stored-text" } },
+        },
+      ],
+    });
+    expect(capturedMessages[2]?.[1]).toEqual({
+      role: "assistant",
+      content: [
+        { type: "text", text: "Stored reasoning" },
+        { type: "text", text: "Stored answer" },
+      ],
+    });
+    expect(callCount).toBe(3);
 
     db.close();
   });
@@ -1676,6 +2107,250 @@ describe("RuntimeTextRunner", () => {
         state: "completed",
       }),
     ]);
+
+    db.close();
+  });
+
+  test("replays the persisted Provider tool name through a real Runtime registry", async () => {
+    let streamCallCount = 0;
+    let followUpMessages: unknown[] | undefined;
+    const streamText: RuntimeStreamText = async (input) => {
+      streamCallCount += 1;
+      if (streamCallCount === 1) {
+        const toolCall = {
+          type: "tool-call" as const,
+          toolCallId: "call_web_history",
+          toolName: "np__web__fetch",
+          input: { url: "https://example.com" },
+        };
+        await input.onToolCallStart?.({ stepNumber: 0, toolCall });
+        const output = await input.tools?.np__web__fetch.execute?.(
+          toolCall.input,
+          {
+            toolCallId: toolCall.toolCallId,
+            messages: [],
+            abortSignal: undefined,
+            context: undefined,
+          },
+        );
+        await input.onToolCallFinish?.({
+          stepNumber: 0,
+          toolCall,
+          success: true,
+          output,
+          durationMs: 1,
+        });
+        await input.onFinish?.({ finishReason: "stop" });
+      } else {
+        followUpMessages = structuredClone(input.messages ?? []);
+        await input.onChunk?.({ chunk: { type: "text-delta", text: "Follow-up" } });
+        await input.onFinish?.({ finishReason: "stop" });
+      }
+
+      return {
+        toUIMessageStreamResponse: () => new Response("data: {}\n\n", {
+          headers: { "content-type": "text/event-stream" },
+        }),
+      };
+    };
+    const { db, store, runner } = createRunnerWithToolMetadata(streamText);
+
+    const first = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Fetch https://example.com",
+      agentMode: "agent",
+    });
+    await first.response.text();
+    const firstMessage = store.getMessage(first.started.assistantMessage.id);
+    const persistedTool = firstMessage?.parts.find((part) => part.type === "tool");
+
+    expect(persistedTool).toMatchObject({
+      type: "tool",
+      toolName: "web.fetch",
+      metadata: {
+        aiSdkToolCallId: "call_web_history",
+        providerToolName: "np__web__fetch",
+      },
+    });
+
+    const second = await runner.streamText({
+      conversationId: first.started.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "What did the tool return?",
+      agentMode: "agent",
+    });
+    await second.response.text();
+
+    expect(followUpMessages?.map(
+      (message) => (message as { role: string }).role,
+    )).toEqual(["user", "assistant", "tool", "user"]);
+    expect(followUpMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: "assistant",
+        content: expect.arrayContaining([
+          expect.objectContaining({
+            type: "tool-call",
+            toolCallId: "call_web_history",
+            toolName: "np__web__fetch",
+            input: { url: "https://example.com" },
+          }),
+        ]),
+      }),
+      expect.objectContaining({
+        role: "tool",
+        content: expect.arrayContaining([
+          expect.objectContaining({
+            type: "tool-result",
+            toolCallId: "call_web_history",
+            toolName: "np__web__fetch",
+            output: {
+              type: "json",
+              value: expect.objectContaining({
+                data: {
+                  finalUrl: "https://example.com",
+                  title: "Example",
+                  preview: "Example page",
+                },
+                display: expect.objectContaining({
+                  summary: "Fetched.",
+                }),
+              }),
+            },
+          }),
+        ]),
+      }),
+    ]));
+    expect(store.listToolCallsByRun(first.started.run.id)).toHaveLength(1);
+    expect(store.listToolCallsByRun(second.started.run.id)).toHaveLength(0);
+
+    db.close();
+  });
+
+  test("persists a real AI SDK error part once and keeps earlier semantic parts", async () => {
+    const providerError = new Error(
+      "maximum context length exceeded\nrequest id: stream_real_1",
+    );
+    providerError.name = "ContextLengthError";
+    let modelCalls = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "reasoning-start" as const, id: "partial-reasoning" },
+              {
+                type: "reasoning-delta" as const,
+                id: "partial-reasoning",
+                delta: "Reasoning before failure",
+              },
+              { type: "reasoning-end" as const, id: "partial-reasoning" },
+              { type: "text-start" as const, id: "partial-text" },
+              {
+                type: "text-delta" as const,
+                id: "partial-text",
+                delta: "Partial before failure",
+              },
+              { type: "text-end" as const, id: "partial-text" },
+              { type: "error" as const, error: providerError },
+            ],
+          }),
+        };
+      },
+    });
+    const { db, store, runner } = createRunnerWithModel(model);
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Trigger a Provider stream failure",
+    });
+    const responseText = await result.response.text();
+
+    const storedRun = store.getRun(result.started.run.id);
+    const storedMessage = store.getMessage(result.started.assistantMessage.id);
+    const storedConversation = store.getConversation(result.started.conversation.id);
+    expect(modelCalls).toBe(1);
+    expect(storedRun).toMatchObject({
+      status: "failed",
+      finish: "error",
+      error: {
+        name: "ContextLengthError",
+        data: {
+          message: "maximum context length exceeded\nrequest id: stream_real_1",
+        },
+      },
+    });
+    expect(storedMessage).toMatchObject({
+      role: "assistant",
+      status: {
+        type: "error",
+        error: {
+          name: "ContextLengthError",
+          data: {
+            message: "maximum context length exceeded\nrequest id: stream_real_1",
+          },
+        },
+      },
+    });
+    expect(storedMessage?.parts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "reasoning",
+        text: "Reasoning before failure",
+      }),
+      expect.objectContaining({
+        type: "text",
+        text: "Partial before failure",
+      }),
+    ]));
+    expect(storedConversation?.status).toMatchObject({
+      type: "error",
+      error: {
+        name: "ContextLengthError",
+        data: {
+          message: "maximum context length exceeded\nrequest id: stream_real_1",
+        },
+      },
+    });
+    expect(store.listMessages(result.started.conversation.id).filter(
+      (message) => message.role === "assistant" && message.status.type === "error",
+    )).toHaveLength(1);
+    const runtimeErrorEvents = store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    );
+    expect(runtimeErrorEvents).toEqual([
+      expect.objectContaining({
+        type: "runtime.error",
+        properties: {
+          conversationId: result.started.conversation.id,
+          runId: result.started.run.id,
+          error: {
+            name: "ContextLengthError",
+            data: {
+              message: "maximum context length exceeded\nrequest id: stream_real_1",
+            },
+          },
+        },
+      }),
+    ]);
+    expect(projectMessageToAiSdkUIMessage(storedMessage!).metadata?.custom).toMatchObject({
+      nexus: {
+        status: {
+          type: "error",
+          error: {
+            name: "ContextLengthError",
+            data: {
+              message: "maximum context length exceeded\nrequest id: stream_real_1",
+            },
+          },
+        },
+      },
+    });
+    expect(responseText).toContain(
+      "maximum context length exceeded\\nrequest id: stream_real_1",
+    );
 
     db.close();
   });
@@ -2111,22 +2786,40 @@ describe("RuntimeTextRunner", () => {
         doStream: async () => ({
           stream: simulateReadableStream({
             chunks: [
-              { type: "reasoning-start", id: "reasoning-1" },
               {
-                type: "reasoning-delta",
+                type: "reasoning-start",
                 id: "reasoning-1",
-                delta: "Think",
+                providerMetadata: { test: { stage: "reasoning-start" } },
               },
               {
                 type: "reasoning-delta",
                 id: "reasoning-1",
-                delta: " first",
+                delta: " Think",
+              },
+              {
+                type: "reasoning-delta",
+                id: "reasoning-1",
+                delta: " first ",
+                providerMetadata: { test: { stage: "reasoning-delta" } },
               },
               { type: "reasoning-end", id: "reasoning-1" },
-              { type: "text-start", id: "text-1" },
+              {
+                type: "text-start",
+                id: "text-1",
+                providerMetadata: { test: { stage: "text-start" } },
+              },
               { type: "text-delta", id: "text-1", delta: "Hello" },
-              { type: "text-delta", id: "text-1", delta: " AI SDK" },
-              { type: "text-end", id: "text-1" },
+              {
+                type: "text-delta",
+                id: "text-1",
+                delta: " AI SDK",
+                providerMetadata: { test: { stage: "text-delta" } },
+              },
+              {
+                type: "text-end",
+                id: "text-1",
+                providerMetadata: { test: { stage: "text-end" } },
+              },
               {
                 type: "finish",
                 finishReason: { unified: "stop", raw: undefined },
@@ -2161,14 +2854,26 @@ describe("RuntimeTextRunner", () => {
     await result.response.text();
 
     const message = store.getMessage(result.started.assistantMessage.id);
-    expect(message?.parts.map((part) => part.type)).toEqual(["reasoning", "text"]);
-    expect(message?.parts[0]).toMatchObject({
-      type: "reasoning",
-      text: "Think first",
-    });
+    expect(message?.parts.map((part) => part.type)).toEqual([
+      "step-start",
+      "reasoning",
+      "text",
+    ]);
     expect(message?.parts[1]).toMatchObject({
+      type: "reasoning",
+      text: " Think first ",
+      metadata: {
+        aiSdkReasoningId: "reasoning-1",
+        providerMetadata: { test: { stage: "reasoning-delta" } },
+      },
+    });
+    expect(message?.parts[2]).toMatchObject({
       type: "text",
       text: "Hello AI SDK",
+      metadata: {
+        aiSdkTextId: "text-1",
+        providerMetadata: { test: { stage: "text-end" } },
+      },
     });
     expect(store.getRun(result.started.run.id)?.usage).toEqual({
       input: 4,
@@ -2240,16 +2945,17 @@ describe("RuntimeTextRunner", () => {
 
     const message = store.getMessage(result.started.assistantMessage.id);
     expect(message?.parts.map((part) => part.type)).toEqual([
+      "step-start",
       "reasoning",
       "text",
       "reasoning",
       "text",
     ]);
-    expect(message?.parts[0]).toMatchObject({
+    expect(message?.parts[1]).toMatchObject({
       type: "reasoning",
       text: "First",
     });
-    expect(message?.parts[2]).toMatchObject({
+    expect(message?.parts[3]).toMatchObject({
       type: "reasoning",
       text: "Second",
     });
