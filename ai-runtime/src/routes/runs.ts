@@ -10,6 +10,7 @@ import {
   RuntimeTextRunner,
   RuntimeConversationNotFoundError,
   RuntimeConversationBusyError,
+  RuntimeConversationRevisionConflictError,
   RuntimeMessageNotEditableError,
   RuntimePermissionResponseMismatchError,
   RuntimePermissionStrongConfirmationError,
@@ -139,6 +140,16 @@ export function runRoutes(deps: RunRouteDeps) {
 
         if (error instanceof RuntimeAttachmentError) {
           return Response.json(attachmentErrorEnvelope(error), { status: error.status });
+        }
+
+        if (error instanceof RuntimeConversationRevisionConflictError) {
+          return Response.json(
+            {
+              code: "CONVERSATION_REVISION_CONFLICT",
+              message: error.message,
+            },
+            { status: 409 },
+          );
         }
 
         if (
@@ -476,7 +487,7 @@ const runCreateRequestSchema: OpenApiSchema = {
     replace_from_message_id: {
       ...stringSchema,
       description:
-        "编辑既有用户消息后从该处继续时的目标 message id；携带时必须同时提供 conversation_id。Runtime 会移除该消息及其后的会话历史，再创建新的 Run。",
+        "编辑既有用户消息后从该处继续时的目标 message id；携带时必须同时提供 conversation_id。Runtime 会追加创建 replacement 分支：新的 Run supersedes 目标 Run，目标 Run 及其后代仍保留在 transcript 中，active 视图切换到新的 lineage。",
     },
     model: runModelSelectionSchema,
     agent_mode: agentModeSchema,

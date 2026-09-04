@@ -3,6 +3,8 @@ import { z } from "zod";
 const unknownRecordSchema = z.record(z.string(), z.unknown());
 const optionalUnknownRecordSchema = unknownRecordSchema.optional();
 
+export const messageHistoryViewSchema = z.enum(["active", "transcript"]);
+
 export const timeCreatedSchema = z.object({
   created: z.number(),
 });
@@ -94,6 +96,8 @@ export const conversationSchema = z.object({
   title: z.string(),
   version: z.string(),
   status: conversationStatusSchema,
+  activeHeadRunId: z.string().optional(),
+  revision: z.number().int().nonnegative(),
   parentId: z.string().optional(),
   summary: z
     .object({
@@ -220,6 +224,8 @@ export const runSchema = z
   .object({
     id: z.string(),
     conversationId: z.string(),
+    parentRunId: z.string().optional(),
+    supersedesRunId: z.string().optional(),
     parentMessageId: z.string().optional(),
     assistantMessageId: z.string().optional(),
     agentMode: agentModeSchema,
@@ -260,7 +266,23 @@ export const runSchema = z
     }),
     metadata: optionalUnknownRecordSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((run, context) => {
+    if (run.parentRunId === run.id) {
+      context.addIssue({
+        code: "custom",
+        path: ["parentRunId"],
+        message: "Run cannot be its own parent",
+      });
+    }
+    if (run.supersedesRunId === run.id) {
+      context.addIssue({
+        code: "custom",
+        path: ["supersedesRunId"],
+        message: "Run cannot supersede itself",
+      });
+    }
+  });
 
 const diffLineSchema = z.discriminatedUnion("type", [
   z.object({

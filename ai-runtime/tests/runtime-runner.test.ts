@@ -4,8 +4,10 @@ import {
   RuntimeEventBus,
   RuntimeRunner,
   RuntimeSqliteStore,
+  type Permission,
   type RuntimeError,
   type TextPart,
+  type ToolCall,
 } from "../src/runtime";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
 
@@ -193,57 +195,139 @@ describe("RuntimeRunner", () => {
     db.close();
   });
 
-  test("replaces an arbitrary user turn by removing its message tail and Run artifacts", () => {
+  test("edits an active-lineage user turn by appending a replacement branch", () => {
     const { db, store, runner } = createRunner();
     const first = runner.start({
       providerId: "openai",
       modelId: "gpt-4o",
-      text: "First question",
+      text: "Question A",
     });
-    runner.completeText(first, "First answer");
+    runner.completeText(first, "Answer A");
     const second = runner.start({
       conversationId: first.conversation.id,
       providerId: "openai",
       modelId: "gpt-4o",
-      text: "Second question",
+      text: "Question B",
     });
-    runner.completeText(second, "Second answer");
+    runner.completeText(second, "Answer B");
     const third = runner.start({
       conversationId: first.conversation.id,
       providerId: "openai",
       modelId: "gpt-4o",
-      text: "Third question",
+      text: "Question C",
     });
-    runner.completeText(third, "Third answer");
+    runner.completeText(third, "Answer C");
+    const fourth = runner.start({
+      conversationId: first.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question D",
+    });
+    runner.completeText(fourth, "Answer D");
+    const oldBranchToolCall: ToolCall = {
+      id: "tool_old_branch",
+      conversationId: first.conversation.id,
+      runId: fourth.run.id,
+      messageId: fourth.assistantMessage.id,
+      toolName: "system.current_time",
+      input: {},
+      state: "completed",
+      result: { ok: true, summary: "Old branch side effect record", data: {} },
+      time: { created: 100, started: 100, completed: 101 },
+    };
+    const oldBranchPermission: Permission = {
+      id: "perm_old_branch",
+      conversationId: first.conversation.id,
+      runId: fourth.run.id,
+      messageId: fourth.assistantMessage.id,
+      toolCallId: oldBranchToolCall.id,
+      status: "approved",
+      toolId: "system.current_time",
+      title: "Old branch permission",
+      risk: { level: "low", reversible: true, sideEffects: ["none"] },
+      confirmation: { level: "standard" },
+      decision: { source: "user", decidedAt: 100 },
+      createdAt: 100,
+    };
+    store.saveToolCall(oldBranchToolCall);
+    store.savePermission(oldBranchPermission);
+    const oldBranchFactsBefore = {
+      thirdEventIds: store.listEventsByRun(third.run.id).map((event) => event.id),
+      thirdTraceIds: store.listTraces(third.run.id).map((trace) => trace.id),
+      fourthEventIds: store.listEventsByRun(fourth.run.id).map((event) => event.id),
+      fourthTraceIds: store.listTraces(fourth.run.id).map((trace) => trace.id),
+    };
+    for (const ids of Object.values(oldBranchFactsBefore)) {
+      expect(ids).not.toEqual([]);
+    }
 
     const replacement = runner.start({
       conversationId: first.conversation.id,
-      replaceFromMessageId: second.userMessage.id,
+      replaceFromMessageId: third.userMessage.id,
       providerId: "openai",
       modelId: "gpt-4o",
-      text: "Rewritten second question",
+      text: "Question E",
     });
 
-    expect(store.listMessages(first.conversation.id).map((message) => [
-      message.role,
-      message.parts.find((part) => part.type === "text")?.type === "text"
-        ? message.parts.find((part) => part.type === "text")?.text
-        : null,
-    ])).toEqual([
-      ["user", "First question"],
-      ["assistant", "First answer"],
-      ["user", "Rewritten second question"],
-      ["assistant", null],
+    expect(store.listActiveLineageMessages(first.conversation.id).map((message) => message.id))
+      .toEqual([
+        first.userMessage.id,
+        first.assistantMessage.id,
+        second.userMessage.id,
+        second.assistantMessage.id,
+        replacement.userMessage.id,
+        replacement.assistantMessage.id,
+      ]);
+    expect(store.listLineageMessages(first.conversation.id, fourth.run.id).map(
+      (message) => message.id,
+    )).toEqual([
+      first.userMessage.id,
+      first.assistantMessage.id,
+      second.userMessage.id,
+      second.assistantMessage.id,
+      third.userMessage.id,
+      third.assistantMessage.id,
+      fourth.userMessage.id,
+      fourth.assistantMessage.id,
     ]);
-    expect(store.getRun(first.run.id)).not.toBeNull();
-    expect(store.getRun(second.run.id)).toBeNull();
-    expect(store.getRun(third.run.id)).toBeNull();
-    expect(store.getMessage(second.userMessage.id)).toBeNull();
-    expect(store.getMessage(third.assistantMessage.id)).toBeNull();
-    expect(store.listEventsByRun(second.run.id)).toEqual([]);
-    expect(store.listTraces(third.run.id)).toEqual([]);
+    expect(store.listTranscriptMessages(first.conversation.id).map((message) => message.id))
+      .toEqual([
+        first.userMessage.id,
+        first.assistantMessage.id,
+        second.userMessage.id,
+        second.assistantMessage.id,
+        third.userMessage.id,
+        third.assistantMessage.id,
+        fourth.userMessage.id,
+        fourth.assistantMessage.id,
+        replacement.userMessage.id,
+        replacement.assistantMessage.id,
+      ]);
+    expect(store.getRun(replacement.run.id)).toMatchObject({
+      parentRunId: second.run.id,
+      supersedesRunId: third.run.id,
+      parentMessageId: replacement.userMessage.id,
+    });
+    expect(store.getRun(third.run.id)).not.toBeNull();
+    expect(store.getRun(fourth.run.id)).not.toBeNull();
+    expect(store.getMessage(third.userMessage.id)).not.toBeNull();
+    expect(store.getMessage(fourth.assistantMessage.id)).not.toBeNull();
+    expect(store.listEventsByRun(third.run.id).map((event) => event.id)).toEqual(
+      oldBranchFactsBefore.thirdEventIds,
+    );
+    expect(store.listTraces(third.run.id).map((trace) => trace.id)).toEqual(
+      oldBranchFactsBefore.thirdTraceIds,
+    );
+    expect(store.listEventsByRun(fourth.run.id).map((event) => event.id)).toEqual(
+      oldBranchFactsBefore.fourthEventIds,
+    );
+    expect(store.listTraces(fourth.run.id).map((trace) => trace.id)).toEqual(
+      oldBranchFactsBefore.fourthTraceIds,
+    );
+    expect(store.getToolCall(oldBranchToolCall.id)).toEqual(oldBranchToolCall);
+    expect(store.getPermission(oldBranchPermission.id)).toEqual(oldBranchPermission);
     expect(store.listEvents(first.conversation.id).filter((event) => event.type === "message.removed"))
-      .toHaveLength(4);
+      .toHaveLength(0);
     expect(replacement.conversation.status).toEqual({
       type: "busy",
       runId: replacement.run.id,
@@ -284,7 +368,190 @@ describe("RuntimeRunner", () => {
     db.close();
   });
 
-  test("publishes replacement invalidation only after the new message tail is committed", () => {
+  test("rejects normal sends and edits while a Run is waiting for permission", () => {
+    const { db, store, runner } = createRunner();
+    const first = runner.start({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question A",
+    });
+    runner.completeText(first, "Answer A");
+    const waiting = runner.start({
+      conversationId: first.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question B",
+    });
+    const toolCall: ToolCall = {
+      id: "tool_waiting_runner",
+      conversationId: first.conversation.id,
+      runId: waiting.run.id,
+      messageId: waiting.assistantMessage.id,
+      toolName: "test.write",
+      input: { value: "protected" },
+      state: "waiting_for_permission",
+      permissionId: "perm_waiting_runner",
+      time: { created: 1100 },
+    };
+    const permission: Permission = {
+      id: "perm_waiting_runner",
+      conversationId: first.conversation.id,
+      runId: waiting.run.id,
+      messageId: waiting.assistantMessage.id,
+      toolCallId: toolCall.id,
+      status: "pending",
+      toolId: "test.write",
+      title: "Write protected data",
+      risk: {
+        level: "high",
+        reversible: false,
+        sideEffects: ["business_write"],
+      },
+      confirmation: { level: "standard" },
+      createdAt: 1100,
+    };
+    store.commitToolPermissionRequest({
+      toolCall,
+      permission,
+      requestedAt: 1100,
+      eventIds: {
+        tool: "evt_waiting_runner_tool",
+        permission: "evt_waiting_runner_permission",
+        run: "evt_waiting_runner_run",
+        conversation: "evt_waiting_runner_conversation",
+      },
+    });
+
+    const before = {
+      conversation: store.getConversation(first.conversation.id),
+      run: store.getRun(waiting.run.id),
+      toolCall: store.getToolCall(toolCall.id),
+      permission: store.getPermissionByToolCallId(toolCall.id),
+      pendingPermissions: store.listPendingPermissionsByRun(waiting.run.id),
+      messages: store.listTranscriptMessages(first.conversation.id),
+      runs: store.listRunsByConversation(first.conversation.id),
+      events: store.listEvents(first.conversation.id),
+      traces: store.listTraces(waiting.run.id),
+    };
+
+    expect(() =>
+      runner.start({
+        conversationId: first.conversation.id,
+        replaceFromMessageId: first.userMessage.id,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: "Edited question A",
+      })
+    ).toThrow("has an active run");
+    expect(() =>
+      runner.start({
+        conversationId: first.conversation.id,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: "Question C",
+      })
+    ).toThrow("has an active run");
+
+    expect(store.getConversation(first.conversation.id)).toEqual(before.conversation);
+    expect(store.getRun(waiting.run.id)).toEqual(before.run);
+    expect(store.getToolCall(toolCall.id)).toEqual(before.toolCall);
+    expect(store.getPermissionByToolCallId(toolCall.id)).toEqual(before.permission);
+    expect(store.listPendingPermissionsByRun(waiting.run.id)).toEqual(
+      before.pendingPermissions,
+    );
+    expect(store.listTranscriptMessages(first.conversation.id)).toEqual(before.messages);
+    expect(store.listRunsByConversation(first.conversation.id)).toEqual(before.runs);
+    expect(store.listEvents(first.conversation.id)).toEqual(before.events);
+    expect(store.listTraces(waiting.run.id)).toEqual(before.traces);
+    expect(store.getConversation(first.conversation.id)).toMatchObject({
+      activeHeadRunId: waiting.run.id,
+      revision: waiting.conversation.revision,
+      status: {
+        type: "waiting_for_permission",
+        runId: waiting.run.id,
+        permissionId: permission.id,
+      },
+    });
+    expect(store.getRun(waiting.run.id)?.status).toBe("waiting_for_permission");
+    expect(store.getPermissionByToolCallId(toolCall.id)?.status).toBe("pending");
+    expect(store.getToolCall(toolCall.id)?.state).toBe("waiting_for_permission");
+
+    db.close();
+  });
+
+  test("rejects replacing a user message outside the current active lineage", () => {
+    const { db, store, runner } = createRunner();
+    const first = runner.start({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question A",
+    });
+    runner.completeText(first, "Answer A");
+    const second = runner.start({
+      conversationId: first.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question B",
+    });
+    runner.completeText(second, "Answer B");
+    const third = runner.start({
+      conversationId: first.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question C",
+    });
+    const completedThird = runner.completeText(third, "Answer C");
+
+    store.saveConversation({
+      ...completedThird.conversation,
+      activeHeadRunId: second.run.id,
+      revision: completedThird.conversation.revision + 1,
+    });
+
+    expect(() =>
+      runner.start({
+        conversationId: first.conversation.id,
+        replaceFromMessageId: third.userMessage.id,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: "Inactive rewrite",
+      }),
+    ).toThrow("cannot be edited");
+    expect(store.getRun(third.run.id)).not.toBeNull();
+    expect(store.getMessage(third.userMessage.id)).not.toBeNull();
+
+    db.close();
+  });
+
+  test("advances the conversation revision once per accepted Run start only", () => {
+    const { db, store, runner } = createRunner();
+    const first = runner.start({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question A",
+    });
+    expect(first.conversation.revision).toBe(1);
+
+    const completedFirst = runner.completeText(first, "Answer A");
+    expect(completedFirst.conversation.revision).toBe(1);
+    expect(store.getConversation(first.conversation.id)?.revision).toBe(1);
+
+    const second = runner.start({
+      conversationId: first.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Question B",
+    });
+    expect(second.conversation.revision).toBe(2);
+
+    const completedSecond = runner.completeText(second, "Answer B");
+    expect(completedSecond.conversation.revision).toBe(2);
+    expect(store.getConversation(first.conversation.id)?.revision).toBe(2);
+
+    db.close();
+  });
+
+  test("publishes replacement events only after the appended branch is committed", () => {
     const eventBus = new RuntimeEventBus();
     const { db, store, runner } = createRunner({ eventBus });
     const observed: Array<{ type: string; hasReplacement: boolean }> = [];
@@ -322,8 +589,6 @@ describe("RuntimeRunner", () => {
     });
 
     expect(observed.map((event) => event.type)).toEqual([
-      "message.removed",
-      "message.removed",
       "conversation.updated",
       "run.updated",
     ]);

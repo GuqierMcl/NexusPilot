@@ -83,6 +83,7 @@ describe("runtime event envelope", () => {
           title: "New conversation",
           version: "1",
           status: { type: "idle" },
+          revision: 0,
           time: { created: 1, updated: 1 },
         },
       },

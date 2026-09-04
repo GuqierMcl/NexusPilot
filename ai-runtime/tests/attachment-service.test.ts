@@ -15,12 +15,19 @@ import {
   ATTACHMENT_LIMITS,
   RuntimeAttachmentService,
   RuntimeAttachmentSqliteStore,
+  RuntimeRunner,
   RuntimeSqliteStore,
   RuntimeTextRunner,
   RuntimeToolRegistry,
   sanitizeFilename,
+  type AssistantMessage,
+  type Conversation,
+  type Event,
+  type Run,
   type RuntimeStreamText,
   type RuntimeToolNamespace,
+  type TraceEvent,
+  type UserMessage,
 } from "../src/runtime";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
 
@@ -252,6 +259,7 @@ describe("Runtime Attachment Service", () => {
         title: "Attachment",
         version: "1",
         status: { type: "idle" },
+        revision: 0,
         time: { created: 1, updated: 1 },
       });
       runtimeStore.saveMessage({
@@ -286,6 +294,194 @@ describe("Runtime Attachment Service", () => {
     }
   });
 
+  test("rolls back a stale Run start before committing facts or attachment references", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "nexuspilot-attachment-run-cas-"));
+    const db = openRuntimeDatabase(":memory:");
+    const attachmentStore = new RuntimeAttachmentSqliteStore(db);
+    const service = new RuntimeAttachmentService(attachmentStore, dataDir);
+    const runtimeStore = new RuntimeSqliteStore(db);
+    try {
+      await service.initialize();
+      const bytes = new TextEncoder().encode("stale attachment");
+      const upload = service.createUpload({
+        filename: "stale.txt",
+        declaredMediaType: "text/plain",
+        declaredByteLength: bytes.byteLength,
+      });
+      const attachment = await service.upload(upload.id, bytesStream(bytes), bytes.byteLength);
+      const originalConversation: Conversation = {
+        id: "conv_stale_run_start",
+        title: "Stale Run",
+        version: "1",
+        status: { type: "idle" },
+        revision: 1,
+        time: { created: 1, updated: 1 },
+      };
+      runtimeStore.saveConversation(originalConversation);
+
+      const userMessage: UserMessage = {
+        id: "msg_stale_user",
+        conversationId: originalConversation.id,
+        role: "user",
+        agentMode: "ask",
+        parts: [{
+          id: "part_stale_file",
+          conversationId: originalConversation.id,
+          messageId: "msg_stale_user",
+          type: "file",
+          attachmentId: attachment.id,
+          mediaType: attachment.mediaType,
+          filename: attachment.filename,
+          byteLength: attachment.byteLength,
+          time: { created: 2 },
+        }],
+        time: { created: 2, completed: 2 },
+      };
+      const assistantMessage: AssistantMessage = {
+        id: "msg_stale_assistant",
+        conversationId: originalConversation.id,
+        role: "assistant",
+        runId: "run_stale_start",
+        parentId: userMessage.id,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        agentMode: "ask",
+        status: { type: "running" },
+        parts: [],
+        time: { created: 2 },
+      };
+      const run: Run = {
+        id: "run_stale_start",
+        conversationId: originalConversation.id,
+        parentMessageId: userMessage.id,
+        assistantMessageId: assistantMessage.id,
+        agentMode: "ask",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        status: "running",
+        input: { messageIds: [userMessage.id] },
+        limits: { maxSteps: 1, maxToolCalls: 0 },
+        time: { created: 2, started: 2 },
+      };
+      const event: Event = {
+        id: "evt_stale_start",
+        type: "run.updated",
+        properties: { info: run },
+        time: 2,
+      };
+      const trace: TraceEvent = {
+        id: "trace_stale_start",
+        conversationId: originalConversation.id,
+        runId: run.id,
+        type: "request.received",
+        level: "info",
+        time: 2,
+        payload: {},
+      };
+
+      let conflict: unknown;
+      try {
+        runtimeStore.commitRunStart({
+          expectedConversationRevision: 0,
+          conversation: {
+            ...originalConversation,
+            status: { type: "busy", runId: run.id },
+            activeHeadRunId: run.id,
+            revision: 1,
+            time: { ...originalConversation.time, updated: 2 },
+          },
+          userMessage,
+          run,
+          assistantMessage,
+          events: [event],
+          traces: [trace],
+        });
+      } catch (error) {
+        conflict = error;
+      }
+
+      expect(runtimeStore.getConversation(originalConversation.id)).toEqual(originalConversation);
+      expect(runtimeStore.getRun(run.id)).toBeNull();
+      expect(runtimeStore.getMessage(userMessage.id)).toBeNull();
+      expect(runtimeStore.getMessage(assistantMessage.id)).toBeNull();
+      expect(runtimeStore.listEventsByRun(run.id)).toEqual([]);
+      expect(runtimeStore.listTraces(run.id)).toEqual([]);
+      expect(attachmentStore.countAttachmentReferences(attachment.id)).toBe(0);
+      expect(conflict).toMatchObject({
+        name: "RuntimeConversationRevisionConflictError",
+        conversationId: originalConversation.id,
+        expectedRevision: 0,
+        actualRevision: 1,
+      });
+    } finally {
+      service.dispose();
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps attachment references on both branches when editing a message", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "nexuspilot-attachment-edit-branch-"));
+    const db = openRuntimeDatabase(":memory:");
+    const attachmentStore = new RuntimeAttachmentSqliteStore(db);
+    const service = new RuntimeAttachmentService(attachmentStore, dataDir);
+    const runtimeStore = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    const runner = new RuntimeRunner({
+      store: runtimeStore,
+      attachmentService: service,
+      now: () => 1_000 + idSequence,
+      createId: ((prefix: string) => `${prefix}_${++idSequence}`) as never,
+    });
+    try {
+      await service.initialize();
+      const bytes = new TextEncoder().encode("shared branch attachment");
+      const upload = service.createUpload({
+        filename: "shared.txt",
+        declaredMediaType: "text/plain",
+        declaredByteLength: bytes.byteLength,
+      });
+      const attachment = await service.upload(upload.id, bytesStream(bytes), bytes.byteLength);
+      const original = runner.start({
+        providerId: "openai",
+        modelId: "gpt-4o",
+        parts: [
+          { type: "text", text: "Original question" },
+          { type: "file", attachmentId: attachment.id },
+        ],
+      });
+      runner.completeText(original, "Original answer");
+
+      const replacement = runner.start({
+        conversationId: original.conversation.id,
+        replaceFromMessageId: original.userMessage.id,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        parts: [
+          { type: "text", text: "Edited question" },
+          { type: "file", attachmentId: attachment.id },
+        ],
+      });
+
+      expect(runtimeStore.getMessage(original.userMessage.id)).not.toBeNull();
+      expect(runtimeStore.listLineageMessages(original.conversation.id, original.run.id).map(
+        (message) => message.id,
+      )).toEqual([original.userMessage.id, original.assistantMessage.id]);
+      expect(runtimeStore.listActiveLineageMessages(original.conversation.id).map(
+        (message) => message.id,
+      )).toEqual([replacement.userMessage.id, replacement.assistantMessage.id]);
+      expect(attachmentStore.countAttachmentReferences(attachment.id)).toBe(2);
+      expect(attachmentStore.totalStoredBlobBytes()).toBe(bytes.byteLength);
+      expect(db.query<{ gc_after: number | null }, [string]>(
+        "SELECT gc_after FROM runtime_attachments WHERE id = ?",
+      ).get(attachment.id)).toEqual({ gc_after: null });
+    } finally {
+      service.dispose();
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   test("persists corrupt state after a FilePart snapshot mismatch rolls back", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "nexuspilot-attachment-corrupt-"));
     const db = openRuntimeDatabase(":memory:");
@@ -302,6 +498,7 @@ describe("Runtime Attachment Service", () => {
         title: "Integrity",
         version: "1",
         status: { type: "idle" },
+        revision: 0,
         time: { created: 1, updated: 1 },
       });
       expect(() => runtimeStore.saveMessage({
@@ -371,6 +568,7 @@ describe("Runtime Attachment Service", () => {
         title: "Integrity scan",
         version: "1",
         status: { type: "idle" },
+        revision: 0,
         time: { created: 1, updated: 1 },
       });
       runtimeStore.saveMessage({
@@ -424,6 +622,7 @@ describe("Runtime Attachment Service", () => {
         title: "Message JSON integrity",
         version: "1",
         status: { type: "idle" },
+        revision: 0,
         time: { created: 1, updated: 1 },
       });
       runtimeStore.saveMessage({

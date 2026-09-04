@@ -24,6 +24,7 @@ function createTitleTestStore() {
     title: "请帮我修复 EventBus...",
     version: "1",
     status: { type: "busy", runId: "run_title" as never },
+    revision: 1,
     time: { created: 1_000, updated: 1_000 },
     metadata: withConversationTitleMetadata(undefined, {
       source: "fallback",

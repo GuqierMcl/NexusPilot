@@ -10,7 +10,8 @@ export type RuntimeIdPrefix =
   | "diff"
   | "upl"
   | "att"
-  | "blob";
+  | "blob"
+  | "diag";
 
 export type RuntimeId<TPrefix extends RuntimeIdPrefix = RuntimeIdPrefix> =
   `${TPrefix}_${string}`;

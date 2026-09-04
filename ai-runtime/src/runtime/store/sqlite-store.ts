@@ -1,3 +1,4 @@
+import { ZodError } from "zod";
 import type { RuntimeDatabase } from "../../storage/runtime-database";
 import { runtimeEventToEnvelope } from "../events/event-envelope";
 import type { RuntimeEventBus } from "../events/event-bus";
@@ -13,6 +14,7 @@ import {
 import type {
   Conversation,
   ConversationId,
+  AssistantMessage,
   Event,
   FilePart,
   Message,
@@ -22,6 +24,8 @@ import type {
   PermissionId,
   Run,
   RunId,
+  RuntimeHistoryDiagnostic,
+  UserMessage,
   ToolCall,
   ToolCallId,
   TraceEvent,
@@ -44,6 +48,8 @@ interface ConversationRow {
   title: string;
   version: string;
   status_json: string;
+  active_head_run_id: string | null;
+  revision: number;
   parent_id: string | null;
   summary_json: string | null;
   share_json: string | null;
@@ -54,6 +60,8 @@ interface ConversationRow {
 interface RunRow {
   id: string;
   conversation_id: string;
+  parent_run_id: string | null;
+  supersedes_run_id: string | null;
   parent_message_id: string | null;
   assistant_message_id: string | null;
   agent_mode: Run["agentMode"];
@@ -138,6 +146,46 @@ interface TraceRow {
   time: number;
 }
 
+interface RuntimeHistoryDiagnosticRow {
+  id: string;
+  conversation_id: string;
+  code: RuntimeHistoryDiagnostic["code"];
+  details_json: string;
+  created_at: number;
+}
+
+interface ResolvedLineageRun {
+  run: Run;
+  userMessage: UserMessage;
+  assistantMessage: AssistantMessage;
+}
+
+export class RuntimeHistoryIntegrityError extends Error {
+  constructor(
+    readonly code: Exclude<RuntimeHistoryDiagnostic["code"], "LEGACY_DAG_BACKFILL_INVALID">,
+    readonly conversationId: ConversationId,
+    readonly runId: RunId,
+    readonly details: Record<string, unknown>,
+  ) {
+    super(`Runtime history integrity error: ${code}`);
+    this.name = "RuntimeHistoryIntegrityError";
+  }
+}
+
+export class RuntimeConversationRevisionConflictError extends Error {
+  constructor(
+    readonly conversationId: ConversationId,
+    readonly expectedRevision: number,
+    readonly actualRevision: number | null,
+  ) {
+    super(
+      `Conversation ${conversationId} revision conflict: expected ${expectedRevision}, ` +
+      `actual ${actualRevision ?? "missing"}`,
+    );
+    this.name = "RuntimeConversationRevisionConflictError";
+  }
+}
+
 export interface ListConversationsOptions {
   limit?: number;
   withMessagesOnly?: boolean;
@@ -194,13 +242,13 @@ export class RuntimeSqliteStore {
   }
 
   commitRunStart(input: {
+    expectedConversationRevision?: number;
     conversation: Conversation;
     userMessage: Message;
     run: Run;
     assistantMessage: Message;
     events: Event[];
     traces: TraceEvent[];
-    removedMessageIds?: MessageId[];
   }): void {
     const conversation = conversationSchema.parse(input.conversation) as Conversation;
     const userMessage = messageSchema.parse(input.userMessage) as Message;
@@ -208,14 +256,29 @@ export class RuntimeSqliteStore {
     const assistantMessage = messageSchema.parse(input.assistantMessage) as Message;
     const events = input.events.map((event) => eventSchema.parse(event) as Event);
     const traces = input.traces.map((trace) => traceEventSchema.parse(trace) as TraceEvent);
-    const removedMessageIds = [...new Set(input.removedMessageIds ?? [])];
 
     const tx = this.db.transaction(() => {
-      if (removedMessageIds.length > 0) {
-        this.removeMessageTail(conversation.id, removedMessageIds);
+      if (input.expectedConversationRevision === undefined) {
+        if (conversation.revision !== 1) {
+          throw new Error(
+            `Initial Run start must set Conversation revision to 1, got ` +
+            conversation.revision,
+          );
+        }
+        this.insertConversation(conversation);
+      } else {
+        if (conversation.revision !== input.expectedConversationRevision + 1) {
+          throw new Error(
+            `Run start must advance Conversation revision exactly once from ` +
+            `${input.expectedConversationRevision} to ${conversation.revision}`,
+          );
+        }
+        this.updateConversationAtRevision(
+          conversation,
+          input.expectedConversationRevision,
+        );
       }
 
-      this.saveConversation(conversation);
       this.saveMessage(userMessage);
       this.saveRun(run);
       this.saveMessage(assistantMessage);
@@ -238,12 +301,15 @@ export class RuntimeSqliteStore {
     this.db
       .query(
         `INSERT INTO runtime_conversations (
-          id, title, version, status_json, parent_id, summary_json, share_json, time_json, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, title, version, status_json, active_head_run_id, revision,
+          parent_id, summary_json, share_json, time_json, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
           version = excluded.version,
           status_json = excluded.status_json,
+          active_head_run_id = excluded.active_head_run_id,
+          revision = excluded.revision,
           parent_id = excluded.parent_id,
           summary_json = excluded.summary_json,
           share_json = excluded.share_json,
@@ -255,6 +321,8 @@ export class RuntimeSqliteStore {
         parsed.title,
         parsed.version,
         encode(parsed.status),
+        parsed.activeHeadRunId ?? null,
+        parsed.revision,
         parsed.parentId ?? null,
         parsed.summary ? encode(parsed.summary) : null,
         parsed.share ? encode(parsed.share) : null,
@@ -324,10 +392,11 @@ export class RuntimeSqliteStore {
     this.db
       .query(
         `INSERT INTO runtime_runs (
-          id, conversation_id, parent_message_id, assistant_message_id, agent_mode,
+          id, conversation_id, parent_run_id, supersedes_run_id,
+          parent_message_id, assistant_message_id, agent_mode,
           provider_id, model_id, status, input_json, output_json, usage_json, cost_json,
           finish, error_json, time_json, limits_json, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           parent_message_id = excluded.parent_message_id,
           assistant_message_id = excluded.assistant_message_id,
@@ -345,6 +414,8 @@ export class RuntimeSqliteStore {
       .run(
         parsed.id,
         parsed.conversationId,
+        parsed.parentRunId ?? null,
+        parsed.supersedesRunId ?? null,
         parsed.parentMessageId ?? null,
         parsed.assistantMessageId ?? null,
         parsed.agentMode,
@@ -539,7 +610,7 @@ export class RuntimeSqliteStore {
     return this.parseAndAssertLoadedMessage(row.message_json);
   }
 
-  listMessages(conversationId: ConversationId): Message[] {
+  listTranscriptMessages(conversationId: ConversationId): Message[] {
     return this.db
       .query<MessageRow, [string]>(
         `SELECT message_json FROM runtime_messages
@@ -556,6 +627,61 @@ export class RuntimeSqliteStore {
       )
       .all(conversationId)
       .map((row) => this.parseAndAssertLoadedMessage(row.message_json));
+  }
+
+  /** @deprecated Use an explicit transcript or lineage history view. */
+  listMessages(conversationId: ConversationId): Message[] {
+    return this.listTranscriptMessages(conversationId);
+  }
+
+  listLineageRuns(conversationId: ConversationId, headRunId: RunId): Run[] {
+    return this.resolveLineage(conversationId, headRunId).map(({ run }) => run);
+  }
+
+  listLineageMessages(conversationId: ConversationId, headRunId: RunId): Message[] {
+    return this.resolveLineage(conversationId, headRunId).flatMap(
+      ({ userMessage, assistantMessage }) => [userMessage, assistantMessage],
+    );
+  }
+
+  listActiveLineageMessages(conversationId: ConversationId): Message[] {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation?.activeHeadRunId) {
+      return [];
+    }
+    return this.listLineageMessages(conversationId, conversation.activeHeadRunId);
+  }
+
+  listRunAlternatives(runId: RunId): Run[] {
+    const run = this.getRun(runId);
+    if (!run) {
+      return [];
+    }
+
+    return this.db
+      .query<RunRow, [string, string | null]>(
+        `SELECT * FROM runtime_runs
+         WHERE conversation_id = ? AND parent_run_id IS ?
+         ORDER BY json_extract(time_json, '$.created') ASC, id ASC`,
+      )
+      .all(run.conversationId, run.parentRunId ?? null)
+      .map(runFromRow);
+  }
+
+  listHistoryDiagnostics(conversationId?: ConversationId): RuntimeHistoryDiagnostic[] {
+    const rows = conversationId
+      ? this.db
+          .query<RuntimeHistoryDiagnosticRow, [string]>(
+            `SELECT * FROM runtime_history_diagnostics
+             WHERE conversation_id = ? ORDER BY created_at ASC, id ASC`,
+          )
+          .all(conversationId)
+      : this.db
+          .query<RuntimeHistoryDiagnosticRow, []>(
+            "SELECT * FROM runtime_history_diagnostics ORDER BY created_at ASC, id ASC",
+          )
+          .all();
+    return rows.map(historyDiagnosticFromRow);
   }
 
   listParts(messageId: MessageId): Part[] {
@@ -1417,6 +1543,248 @@ export class RuntimeSqliteStore {
       );
   }
 
+  private insertConversation(conversation: Conversation): void {
+    this.db
+      .query(
+        `INSERT INTO runtime_conversations (
+          id, title, version, status_json, active_head_run_id, revision,
+          parent_id, summary_json, share_json, time_json, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        conversation.id,
+        conversation.title,
+        conversation.version,
+        encode(conversation.status),
+        conversation.activeHeadRunId ?? null,
+        conversation.revision,
+        conversation.parentId ?? null,
+        conversation.summary ? encode(conversation.summary) : null,
+        conversation.share ? encode(conversation.share) : null,
+        encode(conversation.time),
+        conversation.metadata ? encode(conversation.metadata) : null,
+      );
+  }
+
+  private updateConversationAtRevision(
+    conversation: Conversation,
+    expectedRevision: number,
+  ): void {
+    const result = this.db
+      .query(
+        `UPDATE runtime_conversations SET
+          title = ?,
+          version = ?,
+          status_json = ?,
+          active_head_run_id = ?,
+          revision = ?,
+          parent_id = ?,
+          summary_json = ?,
+          share_json = ?,
+          time_json = ?,
+          metadata_json = ?
+        WHERE id = ? AND revision = ?`,
+      )
+      .run(
+        conversation.title,
+        conversation.version,
+        encode(conversation.status),
+        conversation.activeHeadRunId ?? null,
+        conversation.revision,
+        conversation.parentId ?? null,
+        conversation.summary ? encode(conversation.summary) : null,
+        conversation.share ? encode(conversation.share) : null,
+        encode(conversation.time),
+        conversation.metadata ? encode(conversation.metadata) : null,
+        conversation.id,
+        expectedRevision,
+      );
+    if (result.changes === 1) {
+      return;
+    }
+
+    const current = this.db
+      .query<{ revision: number }, [string]>(
+        "SELECT revision FROM runtime_conversations WHERE id = ?",
+      )
+      .get(conversation.id);
+    throw new RuntimeConversationRevisionConflictError(
+      conversation.id,
+      expectedRevision,
+      current?.revision ?? null,
+    );
+  }
+
+  private resolveLineage(
+    conversationId: ConversationId,
+    headRunId: RunId,
+  ): ResolvedLineageRun[] {
+    const reverseLineage: ResolvedLineageRun[] = [];
+    const visited = new Set<RunId>();
+    let currentRunId: RunId | undefined = headRunId;
+
+    while (currentRunId) {
+      const run = this.getLineageRun(conversationId, headRunId, currentRunId);
+      if (!run) {
+        this.failHistoryIntegrity(
+          "DAG_INCOMPLETE_RUN",
+          conversationId,
+          currentRunId,
+          { headRunId, runId: currentRunId, reason: "missing_run" },
+        );
+      }
+      if (run.conversationId !== conversationId) {
+        this.failHistoryIntegrity(
+          "DAG_INCOMPLETE_RUN",
+          conversationId,
+          run.id,
+          { headRunId, runId: run.id, reason: "conversation_ownership_mismatch" },
+        );
+      }
+      visited.add(run.id);
+      const messages = this.resolveRunMessages(conversationId, headRunId, run);
+      reverseLineage.push({ run, ...messages });
+
+      if (run.parentRunId && visited.has(run.parentRunId)) {
+        this.failHistoryIntegrity(
+          "DAG_CYCLE",
+          conversationId,
+          run.id,
+          { headRunId, runId: run.id },
+        );
+      }
+      currentRunId = run.parentRunId;
+    }
+
+    return reverseLineage.reverse();
+  }
+
+  private resolveRunMessages(
+    conversationId: ConversationId,
+    headRunId: RunId,
+    run: Run,
+  ): { userMessage: UserMessage; assistantMessage: AssistantMessage } {
+    const userMessage = run.parentMessageId
+      ? this.getLineageMessage(
+          conversationId,
+          headRunId,
+          run,
+          run.parentMessageId,
+          "invalid_user_message_payload",
+        )
+      : null;
+    if (!userMessage) {
+      this.failHistoryIntegrity(
+        "DAG_INCOMPLETE_RUN",
+        conversationId,
+        run.id,
+        { headRunId, runId: run.id, reason: "missing_user_message" },
+      );
+    }
+    if (userMessage.role !== "user" || userMessage.conversationId !== conversationId) {
+      this.failHistoryIntegrity(
+        "DAG_INCOMPLETE_RUN",
+        conversationId,
+        run.id,
+        { headRunId, runId: run.id, reason: "invalid_user_message" },
+      );
+    }
+
+    const assistantMessage = run.assistantMessageId
+      ? this.getLineageMessage(
+          conversationId,
+          headRunId,
+          run,
+          run.assistantMessageId,
+          "invalid_assistant_message_payload",
+        )
+      : null;
+    if (!assistantMessage) {
+      this.failHistoryIntegrity(
+        "DAG_INCOMPLETE_RUN",
+        conversationId,
+        run.id,
+        { headRunId, runId: run.id, reason: "missing_assistant_message" },
+      );
+    }
+    if (
+      assistantMessage.role !== "assistant"
+      || assistantMessage.conversationId !== conversationId
+      || assistantMessage.runId !== run.id
+      || assistantMessage.parentId !== userMessage.id
+    ) {
+      this.failHistoryIntegrity(
+        "DAG_INCOMPLETE_RUN",
+        conversationId,
+        run.id,
+        { headRunId, runId: run.id, reason: "invalid_assistant_message" },
+      );
+    }
+
+    return { userMessage, assistantMessage };
+  }
+
+  private getLineageRun(
+    conversationId: ConversationId,
+    headRunId: RunId,
+    runId: RunId,
+  ): Run | null {
+    try {
+      return this.getRun(runId);
+    } catch (error) {
+      if (!isPersistedPayloadParseError(error)) {
+        throw error;
+      }
+      this.failHistoryIntegrity(
+        "DAG_INCOMPLETE_RUN",
+        conversationId,
+        runId,
+        { headRunId, runId, reason: "invalid_run_payload" },
+      );
+    }
+  }
+
+  private getLineageMessage(
+    conversationId: ConversationId,
+    headRunId: RunId,
+    run: Run,
+    messageId: MessageId,
+    reason: "invalid_user_message_payload" | "invalid_assistant_message_payload",
+  ): Message | null {
+    try {
+      return this.getMessage(messageId);
+    } catch (error) {
+      if (!isPersistedPayloadParseError(error)) {
+        throw error;
+      }
+      this.failHistoryIntegrity(
+        "DAG_INCOMPLETE_RUN",
+        conversationId,
+        run.id,
+        { headRunId, runId: run.id, reason },
+      );
+    }
+  }
+
+  private failHistoryIntegrity(
+    code: Exclude<RuntimeHistoryDiagnostic["code"], "LEGACY_DAG_BACKFILL_INVALID">,
+    conversationId: ConversationId,
+    runId: RunId,
+    details: Record<string, unknown>,
+  ): never {
+    const diagnosticId = `diag_${code.toLowerCase()}_${conversationId}_${String(
+      details.headRunId ?? runId,
+    )}_${runId}` as RuntimeHistoryDiagnostic["id"];
+    this.db
+      .query(
+        `INSERT OR IGNORE INTO runtime_history_diagnostics (
+          id, conversation_id, code, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(diagnosticId, conversationId, code, encode(details), Date.now());
+    throw new RuntimeHistoryIntegrityError(code, conversationId, runId, details);
+  }
+
   listTraces(runId: RunId): TraceEvent[] {
     return this.db
       .query<TraceRow, [string]>(
@@ -1486,6 +1854,8 @@ function conversationFromRow(row: ConversationRow): Conversation {
     title: row.title,
     version: row.version,
     status: decode(row.status_json),
+    activeHeadRunId: row.active_head_run_id ?? undefined,
+    revision: row.revision,
     parentId: row.parent_id ?? undefined,
     summary: decode(row.summary_json),
     share: decode(row.share_json),
@@ -1498,6 +1868,8 @@ function runFromRow(row: RunRow): Run {
   return runSchema.parse({
     id: row.id,
     conversationId: row.conversation_id,
+    parentRunId: row.parent_run_id ?? undefined,
+    supersedesRunId: row.supersedes_run_id ?? undefined,
     parentMessageId: row.parent_message_id ?? undefined,
     assistantMessageId: row.assistant_message_id ?? undefined,
     agentMode: row.agent_mode,
@@ -1514,6 +1886,20 @@ function runFromRow(row: RunRow): Run {
     limits: decode(row.limits_json),
     metadata: decode(row.metadata_json),
   }) as Run;
+}
+
+function isPersistedPayloadParseError(error: unknown): boolean {
+  return error instanceof SyntaxError || error instanceof ZodError;
+}
+
+function historyDiagnosticFromRow(row: RuntimeHistoryDiagnosticRow): RuntimeHistoryDiagnostic {
+  return {
+    id: row.id as RuntimeHistoryDiagnostic["id"],
+    conversationId: row.conversation_id as ConversationId,
+    code: row.code,
+    details: decode<Record<string, unknown>>(row.details_json) ?? {},
+    createdAt: row.created_at,
+  };
 }
 
 function toolCallFromRow(row: ToolCallRow): ToolCall {

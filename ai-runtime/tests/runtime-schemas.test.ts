@@ -16,16 +16,24 @@ describe("runtime domain schemas", () => {
       title: "Runtime foundation",
       version: "1",
       status: { type: "idle" },
+      activeHeadRunId: "run_c",
+      revision: 3,
       time: { created: 1, updated: 1 },
     });
 
-    expect(parsed.id).toBe("conv_1");
+    expect(parsed).toMatchObject({
+      id: "conv_1",
+      activeHeadRunId: "run_c",
+      revision: 3,
+    });
   });
 
   test("validates a run record", () => {
     const parsed = runSchema.parse({
       id: "run_1",
       conversationId: "conv_1",
+      parentRunId: "run_parent",
+      supersedesRunId: "run_previous",
       agentMode: "ask",
       providerId: "openai",
       modelId: "gpt-4o",
@@ -56,6 +64,38 @@ describe("runtime domain schemas", () => {
 
     expect(parsed.status).toBe("queued");
     expect(parsed.agentMode).toBe("ask");
+    expect(parsed.parentRunId).toBe("run_parent");
+    expect(parsed.supersedesRunId).toBe("run_previous");
+  });
+
+  test("rejects invalid conversation revisions", () => {
+    expect(() =>
+      conversationSchema.parse({
+        id: "conv_invalid_revision",
+        title: "Invalid revision",
+        version: "1",
+        status: { type: "idle" },
+        revision: -1,
+        time: { created: 1, updated: 1 },
+      }),
+    ).toThrow();
+  });
+
+  test("rejects self-referential Run DAG edges", () => {
+    const run = {
+      id: "run_self",
+      conversationId: "conv_1",
+      agentMode: "ask",
+      providerId: "openai",
+      modelId: "gpt-4o",
+      status: "queued",
+      input: { messageIds: ["msg_1"] },
+      limits: { maxSteps: 1, maxToolCalls: 0 },
+      time: { created: 1 },
+    };
+
+    expect(() => runSchema.parse({ ...run, parentRunId: run.id })).toThrow();
+    expect(() => runSchema.parse({ ...run, supersedesRunId: run.id })).toThrow();
   });
 
   test("validates interrupted run and assistant message records", () => {

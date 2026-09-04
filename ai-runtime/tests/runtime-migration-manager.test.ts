@@ -15,6 +15,235 @@ function createMemoryDb(): Database {
 }
 
 describe("runtime migration manager", () => {
+  test("backfills deterministic legacy Run lineage and diagnoses incomplete conversations", () => {
+    const db = createMemoryDb();
+    runRuntimeMigrations(db, RUNTIME_MIGRATIONS.slice(0, 7));
+
+    const insertConversation = db.query(
+      `INSERT INTO runtime_conversations (
+        id, title, version, status_json, time_json
+      ) VALUES (?, ?, '1', ?, ?)`,
+    );
+    insertConversation.run(
+      "conv_valid_dag",
+      "Valid legacy history",
+      JSON.stringify({ type: "idle" }),
+      JSON.stringify({ created: 1, updated: 30 }),
+    );
+    insertConversation.run(
+      "conv_invalid_dag",
+      "Incomplete legacy history",
+      JSON.stringify({ type: "idle" }),
+      JSON.stringify({ created: 1, updated: 40 }),
+    );
+    insertConversation.run(
+      "conv_malformed_run_time",
+      "Malformed Run time",
+      JSON.stringify({ type: "idle" }),
+      JSON.stringify({ created: 1, updated: 50 }),
+    );
+    insertConversation.run(
+      "conv_non_numeric_run_time",
+      "Non-numeric Run time",
+      JSON.stringify({ type: "idle" }),
+      JSON.stringify({ created: 1, updated: 60 }),
+    );
+    insertConversation.run(
+      "conv_missing_run_time",
+      "Missing Run time",
+      JSON.stringify({ type: "idle" }),
+      JSON.stringify({ created: 1, updated: 70 }),
+    );
+
+    const insertMessage = db.query(
+      `INSERT INTO runtime_messages (
+        id, conversation_id, role, agent_mode, run_id, parent_id,
+        provider_id, model_id, status_json, time_json, message_json
+      ) VALUES (?, ?, ?, 'ask', ?, ?, 'openai', 'gpt-4o', ?, ?, ?)`,
+    );
+    const saveLegacyRunPair = (input: {
+      conversationId: string;
+      runId: string;
+      userMessageId: string;
+      assistantMessageId: string;
+      created: number;
+      persistAssistant?: boolean;
+      runTimeJson?: string;
+    }): void => {
+      const userMessage = {
+        id: input.userMessageId,
+        conversationId: input.conversationId,
+        role: "user",
+        agentMode: "ask",
+        parts: [],
+        time: { created: input.created },
+      };
+      insertMessage.run(
+        input.userMessageId,
+        input.conversationId,
+        "user",
+        null,
+        null,
+        JSON.stringify({ type: "complete" }),
+        JSON.stringify(userMessage.time),
+        JSON.stringify(userMessage),
+      );
+
+      if (input.persistAssistant !== false) {
+        const assistantMessage = {
+          id: input.assistantMessageId,
+          conversationId: input.conversationId,
+          role: "assistant",
+          runId: input.runId,
+          parentId: input.userMessageId,
+          providerId: "openai",
+          modelId: "gpt-4o",
+          agentMode: "ask",
+          status: { type: "complete" },
+          parts: [],
+          time: { created: input.created + 1 },
+        };
+        insertMessage.run(
+          input.assistantMessageId,
+          input.conversationId,
+          "assistant",
+          input.runId,
+          input.userMessageId,
+          JSON.stringify(assistantMessage.status),
+          JSON.stringify(assistantMessage.time),
+          JSON.stringify(assistantMessage),
+        );
+      }
+
+      db.query(
+        `INSERT INTO runtime_runs (
+          id, conversation_id, parent_message_id, assistant_message_id, agent_mode,
+          provider_id, model_id, status, input_json, time_json, limits_json
+        ) VALUES (?, ?, ?, ?, 'ask', 'openai', 'gpt-4o', 'completed', ?, ?, ?)`,
+      ).run(
+        input.runId,
+        input.conversationId,
+        input.userMessageId,
+        input.assistantMessageId,
+        JSON.stringify({ messageIds: [input.userMessageId] }),
+        input.runTimeJson ?? JSON.stringify({ created: input.created }),
+        JSON.stringify({ maxSteps: 1, maxToolCalls: 0 }),
+      );
+    };
+
+    // Equal timestamps deliberately prove the Run ID tie-break is deterministic.
+    saveLegacyRunPair({
+      conversationId: "conv_valid_dag",
+      runId: "run_b",
+      userMessageId: "msg_user_b",
+      assistantMessageId: "msg_assistant_b",
+      created: 10,
+    });
+    saveLegacyRunPair({
+      conversationId: "conv_valid_dag",
+      runId: "run_a",
+      userMessageId: "msg_user_a",
+      assistantMessageId: "msg_assistant_a",
+      created: 10,
+    });
+    saveLegacyRunPair({
+      conversationId: "conv_invalid_dag",
+      runId: "run_incomplete",
+      userMessageId: "msg_user_incomplete",
+      assistantMessageId: "msg_assistant_missing",
+      created: 20,
+      persistAssistant: false,
+    });
+    saveLegacyRunPair({
+      conversationId: "conv_malformed_run_time",
+      runId: "run_malformed_time",
+      userMessageId: "msg_user_malformed_time",
+      assistantMessageId: "msg_assistant_malformed_time",
+      created: 30,
+      runTimeJson: "{",
+    });
+    saveLegacyRunPair({
+      conversationId: "conv_non_numeric_run_time",
+      runId: "run_non_numeric_time",
+      userMessageId: "msg_user_non_numeric_time",
+      assistantMessageId: "msg_assistant_non_numeric_time",
+      created: 40,
+      runTimeJson: JSON.stringify({ created: "forty" }),
+    });
+    saveLegacyRunPair({
+      conversationId: "conv_missing_run_time",
+      runId: "run_missing_time",
+      userMessageId: "msg_user_missing_time",
+      assistantMessageId: "msg_assistant_missing_time",
+      created: 50,
+      runTimeJson: JSON.stringify({}),
+    });
+
+    expect(RUNTIME_MIGRATIONS.at(-1)?.id).toBe("0008_runtime_run_dag");
+    expect(() => runRuntimeMigrations(db, RUNTIME_MIGRATIONS)).not.toThrow();
+
+    const validConversation = db
+      .query<{ active_head_run_id: string | null; revision: number }, []>(
+        `SELECT active_head_run_id, revision
+         FROM runtime_conversations WHERE id = 'conv_valid_dag'`,
+      )
+      .get();
+    const validRuns = db
+      .query<
+        { id: string; parent_run_id: string | null; supersedes_run_id: string | null },
+        []
+      >(
+        `SELECT id, parent_run_id, supersedes_run_id
+         FROM runtime_runs WHERE conversation_id = 'conv_valid_dag'
+         ORDER BY id`,
+      )
+      .all();
+    const invalidConversation = db
+      .query<{ active_head_run_id: string | null; revision: number }, []>(
+        `SELECT active_head_run_id, revision
+         FROM runtime_conversations WHERE id = 'conv_invalid_dag'`,
+      )
+      .get();
+    const diagnostics = db
+      .query<{ conversation_id: string; code: string; details_json: string }, []>(
+        `SELECT conversation_id, code, details_json
+         FROM runtime_history_diagnostics ORDER BY conversation_id`,
+      )
+      .all();
+
+    expect(validRuns).toEqual([
+      { id: "run_a", parent_run_id: null, supersedes_run_id: null },
+      { id: "run_b", parent_run_id: "run_a", supersedes_run_id: null },
+    ]);
+    expect(validConversation).toEqual({ active_head_run_id: "run_b", revision: 2 });
+    expect(invalidConversation).toEqual({ active_head_run_id: null, revision: 0 });
+    expect(
+      db.query<{ count: number }, []>(
+        `SELECT COUNT(*) AS count FROM runtime_runs WHERE conversation_id = 'conv_invalid_dag'`,
+      ).get()?.count,
+    ).toBe(1);
+    expect(diagnostics).toHaveLength(4);
+    expect(diagnostics.map((diagnostic) => diagnostic.conversation_id)).toEqual([
+      "conv_invalid_dag",
+      "conv_malformed_run_time",
+      "conv_missing_run_time",
+      "conv_non_numeric_run_time",
+    ]);
+    for (const diagnostic of diagnostics) {
+      expect(diagnostic.code).toBe("LEGACY_DAG_BACKFILL_INVALID");
+      expect(JSON.parse(diagnostic.details_json)).toMatchObject({ runCount: 1 });
+      const invalid = db
+        .query<{ active_head_run_id: string | null; revision: number }, [string]>(
+          `SELECT active_head_run_id, revision
+           FROM runtime_conversations WHERE id = ?`,
+        )
+        .get(diagnostic.conversation_id);
+      expect(invalid).toEqual({ active_head_run_id: null, revision: 0 });
+    }
+
+    db.close();
+  });
+
   test("applies migrations and records metadata", () => {
     const db = createMemoryDb();
     const migrations: RuntimeMigration[] = [

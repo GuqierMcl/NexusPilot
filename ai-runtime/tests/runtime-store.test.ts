@@ -33,6 +33,7 @@ describe("RuntimeSqliteStore", () => {
       title: "Store test",
       version: "1",
       status: { type: "idle" },
+      revision: 0,
       time: { created: 1, updated: 1 },
     };
 
@@ -128,6 +129,7 @@ describe("RuntimeSqliteStore", () => {
       title: "Tool store test",
       version: "1",
       status: { type: "idle" },
+      revision: 0,
       time: { created: 1, updated: 1 },
     };
     store.saveConversation(conversation);
@@ -231,6 +233,7 @@ describe("RuntimeSqliteStore", () => {
       title: "Permission",
       version: "1",
       status: { type: "busy", runId: "run_permission" },
+      revision: 1,
       time: { created: 1, updated: 2 },
     };
     const run: Run = {
@@ -396,6 +399,7 @@ describe("RuntimeSqliteStore", () => {
       title: "Continue",
       version: "1",
       status: { type: "busy", runId: "run_continue" },
+      revision: 1,
       time: { created: 1, updated: 2 },
     };
     const run: Run = {
@@ -559,6 +563,7 @@ describe("RuntimeSqliteStore", () => {
       title: "First",
       version: "1",
       status: { type: "idle" },
+      revision: 0,
       time: { created: 1, updated: 10 },
     };
     const secondConversation: Conversation = {
@@ -566,6 +571,7 @@ describe("RuntimeSqliteStore", () => {
       title: "Second",
       version: "1",
       status: { type: "busy", runId: "run_second" },
+      revision: 1,
       time: { created: 2, updated: 20 },
       metadata: { pinned: true },
     };
@@ -623,6 +629,7 @@ describe("RuntimeSqliteStore", () => {
       title: "Active",
       version: "1",
       status: { type: "busy", runId: "run_running" },
+      revision: 1,
       time: { created: 1, updated: 2 },
     };
     store.saveConversation(conversation);

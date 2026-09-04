@@ -96,13 +96,13 @@ export interface NormalizedRunRequest {
 }
 
 export interface RuntimeRunStartCommit {
+  expectedConversationRevision?: number;
   conversation: Conversation;
   userMessage: UserMessage;
   run: Run;
   assistantMessage: AssistantMessage;
   events: Event[];
   traces: TraceEvent[];
-  removedMessageIds?: MessageId[];
 }
 
 export interface RuntimeRunnerStore {
@@ -113,7 +113,9 @@ export interface RuntimeRunnerStore {
   getRun(id: Run["id"]): Run | null;
   saveMessage(message: Message): void;
   getMessage(id: MessageId): Message | null;
-  listMessages(conversationId: ConversationId): Message[];
+  listTranscriptMessages(conversationId: ConversationId): Message[];
+  listLineageRuns(conversationId: ConversationId, headRunId: Run["id"]): Run[];
+  listActiveLineageMessages(conversationId: ConversationId): Message[];
   saveToolCall(toolCall: ToolCall): void;
   getToolCall(id: ToolCallId): ToolCall | null;
   listToolCallsByRun(runId: Run["id"]): ToolCall[];

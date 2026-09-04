@@ -18,6 +18,24 @@ export interface AiRuntimeConversationSummary {
 }
 
 export type AiRuntimeMessageHistoryFormat = "ai_sdk";
+export type AiRuntimeMessageHistoryView = "active" | "transcript";
+
+export interface AiRuntimeTranscriptRunSnapshot {
+    id: string;
+    conversation_id: string;
+    parent_run_id?: string;
+    supersedes_run_id?: string;
+    agent_mode: "ask" | "query" | "agent";
+    provider_id: string;
+    model_id: string;
+    status: string;
+    finish?: string;
+    time: {
+        created: number;
+        started?: number;
+        completed?: number;
+    };
+}
 
 export interface CreateRuntimeConversationInput {
     title?: string;
@@ -53,10 +71,16 @@ interface DeleteRuntimeConversationResponse {
     conversation_id: string;
 }
 
-interface RuntimeConversationMessagesResponse<TFormat extends AiRuntimeMessageHistoryFormat> {
+export interface AiRuntimeConversationMessagesSnapshot<
+    TFormat extends AiRuntimeMessageHistoryFormat = AiRuntimeMessageHistoryFormat,
+> {
     conversation_id: string;
+    active_head_run_id?: string;
+    revision: number;
+    view: AiRuntimeMessageHistoryView;
     format: TFormat;
     messages: UIMessage[];
+    runs?: AiRuntimeTranscriptRunSnapshot[];
 }
 
 export async function listRuntimeConversations(
@@ -168,7 +192,7 @@ export async function getRuntimeConversationMessages(
 ): Promise<UIMessage[]> {
     const encodedConversationId = encodeURIComponent(conversationId);
     const encodedFormat = encodeURIComponent(format);
-    const response = await aiRuntimeRequest<RuntimeConversationMessagesResponse<typeof format>>(
+    const response = await aiRuntimeRequest<AiRuntimeConversationMessagesSnapshot<typeof format>>(
         `/v1/conversations/${encodedConversationId}/messages?format=${encodedFormat}`,
         { signal, silent: options.silent },
     );

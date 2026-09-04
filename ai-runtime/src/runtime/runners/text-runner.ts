@@ -538,7 +538,7 @@ export class RuntimeTextRunner {
         },
       };
       const history = this.deps.store
-        .listMessages(waitingRun.conversationId)
+        .listActiveLineageMessages(waitingRun.conversationId)
         .filter((message) => message.id !== assistantMessage.id);
       const continuationResponsePrefix: ModelMessage[] = [
         ...continuation.responseMessages,
@@ -1103,7 +1103,7 @@ export class RuntimeTextRunner {
     try {
       const messages = continuationMessages ??
         await projectModelHistory(
-          this.deps.store.listMessages(started.conversation.id),
+          this.deps.store.listActiveLineageMessages(started.conversation.id),
           {
             attachmentService: this.deps.attachmentService,
             target: {
@@ -1992,7 +1992,7 @@ function scheduleConversationTitleGeneration(input: {
   }
 
   const userMessages = input.store
-    .listMessages(input.started.conversation.id)
+    .listActiveLineageMessages(input.started.conversation.id)
     .filter((message) => message.role === "user");
   if (
     userMessages.length !== 1 ||

@@ -17,6 +17,8 @@ export type DiffId = RuntimeId<"diff">;
 export type UploadId = RuntimeId<"upl">;
 export type AttachmentId = RuntimeId<"att">;
 export type BlobId = RuntimeId<"blob">;
+export type DiagnosticId = RuntimeId<"diag">;
+export type MessageHistoryView = "active" | "transcript";
 
 export interface TimeCreated {
   created: number;
@@ -32,6 +34,8 @@ export interface Conversation {
   title: string;
   version: string;
   status: ConversationStatus;
+  activeHeadRunId?: RunId;
+  revision: number;
   parentId?: ConversationId;
   summary?: ConversationSummary;
   share?: ConversationShare;
@@ -77,6 +81,8 @@ export interface PromptAssemblySnapshot {
 export interface Run {
   id: RunId;
   conversationId: ConversationId;
+  parentRunId?: RunId;
+  supersedesRunId?: RunId;
   parentMessageId?: MessageId;
   assistantMessageId?: MessageId;
   agentMode: AgentMode;
@@ -96,6 +102,14 @@ export interface Run {
   };
   limits: RunLimits;
   metadata?: Record<string, unknown>;
+}
+
+export interface RuntimeHistoryDiagnostic {
+  id: DiagnosticId;
+  conversationId: ConversationId;
+  code: "LEGACY_DAG_BACKFILL_INVALID" | "DAG_CYCLE" | "DAG_INCOMPLETE_RUN";
+  details: Record<string, unknown>;
+  createdAt: number;
 }
 
 export type RunStatus =

@@ -6,6 +6,7 @@ import {
 } from "../conversations/conversation-title";
 import {
   normalizeRunRequest,
+  isTerminalRunState,
   type RunRequest,
   type RuntimeRunCompleted,
   type RuntimeRunCompletionOptions,
@@ -14,6 +15,7 @@ import {
   type RuntimeRunInterrupted,
   type RuntimeRunInterruptOptions,
   type RuntimeRunnerDependencies,
+  type RuntimeRunnerStore,
   type RuntimeRunStarted,
 } from "./runner-types";
 import type {
@@ -72,11 +74,15 @@ export class RuntimeRunner {
     if (normalized.conversationId && !existingConversation) {
       throw new RuntimeConversationNotFoundError(normalized.conversationId);
     }
+    if (existingConversation && hasActiveRun(existingConversation)) {
+      throw new RuntimeConversationBusyError(existingConversation.id);
+    }
 
     const existingMessages = existingConversation
-      ? this.deps.store.listMessages(existingConversation.id)
+      ? this.deps.store.listActiveLineageMessages(existingConversation.id)
       : [];
-    const removedMessages = resolveMessagesToReplace({
+    const replacementTarget = resolveReplacementTarget({
+      store: this.deps.store,
       conversation: existingConversation,
       messages: existingMessages,
       replaceFromMessageId: normalized.replaceFromMessageId,
@@ -120,6 +126,8 @@ export class RuntimeRunner {
               }
             : {}),
           status: { type: "busy", runId },
+          activeHeadRunId: runId,
+          revision: existingConversation.revision + 1,
           time: { ...existingConversation.time, updated: created },
         }
       : {
@@ -127,6 +135,8 @@ export class RuntimeRunner {
           title: resolvedTitle,
           version: "1",
           status: { type: "busy", runId },
+          activeHeadRunId: runId,
+          revision: 1,
           time: { created, updated: created },
           metadata: withConversationTitleMetadata(normalized.metadata, {
             source: normalized.titleSource,
@@ -165,6 +175,10 @@ export class RuntimeRunner {
     const run: Run = {
       id: runId,
       conversationId,
+      parentRunId: replacementTarget
+        ? replacementTarget.parentRunId
+        : existingConversation?.activeHeadRunId,
+      supersedesRunId: replacementTarget?.id,
       parentMessageId: userMessageId,
       assistantMessageId,
       agentMode: normalized.agentMode,
@@ -209,15 +223,6 @@ export class RuntimeRunner {
     };
 
     const events: Event[] = [
-      ...removedMessages.map(
-        (message) =>
-          ({
-            id: this.createId("evt"),
-            type: "message.removed",
-            properties: { conversationId, messageId: message.id },
-            time: created,
-          }) as Event,
-      ),
       ...(shouldRefreshConversationTitle
         ? [
             {
@@ -251,7 +256,7 @@ export class RuntimeRunner {
             ? {
                 replacement: {
                   fromMessageId: normalized.replaceFromMessageId,
-                  removedMessageCount: removedMessages.length,
+                  supersedesRunId: replacementTarget?.id,
                 },
               }
             : {}),
@@ -272,15 +277,13 @@ export class RuntimeRunner {
     ];
 
     this.deps.store.commitRunStart({
+      expectedConversationRevision: existingConversation?.revision,
       conversation,
       userMessage,
       run,
       assistantMessage,
       events,
       traces,
-      ...(removedMessages.length > 0
-        ? { removedMessageIds: removedMessages.map((message) => message.id) }
-        : {}),
     });
 
     return { conversation, run, userMessage, assistantMessage };
@@ -523,29 +526,31 @@ export class RuntimeMessageNotEditableError extends Error {
   }
 }
 
-function resolveMessagesToReplace(input: {
+function hasActiveRun(conversation: Conversation): boolean {
+  return (
+    conversation.status.type === "busy" ||
+    conversation.status.type === "waiting_for_permission"
+  );
+}
+
+function resolveReplacementTarget(input: {
+  store: RuntimeRunnerStore;
   conversation: Conversation | null;
   messages: Message[];
   replaceFromMessageId: string | undefined;
-}): Message[] {
+}): Run | null {
   if (!input.replaceFromMessageId) {
-    return [];
+    return null;
   }
 
   if (!input.conversation) {
     throw new RuntimeMessageNotEditableError(input.replaceFromMessageId);
   }
 
-  if (input.conversation.status.type === "busy") {
-    throw new RuntimeConversationBusyError(input.conversation.id);
-  }
-
-  const messageIndex = input.messages.findIndex(
+  const targetMessage = input.messages.find(
     (message) => message.id === input.replaceFromMessageId,
   );
-  const targetMessage = input.messages[messageIndex];
   if (
-    messageIndex < 0 ||
     !targetMessage ||
     targetMessage.conversationId !== input.conversation.id ||
     targetMessage.role !== "user"
@@ -553,7 +558,17 @@ function resolveMessagesToReplace(input: {
     throw new RuntimeMessageNotEditableError(input.replaceFromMessageId);
   }
 
-  return input.messages.slice(messageIndex);
+  const activeHeadRunId = input.conversation.activeHeadRunId;
+  const targetRun = activeHeadRunId
+    ? input.store.listLineageRuns(input.conversation.id, activeHeadRunId).find(
+        (run) => run.parentMessageId === targetMessage.id,
+      )
+    : undefined;
+  if (!targetRun || !isTerminalRunState(targetRun.status)) {
+    throw new RuntimeMessageNotEditableError(input.replaceFromMessageId);
+  }
+
+  return targetRun;
 }
 
 function shouldRefreshTitleAfterReplacement(input: {

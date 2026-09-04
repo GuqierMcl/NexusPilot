@@ -31,6 +31,7 @@ describe("runtime database", () => {
     expect(tables).toContain("runtime_attachments");
     expect(tables).toContain("runtime_attachment_uploads");
     expect(tables).toContain("runtime_message_attachments");
+    expect(tables).toContain("runtime_history_diagnostics");
 
     const indexes = db
       .query<{ name: string }, []>(
@@ -53,6 +54,9 @@ describe("runtime database", () => {
     expect(indexes).toContain("idx_runtime_attachment_uploads_state_expiry");
     expect(indexes).toContain("idx_runtime_message_attachments_attachment");
     expect(indexes).toContain("idx_runtime_blobs_state");
+    expect(indexes).toContain("idx_runtime_runs_parent");
+    expect(indexes).toContain("idx_runtime_runs_supersedes");
+    expect(indexes).toContain("idx_runtime_history_diagnostics_conversation");
 
     const migrations = db
       .query<{ id: string }, []>(
@@ -70,6 +74,7 @@ describe("runtime database", () => {
       "0005_runtime_tool_permission_state",
       "0006_runtime_tool_permission_confirmation",
       "0007_runtime_chat_attachments",
+      "0008_runtime_run_dag",
     ]);
 
     const runColumns = db
@@ -80,10 +85,18 @@ describe("runtime database", () => {
       .query<{ name: string }, []>("PRAGMA table_info(runtime_messages)")
       .all()
       .map((row) => row.name);
+    const conversationColumns = db
+      .query<{ name: string }, []>("PRAGMA table_info(runtime_conversations)")
+      .all()
+      .map((row) => row.name);
 
     expect(runColumns).toContain("agent_mode");
     expect(runColumns).not.toContain("mode");
     expect(runColumns).not.toContain("profile_id");
+    expect(runColumns).toContain("parent_run_id");
+    expect(runColumns).toContain("supersedes_run_id");
+    expect(conversationColumns).toContain("active_head_run_id");
+    expect(conversationColumns).toContain("revision");
     expect(messageColumns).toContain("agent_mode");
     expect(messageColumns).not.toContain("agent");
     expect(messageColumns).not.toContain("mode");
@@ -203,6 +216,7 @@ describe("runtime database", () => {
           "0005_runtime_tool_permission_state",
           "0006_runtime_tool_permission_confirmation",
           "0007_runtime_chat_attachments",
+          "0008_runtime_run_dag",
         ]);
       } finally {
         secondDb.close();

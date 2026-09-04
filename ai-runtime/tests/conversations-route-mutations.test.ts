@@ -26,6 +26,7 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
     title: "Original title",
     version: "1",
     status: { type: "idle" },
+    revision: 0,
     time: { created: now, updated: now },
     ...overrides,
   } as Conversation;

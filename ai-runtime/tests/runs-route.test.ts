@@ -1,13 +1,43 @@
 import { describe, expect, test } from "bun:test";
 import { MockLanguageModelV3 } from "ai/test";
 import { createApp } from "../src/app";
+import { runRoutes } from "../src/routes/runs";
 import {
   RuntimeEventBus,
+  RuntimeRunner,
   RuntimeSqliteStore,
   type RuntimeEventEnvelope,
+  type RuntimeRunStartCommit,
   type RuntimeStreamText,
 } from "../src/runtime";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
+
+class RevisionConflictStore extends RuntimeSqliteStore {
+  private conflictNextRunStart = false;
+
+  triggerNextRunStartConflict(): void {
+    this.conflictNextRunStart = true;
+  }
+
+  override commitRunStart(input: RuntimeRunStartCommit): void {
+    if (
+      this.conflictNextRunStart &&
+      input.expectedConversationRevision !== undefined
+    ) {
+      this.conflictNextRunStart = false;
+      const persisted = this.getConversation(input.conversation.id);
+      if (!persisted) {
+        throw new Error("Expected persisted conversation before CAS conflict");
+      }
+      this.saveConversation({
+        ...persisted,
+        revision: persisted.revision + 1,
+      });
+    }
+
+    super.commitRunStart(input);
+  }
+}
 
 function streamFromText(text: string): RuntimeStreamText {
   return (input) => {
@@ -290,13 +320,128 @@ describe("runs route", () => {
     });
 
     expect(replacement.status).toBe(200);
-    expect(store.listMessages(conversationId as never).map((message) => message.role)).toEqual([
+    expect(store.listActiveLineageMessages(conversationId as never).map(
+      (message) => message.role,
+    )).toEqual([
       "user",
       "assistant",
     ]);
-    expect(store.listMessages(conversationId as never)[0]?.parts[0]).toMatchObject({
+    expect(store.listActiveLineageMessages(conversationId as never)[0]?.parts[0]).toMatchObject({
       type: "text",
       text: "Rewritten first question",
+    });
+    const runs = store.listRunsByConversation(conversationId as never);
+    expect(runs).toHaveLength(3);
+    expect(runs[2]).toMatchObject({
+      parentRunId: undefined,
+      supersedesRunId: runs[0]?.id,
+    });
+    expect(store.listLineageMessages(conversationId as never, runs[1]!.id).map(
+      (message) => message.role,
+    )).toEqual(["user", "assistant", "user", "assistant"]);
+    expect(store.listTranscriptMessages(conversationId as never).map(
+      (message) => message.role,
+    )).toEqual(["user", "assistant", "user", "assistant", "user", "assistant"]);
+    expect(store.listEvents(conversationId as never).filter(
+      (event) => event.type === "message.removed",
+    )).toEqual([]);
+
+    db.close();
+  });
+
+  test("maps a stale conversation revision to a stable 409 without partial facts", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const eventBus = new RuntimeEventBus();
+    const store = new RevisionConflictStore(db, { eventBus });
+    const published: RuntimeEventEnvelope[] = [];
+    eventBus.subscribe({ kind: "global" }, (event) => {
+      published.push(event);
+    });
+    const runner = new RuntimeRunner({ store });
+    const first = runner.start({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "First question",
+    });
+    runner.completeText(first, "First answer");
+    const firstRunBefore = store.getRun(first.run.id);
+    const factsBefore = {
+      messages: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_messages",
+      ).get()!.count,
+      runs: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_runs",
+      ).get()!.count,
+      events: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_events",
+      ).get()!.count,
+      traces: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_traces",
+      ).get()!.count,
+      attachmentReferences: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_message_attachments",
+      ).get()!.count,
+    };
+    published.length = 0;
+    store.triggerNextRunStartConflict();
+    const app = runRoutes({
+      providerService: null,
+      runtimeStore: store,
+      resolveLanguageModel: () => ({
+        languageModel: new MockLanguageModelV3(),
+        runtimeContext: {
+          provider: { providerId: "openai", modelId: "gpt-4o" },
+        },
+      }),
+      streamText: streamFromText("Should not execute"),
+    });
+
+    const response = await app.handle(
+      new Request("http://localhost/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          response_mode: "stream",
+          conversation_id: first.conversation.id,
+          model: {
+            provider_id: "openai",
+            model_id: "gpt-4o",
+          },
+          input: {
+            parts: [{ type: "text", text: "Conflicting question" }],
+          },
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      code: "CONVERSATION_REVISION_CONFLICT",
+      message: `Conversation ${first.conversation.id} revision conflict: expected 1, actual 2`,
+    });
+    expect({
+      messages: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_messages",
+      ).get()!.count,
+      runs: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_runs",
+      ).get()!.count,
+      events: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_events",
+      ).get()!.count,
+      traces: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_traces",
+      ).get()!.count,
+      attachmentReferences: db.query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM runtime_message_attachments",
+      ).get()!.count,
+    }).toEqual(factsBefore);
+    expect(published).toEqual([]);
+    expect(store.getRun(first.run.id)).toEqual(firstRunBefore);
+    expect(store.getConversation(first.conversation.id)).toMatchObject({
+      activeHeadRunId: first.run.id,
+      revision: 2,
+      status: { type: "idle" },
     });
 
     db.close();

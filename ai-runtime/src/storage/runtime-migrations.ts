@@ -536,4 +536,183 @@ export const RUNTIME_MIGRATIONS: RuntimeMigration[] = [
         ON runtime_blobs(state);
     `,
   },
+  {
+    id: "0008_runtime_run_dag",
+    description: "Persist deterministic Run lineage and history diagnostics",
+    sql: `
+      ALTER TABLE runtime_conversations ADD COLUMN active_head_run_id TEXT;
+      ALTER TABLE runtime_conversations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE runtime_runs ADD COLUMN parent_run_id TEXT;
+      ALTER TABLE runtime_runs ADD COLUMN supersedes_run_id TEXT;
+
+      CREATE TABLE runtime_history_diagnostics (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        code TEXT NOT NULL CHECK (
+          code IN ('LEGACY_DAG_BACKFILL_INVALID', 'DAG_CYCLE', 'DAG_INCOMPLETE_RUN')
+        ),
+        details_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (conversation_id) REFERENCES runtime_conversations(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX idx_runtime_runs_parent
+        ON runtime_runs(parent_run_id);
+      CREATE INDEX idx_runtime_runs_supersedes
+        ON runtime_runs(supersedes_run_id);
+      CREATE INDEX idx_runtime_history_diagnostics_conversation
+        ON runtime_history_diagnostics(conversation_id, created_at, id);
+
+      INSERT INTO runtime_history_diagnostics (
+        id, conversation_id, code, details_json, created_at
+      )
+      SELECT
+        'diag_legacy_dag_' || conversation.id,
+        conversation.id,
+        'LEGACY_DAG_BACKFILL_INVALID',
+        json_object(
+          'runCount', (
+            SELECT COUNT(*) FROM runtime_runs AS counted
+            WHERE counted.conversation_id = conversation.id
+          ),
+          'reason', 'incomplete_run_associations'
+        ),
+        COALESCE(
+          CASE
+            WHEN json_valid(conversation.time_json) THEN
+              CASE
+                WHEN json_type(conversation.time_json, '$.updated') IN ('integer', 'real')
+                  THEN json_extract(conversation.time_json, '$.updated')
+                ELSE NULL
+              END
+            ELSE NULL
+          END,
+          0
+        )
+      FROM runtime_conversations AS conversation
+      WHERE EXISTS (
+        SELECT 1
+        FROM runtime_runs AS run
+        WHERE run.conversation_id = conversation.id
+          AND (
+            run.parent_message_id IS NULL
+            OR run.assistant_message_id IS NULL
+            OR CASE
+              WHEN json_valid(run.time_json) THEN
+                CASE
+                  WHEN json_type(run.time_json, '$.created') IN ('integer', 'real')
+                    THEN 0
+                  ELSE 1
+                END
+              ELSE 1
+            END = 1
+            OR NOT EXISTS (
+              SELECT 1
+              FROM runtime_messages AS user_message
+              WHERE user_message.id = run.parent_message_id
+                AND user_message.conversation_id = run.conversation_id
+                AND user_message.role = 'user'
+            )
+            OR NOT EXISTS (
+              SELECT 1
+              FROM runtime_messages AS assistant_message
+              WHERE assistant_message.id = run.assistant_message_id
+                AND assistant_message.conversation_id = run.conversation_id
+                AND assistant_message.role = 'assistant'
+                AND assistant_message.run_id = run.id
+                AND assistant_message.parent_id = run.parent_message_id
+            )
+          )
+      );
+
+      UPDATE runtime_runs AS run
+      SET parent_run_id = (
+        SELECT previous.id
+        FROM runtime_runs AS previous
+        WHERE previous.conversation_id = run.conversation_id
+          AND (
+            CASE WHEN json_valid(previous.time_json) THEN
+              CASE
+                WHEN json_type(previous.time_json, '$.created') IN ('integer', 'real')
+                  THEN json_extract(previous.time_json, '$.created')
+                ELSE NULL
+              END
+            END
+              < CASE WHEN json_valid(run.time_json) THEN
+                CASE
+                  WHEN json_type(run.time_json, '$.created') IN ('integer', 'real')
+                    THEN json_extract(run.time_json, '$.created')
+                  ELSE NULL
+                END
+              END
+            OR (
+              CASE WHEN json_valid(previous.time_json) THEN
+                CASE
+                  WHEN json_type(previous.time_json, '$.created') IN ('integer', 'real')
+                    THEN json_extract(previous.time_json, '$.created')
+                  ELSE NULL
+                END
+              END
+                = CASE WHEN json_valid(run.time_json) THEN
+                  CASE
+                    WHEN json_type(run.time_json, '$.created') IN ('integer', 'real')
+                      THEN json_extract(run.time_json, '$.created')
+                    ELSE NULL
+                  END
+                END
+              AND previous.id < run.id
+            )
+          )
+        ORDER BY
+          CASE WHEN json_valid(previous.time_json) THEN
+            CASE
+              WHEN json_type(previous.time_json, '$.created') IN ('integer', 'real')
+                THEN json_extract(previous.time_json, '$.created')
+              ELSE NULL
+            END
+          END DESC,
+          previous.id DESC
+        LIMIT 1
+      )
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM runtime_history_diagnostics AS diagnostic
+        WHERE diagnostic.conversation_id = run.conversation_id
+          AND diagnostic.code = 'LEGACY_DAG_BACKFILL_INVALID'
+      );
+
+      UPDATE runtime_conversations AS conversation
+      SET
+        active_head_run_id = (
+          SELECT run.id
+          FROM runtime_runs AS run
+          WHERE run.conversation_id = conversation.id
+          ORDER BY
+            CASE WHEN json_valid(run.time_json) THEN
+              CASE
+                WHEN json_type(run.time_json, '$.created') IN ('integer', 'real')
+                  THEN json_extract(run.time_json, '$.created')
+                ELSE NULL
+              END
+            END DESC,
+            run.id DESC
+          LIMIT 1
+        ),
+        revision = (
+          SELECT COUNT(*)
+          FROM runtime_runs AS run
+          WHERE run.conversation_id = conversation.id
+        )
+      WHERE EXISTS (
+        SELECT 1 FROM runtime_runs AS run
+        WHERE run.conversation_id = conversation.id
+      )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM runtime_history_diagnostics AS diagnostic
+          WHERE diagnostic.conversation_id = conversation.id
+            AND diagnostic.code = 'LEGACY_DAG_BACKFILL_INVALID'
+        );
+    `,
+  },
 ];

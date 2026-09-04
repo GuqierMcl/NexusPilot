@@ -185,7 +185,7 @@ describe("OpenAPI docs", () => {
     expect(parameterNames(
       spec.paths["/v1/conversations/{conversationId}/messages"]?.get,
       "query",
-    )).toEqual(["format"]);
+    )).toEqual(["format", "view"]);
     expect(parameterNames(
       spec.paths["/v1/conversations/{conversationId}/runs"]?.get,
       "path",
@@ -234,6 +234,14 @@ describe("OpenAPI docs", () => {
       .toEqual(["type", "attachment_id"]);
     expect(runBody?.properties?.input?.properties?.parts?.items?.oneOf?.[1]?.properties?.type?.enum)
       .toEqual(["file"]);
+    const replacementSchema = runBody?.properties?.replace_from_message_id as
+      | { description?: string }
+      | undefined;
+    const replacementDescription = replacementSchema?.description ?? "";
+    expect(replacementDescription).toContain("replacement 分支");
+    expect(replacementDescription).toContain("supersedes");
+    expect(replacementDescription).toContain("transcript");
+    expect(replacementDescription).toContain("active 视图");
     expect(runBody?.properties).not.toHaveProperty("text");
     expect(runBody?.properties).not.toHaveProperty("provider_id");
     expect(runBody?.properties).not.toHaveProperty("model_id");

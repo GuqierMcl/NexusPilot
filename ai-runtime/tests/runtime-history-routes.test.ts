@@ -34,11 +34,15 @@ async function createAppWithHistoryFixtures() {
     title: "Recovered conversation",
     version: "1",
     status: { type: "idle" },
+    activeHeadRunId: "run_history",
+    revision: 1,
     time: { created: 1, updated: 10 },
   };
   const run: Run = {
     id: "run_history",
     conversationId: conversation.id,
+    parentMessageId: "msg_user",
+    assistantMessageId: "msg_assistant",
     agentMode: "ask",
     providerId: "openai",
     modelId: "gpt-4o",
@@ -137,6 +141,104 @@ async function createAppWithHistoryFixtures() {
 
   const app = await createApp(config(), { runtimeDatabase: db });
   return { app, db, store, run, permission };
+}
+
+async function createAppWithBranchedHistoryFixtures() {
+  const db = openRuntimeDatabase(":memory:");
+  const store = new RuntimeSqliteStore(db);
+  const conversation: Conversation = {
+    id: "conv_branched_history",
+    title: "Branched history",
+    version: "1",
+    status: { type: "idle" },
+    activeHeadRunId: "run_e",
+    revision: 5,
+    time: { created: 1, updated: 50 },
+  };
+  store.saveConversation(conversation);
+
+  const saveRunPair = (input: {
+    runId: Run["id"];
+    label: string;
+    created: number;
+    parentRunId?: Run["id"];
+    supersedesRunId?: Run["id"];
+  }): void => {
+    const userMessageId = `msg_user_${input.label.toLowerCase()}` as Message["id"];
+    const assistantMessageId = `msg_assistant_${input.label.toLowerCase()}` as Message["id"];
+    const run: Run = {
+      id: input.runId,
+      conversationId: conversation.id,
+      parentRunId: input.parentRunId,
+      supersedesRunId: input.supersedesRunId,
+      parentMessageId: userMessageId,
+      assistantMessageId,
+      agentMode: "ask",
+      providerId: "openai",
+      modelId: "gpt-4o",
+      status: "completed",
+      input: {
+        messageIds: [userMessageId],
+        prompt: {
+          version: "internal-prompt",
+          blockIds: ["must-not-leak"],
+          warnings: [],
+        },
+      },
+      output: { messageId: assistantMessageId, partIds: [] },
+      limits: { maxSteps: 1, maxToolCalls: 0 },
+      finish: "stop",
+      time: { created: input.created, completed: input.created + 1 },
+      metadata: { internalOnly: `secret-${input.label}` },
+    };
+    const userMessage: Message = {
+      id: userMessageId,
+      conversationId: conversation.id,
+      role: "user",
+      agentMode: "ask",
+      parts: [{
+        id: `part_user_${input.label.toLowerCase()}` as never,
+        conversationId: conversation.id,
+        messageId: userMessageId,
+        type: "text",
+        text: `Question ${input.label}`,
+        time: { created: input.created },
+      }],
+      time: { created: input.created, completed: input.created },
+    };
+    const assistantMessage: Message = {
+      id: assistantMessageId,
+      conversationId: conversation.id,
+      role: "assistant",
+      runId: input.runId,
+      parentId: userMessageId,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      agentMode: "ask",
+      status: { type: "complete", reason: "stop" },
+      parts: [],
+      finish: "stop",
+      time: { created: input.created + 1, completed: input.created + 1 },
+    };
+    store.saveMessage(userMessage);
+    store.saveRun(run);
+    store.saveMessage(assistantMessage);
+  };
+
+  saveRunPair({ runId: "run_a", label: "A", created: 10 });
+  saveRunPair({ runId: "run_b", label: "B", created: 20, parentRunId: "run_a" });
+  saveRunPair({ runId: "run_c", label: "C", created: 30, parentRunId: "run_b" });
+  saveRunPair({ runId: "run_d", label: "D", created: 40, parentRunId: "run_c" });
+  saveRunPair({
+    runId: "run_e",
+    label: "E",
+    created: 50,
+    parentRunId: "run_b",
+    supersedesRunId: "run_c",
+  });
+
+  const app = await createApp(config(), { runtimeDatabase: db });
+  return { app, db };
 }
 
 describe("runtime history routes", () => {
@@ -239,6 +341,7 @@ describe("runtime history routes", () => {
       title: "New conversation",
       version: "1",
       status: { type: "idle" },
+      revision: 0,
       time: { created: 20, updated: 20 },
       metadata: {
         client_thread_id: "__LOCALID_empty",
@@ -267,6 +370,7 @@ describe("runtime history routes", () => {
       title: "Busy conversation",
       version: "1",
       status: { type: "busy", runId: "run_history" },
+      revision: 1,
       time: { created: 1, updated: 10 },
     });
 
@@ -323,11 +427,21 @@ describe("runtime history routes", () => {
       new Request("http://localhost/v1/conversations/conv_history/messages"),
     );
     const runtimeBody = await runtimeResponse.json() as {
+      conversation_id: string;
+      active_head_run_id?: string;
+      revision: number;
+      view: string;
       format: string;
       messages: Array<{ id: string; parts: Array<{ type: string; text?: string }> }>;
     };
 
     expect(runtimeResponse.status).toBe(200);
+    expect(runtimeBody).toMatchObject({
+      conversation_id: "conv_history",
+      active_head_run_id: "run_history",
+      revision: 1,
+      view: "active",
+    });
     expect(runtimeBody.format).toBe("runtime");
     expect(runtimeBody.messages[1].parts[0]).toMatchObject({
       type: "text",
@@ -369,6 +483,95 @@ describe("runtime history routes", () => {
     db.close();
   });
 
+  test("returns active history by default and an explicit append-only transcript with DAG runs", async () => {
+    const { app, db } = await createAppWithBranchedHistoryFixtures();
+
+    const defaultResponse = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_branched_history/messages",
+    ));
+    const activeResponse = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_branched_history/messages?view=active",
+    ));
+    const transcriptResponse = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_branched_history/messages?view=transcript",
+    ));
+    const defaultBody = await defaultResponse.json() as {
+      conversation_id: string;
+      active_head_run_id?: string;
+      revision: number;
+      view: string;
+      format: string;
+      messages: Message[];
+      runs?: unknown[];
+    };
+    const activeBody = await activeResponse.json() as typeof defaultBody;
+    const transcriptBody = await transcriptResponse.json() as typeof defaultBody & {
+      runs: Array<Record<string, unknown>>;
+    };
+    const messageTexts = (messages: Message[]) => messages.flatMap((message) =>
+      message.parts.flatMap((part) => part.type === "text" ? [part.text] : [])
+    );
+
+    expect(defaultResponse.status).toBe(200);
+    expect(activeResponse.status).toBe(200);
+    expect(defaultBody).toEqual(activeBody);
+    expect(defaultBody).toMatchObject({
+      conversation_id: "conv_branched_history",
+      active_head_run_id: "run_e",
+      revision: 5,
+      view: "active",
+      format: "runtime",
+    });
+    expect(messageTexts(defaultBody.messages)).toEqual([
+      "Question A",
+      "Question B",
+      "Question E",
+    ]);
+    expect(defaultBody.runs).toBeUndefined();
+
+    expect(transcriptResponse.status).toBe(200);
+    expect(transcriptBody).toMatchObject({
+      conversation_id: "conv_branched_history",
+      active_head_run_id: "run_e",
+      revision: 5,
+      view: "transcript",
+      format: "runtime",
+    });
+    expect(messageTexts(transcriptBody.messages)).toEqual([
+      "Question A",
+      "Question B",
+      "Question C",
+      "Question D",
+      "Question E",
+    ]);
+    expect(transcriptBody.runs).toEqual([
+      expect.objectContaining({ id: "run_a", conversation_id: "conv_branched_history" }),
+      expect.objectContaining({ id: "run_b", parent_run_id: "run_a" }),
+      expect.objectContaining({ id: "run_c", parent_run_id: "run_b" }),
+      expect.objectContaining({ id: "run_d", parent_run_id: "run_c" }),
+      expect.objectContaining({
+        id: "run_e",
+        parent_run_id: "run_b",
+        supersedes_run_id: "run_c",
+      }),
+    ]);
+    for (const run of transcriptBody.runs) {
+      for (const sensitiveField of [
+        "input",
+        "output",
+        "error",
+        "usage",
+        "cost",
+        "limits",
+        "metadata",
+      ]) {
+        expect(run).not.toHaveProperty(sensitiveField);
+      }
+    }
+
+    db.close();
+  });
+
   test("restores the exact Provider error from a reopened SQLite Snapshot", async () => {
     const directory = mkdtempSync(join(tmpdir(), "nexuspilot-runtime-error-recovery-"));
     const databasePath = join(directory, "runtime.sqlite3");
@@ -393,11 +596,14 @@ describe("runtime history routes", () => {
         title: "Recovered Provider error",
         version: "1",
         status: { type: "error", error },
+        activeHeadRunId: "run_error_recovery",
+        revision: 1,
         time: { created: 1, updated: 4 },
       });
       initialStore.saveRun({
         id: "run_error_recovery",
         conversationId: "conv_error_recovery",
+        parentMessageId: "msg_error_user",
         assistantMessageId: "msg_error_recovery",
         agentMode: "ask",
         providerId: "openai",
@@ -622,6 +828,11 @@ describe("runtime history routes", () => {
       new Request("http://localhost/v1/conversations/conv_history/messages?format=bad"),
     );
     expect(formatResponse.status).toBe(422);
+
+    const viewResponse = await app.handle(
+      new Request("http://localhost/v1/conversations/conv_history/messages?view=bad"),
+    );
+    expect(viewResponse.status).toBe(422);
 
     db.close();
   });

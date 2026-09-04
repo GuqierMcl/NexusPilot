@@ -14,6 +14,7 @@ describe("runtime history projection", () => {
       title: "History",
       version: "1",
       status: { type: "busy", runId: "run_history" },
+      revision: 1,
       time: { created: 1, updated: 2 },
       metadata: { source: "test" },
     };

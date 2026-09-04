@@ -3,9 +3,11 @@ import { detailError } from "../core/errors";
 import {
   createRuntimeId,
   parseMessageHistoryFormat,
+  parseMessageHistoryView,
   projectConversationSummary,
   projectMessageHistory,
   projectRunSnapshot,
+  projectTranscriptRunSnapshot,
   interruptStoredRun,
   withConversationTitleMetadata,
   type ActiveRunRegistry,
@@ -32,7 +34,8 @@ export interface RuntimeConversationReadStore {
   deleteConversation(conversationId: ConversationId): Conversation | null;
   listConversations(options?: { limit?: number; withMessagesOnly?: boolean }): Conversation[];
   getConversation(id: ConversationId): Conversation | null;
-  listMessages(conversationId: ConversationId): Message[];
+  listTranscriptMessages(conversationId: ConversationId): Message[];
+  listActiveLineageMessages(conversationId: ConversationId): Message[];
   listRunsByConversation(conversationId: ConversationId): Run[];
   appendEvent(event: Event): void;
 }
@@ -66,6 +69,7 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
         title: parsed.title ?? "新对话",
         version: "1",
         status: { type: "idle" },
+        revision: 0,
         time: { created, updated: created },
         metadata: withConversationTitleMetadata(parsed.metadata, {
           source: parsed.title ? "user" : "fallback",
@@ -376,18 +380,37 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
         return detailError(422, "Invalid message history format");
       }
 
-      const messages = store.listMessages(conversation.id);
+      const view = parseMessageHistoryView(query.view);
+      if (!view) {
+        return detailError(422, "Invalid message history view");
+      }
+
+      const messages = view === "transcript"
+        ? store.listTranscriptMessages(conversation.id)
+        : store.listActiveLineageMessages(conversation.id);
       return {
         conversation_id: conversation.id,
+        ...(conversation.activeHeadRunId
+          ? { active_head_run_id: conversation.activeHeadRunId }
+          : {}),
+        revision: conversation.revision,
+        view,
         format,
         messages: projectMessageHistory(messages, format),
+        ...(view === "transcript"
+          ? {
+              runs: store
+                .listRunsByConversation(conversation.id)
+                .map(projectTranscriptRunSnapshot),
+            }
+          : {}),
       };
     }, {
       detail: {
         tags: ["对话与历史"],
         summary: "获取 Runtime 对话消息历史",
         description:
-          "从 Runtime Store 读取消息历史。format=runtime 返回内部 Message；format=ui 返回 assistant-ui friendly message shape；format=ai_sdk 返回 AI SDK 7 UIMessage shape。",
+          "默认从 Runtime Store 读取 active lineage；view=transcript 显式读取 append-only 审计历史并附带脱敏 Run DAG 关系。format=runtime 返回内部 Message；format=ui 返回 assistant-ui friendly message shape；format=ai_sdk 返回 AI SDK 7 UIMessage shape。",
         parameters: [
           conversationIdParameter,
           {
@@ -397,6 +420,13 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
             description: "消息投影格式，默认 runtime。",
             schema: { type: "string", enum: ["runtime", "ui", "ai_sdk"] },
           },
+          {
+            name: "view",
+            in: "query",
+            required: false,
+            description: "消息历史视图，默认 active；transcript 为显式审计视图。",
+            schema: { type: "string", enum: ["active", "transcript"] },
+          },
         ],
       },
       query: t.Object({
@@ -404,6 +434,12 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
           t.Union(
             [t.Literal("runtime"), t.Literal("ui"), t.Literal("ai_sdk")],
             { description: "消息投影格式，默认 runtime。" },
+          ),
+        ),
+        view: t.Optional(
+          t.Union(
+            [t.Literal("active"), t.Literal("transcript")],
+            { description: "消息历史视图，默认 active。" },
           ),
         ),
       }),

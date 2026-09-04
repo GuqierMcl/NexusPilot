@@ -13,11 +13,14 @@ describe("runtime domain contracts", () => {
   test("creates prefixed runtime identifiers", () => {
     const conversationId = createRuntimeId("conv");
     const runId = createRuntimeId("run");
+    const diagnosticId = createRuntimeId("diag");
 
     expect(conversationId.startsWith("conv_")).toBe(true);
     expect(runId.startsWith("run_")).toBe(true);
     expect(isRuntimeId(conversationId, "conv")).toBe(true);
     expect(isRuntimeId(runId, "conv")).toBe(false);
+    expect(diagnosticId.startsWith("diag_")).toBe(true);
+    expect(isRuntimeId(diagnosticId, "diag")).toBe(true);
   });
 
   test("allows rich conversation, run, message, and structured diff objects", () => {
@@ -26,12 +29,16 @@ describe("runtime domain contracts", () => {
       title: "SQL rewrite analysis",
       version: "1",
       status: { type: "idle" },
+      activeHeadRunId: "run_test",
+      revision: 3,
       time: { created: 1, updated: 1 },
     };
 
     const run: Run = {
       id: "run_test",
       conversationId: conversation.id,
+      parentRunId: "run_parent",
+      supersedesRunId: "run_previous",
       agentMode: "ask",
       providerId: "openai",
       modelId: "gpt-4o",
@@ -113,5 +120,9 @@ describe("runtime domain contracts", () => {
 
     expect(message.parts[0]?.type).toBe("diff");
     expect(diff.target.type).toBe("memory");
+    expect(conversation.activeHeadRunId).toBe("run_test");
+    expect(conversation.revision).toBe(3);
+    expect(run.parentRunId).toBe("run_parent");
+    expect(run.supersedesRunId).toBe("run_previous");
   });
 });

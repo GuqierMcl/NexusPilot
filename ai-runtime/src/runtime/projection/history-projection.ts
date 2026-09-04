@@ -1,4 +1,11 @@
-import type { Conversation, Message, Permission, Run } from "../core/types";
+import { messageHistoryViewSchema } from "../core/schemas";
+import type {
+  Conversation,
+  Message,
+  MessageHistoryView,
+  Permission,
+  Run,
+} from "../core/types";
 import { projectMessageToAiSdkUIMessage, type AiSdkUIMessageLike } from "./ai-sdk-projection";
 import { projectMessageToUiMessage, type UiMessageLike } from "./ui-projection";
 
@@ -16,17 +23,22 @@ export interface ConversationSummarySnapshot {
 export interface RunSnapshot {
   id: string;
   conversation_id: string;
+  parent_run_id?: string;
+  supersedes_run_id?: string;
   agent_mode: Run["agentMode"];
   provider_id: string;
   model_id: string;
   status: Run["status"];
+  finish?: Run["finish"];
+  time: Run["time"];
+}
+
+export interface RunDetailSnapshot extends RunSnapshot {
   input: Run["input"];
   output?: Run["output"];
   usage?: Run["usage"];
   cost?: Run["cost"];
-  finish?: Run["finish"];
   error?: Run["error"];
-  time: Run["time"];
   limits: Run["limits"];
   metadata?: Record<string, unknown>;
 }
@@ -126,6 +138,16 @@ export function projectPermissionSnapshot(permission: Permission) {
 
 export type MessageHistoryProjection = Message[] | UiMessageLike[] | AiSdkUIMessageLike[];
 
+export interface ConversationMessagesSnapshot {
+  conversation_id: string;
+  active_head_run_id?: string;
+  revision: number;
+  view: MessageHistoryView;
+  format: MessageHistoryFormat;
+  messages: MessageHistoryProjection;
+  runs?: RunSnapshot[];
+}
+
 export function projectConversationSummary(
   conversation: Conversation,
 ): ConversationSummarySnapshot {
@@ -141,10 +163,12 @@ export function projectConversationSummary(
   };
 }
 
-export function projectRunSnapshot(run: Run): RunSnapshot {
+export function projectRunSnapshot(run: Run): RunDetailSnapshot {
   return {
     id: run.id,
     conversation_id: run.conversationId,
+    ...(run.parentRunId ? { parent_run_id: run.parentRunId } : {}),
+    ...(run.supersedesRunId ? { supersedes_run_id: run.supersedesRunId } : {}),
     agent_mode: run.agentMode,
     provider_id: run.providerId,
     model_id: run.modelId,
@@ -158,6 +182,21 @@ export function projectRunSnapshot(run: Run): RunSnapshot {
     time: run.time,
     limits: run.limits,
     ...(run.metadata ? { metadata: run.metadata } : {}),
+  };
+}
+
+export function projectTranscriptRunSnapshot(run: Run): RunSnapshot {
+  return {
+    id: run.id,
+    conversation_id: run.conversationId,
+    ...(run.parentRunId ? { parent_run_id: run.parentRunId } : {}),
+    ...(run.supersedesRunId ? { supersedes_run_id: run.supersedesRunId } : {}),
+    agent_mode: run.agentMode,
+    provider_id: run.providerId,
+    model_id: run.modelId,
+    status: run.status,
+    ...(run.finish ? { finish: run.finish } : {}),
+    time: run.time,
   };
 }
 
@@ -186,6 +225,15 @@ export function parseMessageHistoryFormat(value: unknown): MessageHistoryFormat 
   }
 
   return null;
+}
+
+export function parseMessageHistoryView(value: unknown): MessageHistoryView | null {
+  if (value === undefined) {
+    return "active";
+  }
+
+  const parsed = messageHistoryViewSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
 }
 
 function getActiveRunId(status: Conversation["status"]): string | undefined {
