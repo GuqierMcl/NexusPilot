@@ -104,7 +104,17 @@ Run 终态包含 `completed`、`failed`、`interrupted`；历史 `cancelled` 占
 - `diff`
 - `error`
 
-其中 `text` 与 `file` 已由当前 Run 使用；`tool` 和 `source` 已由 Runtime-local `web_fetch` 在工具完成边界生成。`FilePart` 只保存最终 `attachmentId`、不可变 `mediaType`、`filename` 与 `byteLength` 展示快照，不保存 bytes、URL、data URL、用户路径、Provider file ID 或 access token。AI SDK stream 中的 `text` / `reasoning` delta 会在 Runtime 内存中按 `start -> delta -> end` 生命周期聚合，并在完成或中断边界保存为多个独立 `TextPart` / `ReasoningPart`；Runtime 不逐条持久化 delta，但会保留 message parts 的相对顺序。即使 provider 在 `end` 后复用同一个 stream id，新的 `start` 也必须生成新的 Runtime part，避免历史恢复时丢失后续 reasoning UI。`diff` 等其余 Part 仍是领域模型能力，具体业务执行能力需要后续阶段接入。
+其中 `text` 与 `file` 已由当前 Run 使用；`tool` 和 `source` 已由 Runtime-local `web_fetch` 在工具完成边界生成。`FilePart` 只保存最终 `attachmentId`、不可变 `mediaType`、`filename` 与 `byteLength` 展示快照，不保存 bytes、URL、data URL、用户路径、Provider file ID 或 access token。AI SDK stream 中的 `text` / `reasoning` delta 会在 Runtime 内存中按 `start -> delta -> end` 生命周期聚合，并在完成、失败或中断边界保存为多个独立 `TextPart` / `ReasoningPart`；Runtime 不逐条持久化 delta，但会保留 message parts 的相对顺序。即使 provider 在 `end` 后复用同一个 stream id，新的 `start` 也必须生成新的 Runtime part，避免历史恢复时丢失后续 reasoning UI。`step-start` 记录模型多步边界，使跨 Run model-history projector 能重建合法的 Assistant/tool message 序列。`diff` 等其余 Part 仍是领域模型能力，具体业务执行能力需要后续阶段接入。
+
+TextPart、ReasoningPart 与 ToolPart 的 `metadata.providerMetadata` 保存 AI SDK 提供的 Provider 不透明 JSON；同一 Part 的后续 stream chunk 只有在实际携带 metadata 时才覆盖当前值。metadata 通过既有 JSON-backed Part 存储完成 SQLite round-trip，不需要新增表或迁移。该字段不进入普通 UI 或日志，只在历史 AssistantMessage 与目标 Run 的 `providerId/modelId` 完全相同时作为 AI SDK `providerOptions` 重放；不同模型会剥离旧 metadata，并把非空 reasoning 投影为普通 Assistant text。
+
+ToolPart 同时保存两种工具身份：顶层 `toolName` 是 Runtime canonical ID，`metadata.providerToolName` 是该次 AI SDK 调用实际使用的 Provider tool name。前者用于 Tool Core、审计和 UI，后者用于后续模型历史中严格配对的 tool-call/tool-result。旧 ToolPart 缺少 `providerToolName` 时只回退既有 `toolName`，不迁移、不通过当前 registry 反推旧名称；新写入必须保留两者。
+
+Runtime model-history projection 与 UI projection 是两个不同的读侧 adapter。前者向模型表达 User/System 文本、历史附件、Assistant text/reasoning、工具调用及其终态结果；后者服务 assistant-ui 展示。model-history projection 只读取 Store，不执行工具、不触发 Permission，也不把 Source、Diff、Retry、Compaction 或 UI/事件状态发送给模型。历史非终态工具只在该模型视图中 fail closed 为 interrupted error result，Store 事实不被改写。
+
+模型执行失败的 `RuntimeError` 可以保留任意非空上游 error name，`data` 只包含原始 message 和上游实际提供的可选 `statusCode/isRetryable`。新写入不包含 stack、headers、request/response body 或完整 Provider 对象；Runtime 当前明确持有的完整 secret 若出现在 message 中，只做精确 `[REDACTED]` 替换。AI SDK full stream 的标准 error part 立即写入 failed Run 和 Assistant error，保留此前已经聚合的 text/reasoning/tool parts，并把未终态 ToolPart 与 ToolCall 收敛为 error；后续 finish 通知不能覆盖该终态。Run、Conversation 与 AssistantMessage 保存同一错误值，因此 Snapshot/重启恢复与 live SSE 使用相同正文。
+
+AI SDK UIMessage Snapshot 把该状态投影到 `metadata.custom.nexus.status.error.data.message`，Workbench 从这一持久化字段恢复错误卡正文。每次模型失败只追加一条 `runtime.error` durable EventLog 记录；对应 EventBus envelope 是 best-effort live notification，不提供事件补偿，断线或刷新仍以 Snapshot 为准。
 
 ## Diff 设计
 
@@ -229,6 +239,8 @@ interrupt command API 会修改 Runtime Store 中的 Run、Assistant Message、T
 ## 明确未实现
 
 当前领域模型与持久化批次不包含：
+
+- 自动上下文压缩、token 预算、摘要 checkpoint 或工具安全账本；当前跨 Run 模型视图使用完整语义历史，不静默按 Part 类型裁剪。
 
 - Rust / Tauri IPC 集成。
 - 数据库 workbench 业务工具，如 `connect_profile`、`browse_table_data`。

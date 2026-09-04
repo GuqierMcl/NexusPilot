@@ -11,10 +11,11 @@ import {
   type FinishReason as AiFinishReason,
   type LanguageModel,
   type LanguageModelUsage,
-  type StreamTextOnErrorCallback,
+  InvalidToolInputError,
+  NoSuchToolError,
   type TextStreamPart,
+  ToolCallRepairError,
   type ToolSet,
-  type UserContent,
 } from "ai";
 import { createRuntimeId, type RuntimeId, type RuntimeIdPrefix } from "../core/ids";
 import {
@@ -46,7 +47,6 @@ import {
   type PreparedToolInvocationRegistry,
 } from "../tools";
 import type {
-  FilePart,
   FinishReason,
   InterruptReason,
   PermissionId,
@@ -54,7 +54,6 @@ import type {
   Run,
   Part,
   RunContextSnapshot,
-  RuntimeError,
   ToolCall,
   ToolCallId,
   ToolError,
@@ -66,12 +65,13 @@ import type {
   ToolPart,
   SourcePart,
 } from "../core/types";
-import {
-  ATTACHMENT_LIMITS,
-  RuntimeAttachmentError,
-  type RuntimeAttachmentService,
-} from "../attachments";
+import type { RuntimeAttachmentService } from "../attachments";
 import { mapAiSdkUsage } from "../core/usage";
+import { projectModelHistory } from "../projection/model-history-projection";
+import {
+  modelErrorMessage,
+  toRuntimeModelError,
+} from "./model-error";
 import type {
   RuntimeNetworkPolicy,
   RuntimeToolApprovalPolicy,
@@ -86,39 +86,52 @@ export type RuntimeTextChunk =
   | {
       type: "text-start";
       id?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "text-delta";
       id?: string;
       text: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "text-end";
       id?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "reasoning-start";
       id?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "reasoning-delta";
       id?: string;
       text: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "reasoning-end";
       id?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-input-start";
       toolCallId: string;
       toolName: string;
       title?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-input-delta";
       toolCallId: string;
       delta: string;
+      providerMetadata?: Record<string, unknown>;
+    }
+  | {
+      type: "tool-input-end";
+      toolCallId: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-call";
@@ -127,6 +140,7 @@ export type RuntimeTextChunk =
       input: unknown;
       title?: string;
       invalid?: boolean;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-result";
@@ -135,6 +149,7 @@ export type RuntimeTextChunk =
       input?: unknown;
       output: unknown;
       title?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-error";
@@ -143,6 +158,7 @@ export type RuntimeTextChunk =
       input?: unknown;
       error: unknown;
       title?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-approval-request";
@@ -152,6 +168,7 @@ export type RuntimeTextChunk =
       input: unknown;
       title?: string;
       isAutomatic?: boolean;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-approval-response";
@@ -162,6 +179,7 @@ export type RuntimeTextChunk =
       approved: boolean;
       reason?: string;
       title?: string;
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: "tool-output-denied";
@@ -197,6 +215,7 @@ interface RuntimeToolCallEventValue {
   toolName: string;
   input: unknown;
   title?: string;
+  providerMetadata?: Record<string, unknown>;
 }
 
 interface RuntimeToolCallStartEvent {
@@ -272,6 +291,7 @@ export interface RuntimeTextRunnerDependencies {
   continuations?: RunContinuationRegistry;
   getToolApprovalPolicy?: () => RuntimeToolApprovalPolicy;
   getNetworkPolicy?: () => RuntimeNetworkPolicy;
+  getErrorMessageSecrets?: () => readonly string[];
 }
 
 export interface RuntimeTextRunResult {
@@ -563,7 +583,13 @@ export class RuntimeTextRunner {
       };
       committedStart = started;
       const messages: ModelMessage[] = [
-        ...(await buildModelMessages(history, this.deps.attachmentService)),
+        ...(await projectModelHistory(history, {
+          attachmentService: this.deps.attachmentService,
+          target: {
+            providerId: waitingRun.providerId,
+            modelId: waitingRun.modelId,
+          },
+        })),
         ...continuationResponsePrefix,
       ];
 
@@ -587,14 +613,30 @@ export class RuntimeTextRunner {
         this.deps.store.getRun(runId)?.status === "running"
       ) {
         const failedStart = committedStart;
-        committedRunner.fail(failedStart, toRuntimeError(error));
+        const runtimeError = toRuntimeModelError(
+          error,
+          this.deps.getErrorMessageSecrets?.() ?? [],
+        );
+        const failedAt = (this.deps.now ?? Date.now)();
+        const currentMessage = this.deps.store.getMessage(
+          failedStart.assistantMessage.id,
+        );
+        const failedParts = structuredClone(
+          currentMessage?.parts ?? failedStart.assistantMessage.parts,
+        );
+        finalizeSemanticToolPartsForFailure(
+          failedParts,
+          failedAt,
+          runtimeError.data.message,
+        );
+        committedRunner.fail(failedStart, runtimeError, { parts: failedParts });
         finalizeUnfinishedToolCalls({
           store: this.deps.store,
           createId: this.deps.createId ?? createRuntimeId,
           runId,
-          completedAt: (this.deps.now ?? Date.now)(),
+          completedAt: failedAt,
           state: "error",
-          message: "Runtime continuation failed after permission commit.",
+          message: runtimeError.data.message,
         });
         this.deps.preparedInvocations?.clearRun(runId);
         void this.deps.backendToolExecutor?.cleanupRun?.(runId);
@@ -604,10 +646,16 @@ export class RuntimeTextRunner {
           response: withRuntimeHeaders(createUIMessageStreamResponse({
             stream: createUIMessageStream({
               execute: ({ writer }) => {
-                writer.write({ type: "error", errorText: safeUiErrorMessage(error) });
+                writer.write({
+                  type: "error",
+                  errorText: runtimeError.data.message,
+                });
               },
               generateId: () => failedStart.assistantMessage.id,
-              onError: safeUiErrorMessage,
+              onError: (streamError) => modelErrorMessage(
+                streamError,
+                this.deps.getErrorMessageSecrets?.() ?? [],
+              ),
             }),
           }), failedStart),
         };
@@ -660,6 +708,7 @@ export class RuntimeTextRunner {
         id: ToolCallId;
         partId: RuntimeId<"part">;
         toolName: string;
+        providerToolName: string;
         input: Record<string, unknown>;
         startedAt: number;
       }
@@ -671,6 +720,27 @@ export class RuntimeTextRunner {
       { toolName: string; raw: string; title?: string }
     >();
     const invalidToolCallIds = new Set<string>();
+    const toolScopedErrorObjects = new WeakSet<object>();
+    const toolScopedErrorPrimitives = new Set<unknown>();
+    const markToolScopedStreamError = (error: unknown): void => {
+      if (typeof error === "object" && error !== null) {
+        toolScopedErrorObjects.add(error);
+        return;
+      }
+      toolScopedErrorPrimitives.add(error);
+    };
+    const isToolScopedStreamError = (error: unknown): boolean => {
+      if (
+        InvalidToolInputError.isInstance(error) ||
+        NoSuchToolError.isInstance(error) ||
+        ToolCallRepairError.isInstance(error)
+      ) {
+        return true;
+      }
+      return typeof error === "object" && error !== null
+        ? toolScopedErrorObjects.has(error)
+        : toolScopedErrorPrimitives.has(error);
+    };
     const now = this.deps.now ?? Date.now;
     for (const part of semanticParts) {
       if (
@@ -687,6 +757,7 @@ export class RuntimeTextRunner {
         id: part.toolCallId,
         partId: part.id,
         toolName: part.toolName,
+        providerToolName: readProviderToolName(part),
         input: toolInput,
         startedAt: part.time && "start" in part.time
           ? part.time.start
@@ -705,8 +776,14 @@ export class RuntimeTextRunner {
       }
       toolPartByAiSdkId.set(aiSdkToolCallId, part);
     }
-    const canonicalToolName = (name: string): string =>
-      this.deps.toolRegistry?.getCanonicalId(name) ?? name;
+    const resolveToolIdentity = (name: string): {
+      canonicalName: string;
+      providerName: string;
+    } => {
+      const canonicalName = this.deps.toolRegistry?.getCanonicalId(name) ?? name;
+      const providerName = this.deps.toolRegistry?.getProviderName(canonicalName) ?? name;
+      return { canonicalName, providerName };
+    };
     const writeFailure = (error: unknown): void => {
       if (terminalWritten) {
         return;
@@ -715,17 +792,48 @@ export class RuntimeTextRunner {
       terminalWritten = true;
       cleanupActiveRun();
       cleanupPreparedRun();
-      const failed = runner.fail(started, toRuntimeError(error));
+      const completedAt = now();
+      const runtimeError = toRuntimeModelError(
+        error,
+        this.deps.getErrorMessageSecrets?.() ?? [],
+      );
+      const parts = createSemanticParts(completedAt);
+      finalizeSemanticToolPartsForFailure(
+        parts,
+        completedAt,
+        `Runtime Run failed: ${runtimeError.name}`,
+      );
+      const failed = runner.fail(
+        started,
+        runtimeError,
+        { parts },
+      );
       finalizeUnfinishedToolCalls({
         store: this.deps.store,
         createId,
         runId: started.run.id,
-        completedAt: now(),
+        completedAt,
         state: "error",
         message: `Runtime Run failed: ${failed.error.name}`,
       });
     };
-    const startTextPart = (streamId: string, aiSdkTextId?: string): TextPart => {
+    const updatePartProviderMetadata = (
+      part: Part,
+      providerMetadata: Record<string, unknown> | undefined,
+    ): void => {
+      if (!providerMetadata) {
+        return;
+      }
+      part.metadata = {
+        ...(part.metadata ?? {}),
+        providerMetadata: structuredClone(providerMetadata),
+      };
+    };
+    const startTextPart = (
+      streamId: string,
+      aiSdkTextId?: string,
+      providerMetadata?: Record<string, unknown>,
+    ): TextPart => {
       let part = textPartByStreamId.get(streamId);
       if (!part) {
         part = createTextPart({
@@ -736,9 +844,12 @@ export class RuntimeTextRunner {
           created: started.assistantMessage.time.created,
           completed: started.assistantMessage.time.created,
           aiSdkTextId,
+          providerMetadata,
         });
         textPartByStreamId.set(streamId, part);
         semanticParts.push(part);
+      } else {
+        updatePartProviderMetadata(part, providerMetadata);
       }
 
       return part;
@@ -748,12 +859,13 @@ export class RuntimeTextRunner {
     ): void => {
       finalText += chunk.text;
       const streamId = chunk.id?.trim() || "__default_text__";
-      const part = startTextPart(streamId, chunk.id);
+      const part = startTextPart(streamId, chunk.id, chunk.providerMetadata);
       part.text += chunk.text;
     };
     const startReasoningPart = (
       streamId: string,
       aiSdkReasoningId?: string,
+      providerMetadata?: Record<string, unknown>,
     ): ReasoningPart => {
       let part = reasoningPartByStreamId.get(streamId);
       if (!part) {
@@ -765,9 +877,12 @@ export class RuntimeTextRunner {
           created: started.assistantMessage.time.created,
           completed: started.assistantMessage.time.created,
           aiSdkReasoningId,
+          providerMetadata,
         });
         reasoningPartByStreamId.set(streamId, part);
         semanticParts.push(part);
+      } else {
+        updatePartProviderMetadata(part, providerMetadata);
       }
 
       return part;
@@ -776,7 +891,11 @@ export class RuntimeTextRunner {
       chunk: Extract<RuntimeTextChunk, { type: "reasoning-delta" }>,
     ): void => {
       const streamId = chunk.id?.trim() || "__default_reasoning__";
-      const part = startReasoningPart(streamId, chunk.id);
+      const part = startReasoningPart(
+        streamId,
+        chunk.id,
+        chunk.providerMetadata,
+      );
       part.text += chunk.text;
     };
     const ensureToolSlot = (input: {
@@ -788,13 +907,15 @@ export class RuntimeTextRunner {
       id: ToolCallId;
       partId: RuntimeId<"part">;
       toolName: string;
+      providerToolName: string;
       input: Record<string, unknown>;
       startedAt: number;
     } => {
       const existing = toolSlotsByAiSdkId.get(input.aiSdkToolCallId);
-      const toolName = canonicalToolName(input.toolName);
+      const identity = resolveToolIdentity(input.toolName);
       if (existing) {
-        existing.toolName = toolName;
+        existing.toolName = identity.canonicalName;
+        existing.providerToolName = identity.providerName;
         if (input.toolInput) {
           existing.input = input.toolInput;
         }
@@ -804,7 +925,8 @@ export class RuntimeTextRunner {
       const slot = {
         id: createId("tool"),
         partId: createId("part"),
-        toolName,
+        toolName: identity.canonicalName,
+        providerToolName: identity.providerName,
         input: input.toolInput ?? {},
         startedAt: input.startedAt,
       };
@@ -817,6 +939,7 @@ export class RuntimeTextRunner {
       toolInput?: Record<string, unknown>;
       title?: string;
       startedAt: number;
+      providerMetadata?: Record<string, unknown>;
     }): ToolPart => {
       const slot = ensureToolSlot({
         aiSdkToolCallId: input.aiSdkToolCallId,
@@ -827,6 +950,10 @@ export class RuntimeTextRunner {
       const existing = toolPartByAiSdkId.get(input.aiSdkToolCallId);
       if (existing) {
         existing.toolName = slot.toolName;
+        existing.metadata = {
+          ...(existing.metadata ?? {}),
+          providerToolName: slot.providerToolName,
+        };
         if (
           existing.state.status === "pending" ||
           existing.state.status === "running" ||
@@ -839,6 +966,7 @@ export class RuntimeTextRunner {
             time: { start: slot.startedAt },
           };
         }
+        updatePartProviderMetadata(existing, input.providerMetadata);
         return existing;
       }
 
@@ -856,7 +984,13 @@ export class RuntimeTextRunner {
           time: { start: slot.startedAt },
         },
         time: { start: slot.startedAt },
-        metadata: { aiSdkToolCallId: input.aiSdkToolCallId },
+        metadata: {
+          aiSdkToolCallId: input.aiSdkToolCallId,
+          providerToolName: slot.providerToolName,
+          ...(input.providerMetadata
+            ? { providerMetadata: structuredClone(input.providerMetadata) }
+            : {}),
+        },
       };
       toolPartByAiSdkId.set(input.aiSdkToolCallId, part);
       semanticParts.push(part);
@@ -884,10 +1018,11 @@ export class RuntimeTextRunner {
     };
     const createSemanticParts = (completedAt: number): Part[] => {
       const parts: Part[] = [];
+      const hasSignedReasoning = semanticParts.some(hasAnthropicReasoningSignature);
 
       for (const part of semanticParts) {
         if (part.type === "text") {
-          if (part.text.length > 0) {
+          if (part.text.length > 0 || hasSignedReasoning) {
             parts.push({
               ...part,
               time: {
@@ -904,11 +1039,12 @@ export class RuntimeTextRunner {
           continue;
         }
 
-        const text = part.text.trim();
-        if (text.length > 0) {
+        if (
+          part.text.length > 0 ||
+          readPartProviderMetadata(part) !== undefined
+        ) {
           parts.push({
             ...part,
-            text,
             time: {
               start: started.assistantMessage.time.created,
               end: completedAt,
@@ -963,11 +1099,18 @@ export class RuntimeTextRunner {
     });
 
     let result: RuntimeStreamTextResult;
+    let streamedStepCount = 0;
     try {
       const messages = continuationMessages ??
-        await buildModelMessages(
+        await projectModelHistory(
           this.deps.store.listMessages(started.conversation.id),
-          this.deps.attachmentService,
+          {
+            attachmentService: this.deps.attachmentService,
+            target: {
+              providerId: request.providerId,
+              modelId: request.modelId,
+            },
+          },
         );
       const aiSdkTools = this.deps.toolRegistry
         ? runtimeToolsToAiSdkToolSet({
@@ -1025,28 +1168,43 @@ export class RuntimeTextRunner {
         onChunk: ({ chunk }) => {
           switch (chunk.type) {
             case "text-start":
-              startTextPart(chunk.id?.trim() || "__default_text__", chunk.id);
+              startTextPart(
+                chunk.id?.trim() || "__default_text__",
+                chunk.id,
+                chunk.providerMetadata,
+              );
               break;
             case "text-delta":
               appendTextDelta(chunk);
               break;
-            case "text-end":
-              textPartByStreamId.delete(chunk.id?.trim() || "__default_text__");
+            case "text-end": {
+              const streamId = chunk.id?.trim() || "__default_text__";
+              const part = textPartByStreamId.get(streamId);
+              if (part) {
+                updatePartProviderMetadata(part, chunk.providerMetadata);
+              }
+              textPartByStreamId.delete(streamId);
               break;
+            }
             case "reasoning-start":
               startReasoningPart(
                 chunk.id?.trim() || "__default_reasoning__",
                 chunk.id,
+                chunk.providerMetadata,
               );
               break;
             case "reasoning-delta":
               appendReasoningDelta(chunk);
               break;
-            case "reasoning-end":
-              reasoningPartByStreamId.delete(
-                chunk.id?.trim() || "__default_reasoning__",
-              );
+            case "reasoning-end": {
+              const streamId = chunk.id?.trim() || "__default_reasoning__";
+              const part = reasoningPartByStreamId.get(streamId);
+              if (part) {
+                updatePartProviderMetadata(part, chunk.providerMetadata);
+              }
+              reasoningPartByStreamId.delete(streamId);
               break;
+            }
             case "tool-input-start":
               streamedToolInputByAiSdkId.set(chunk.toolCallId, {
                 toolName: chunk.toolName,
@@ -1058,12 +1216,24 @@ export class RuntimeTextRunner {
                 toolName: chunk.toolName,
                 title: chunk.title,
                 startedAt: now(),
+                providerMetadata: chunk.providerMetadata,
               });
               break;
             case "tool-input-delta": {
               const streamedInput = streamedToolInputByAiSdkId.get(chunk.toolCallId);
               if (streamedInput) {
                 streamedInput.raw += chunk.delta;
+              }
+              const toolPart = toolPartByAiSdkId.get(chunk.toolCallId);
+              if (toolPart) {
+                updatePartProviderMetadata(toolPart, chunk.providerMetadata);
+              }
+              break;
+            }
+            case "tool-input-end": {
+              const toolPart = toolPartByAiSdkId.get(chunk.toolCallId);
+              if (toolPart) {
+                updatePartProviderMetadata(toolPart, chunk.providerMetadata);
               }
               break;
             }
@@ -1078,6 +1248,7 @@ export class RuntimeTextRunner {
                 toolInput: chunk.invalid ? {} : toRecord(chunk.input),
                 title: chunk.title ?? streamedInput?.title,
                 startedAt: now(),
+                providerMetadata: chunk.providerMetadata,
               });
               break;
             }
@@ -1114,6 +1285,7 @@ export class RuntimeTextRunner {
                   completedAt,
                 }),
               );
+              updatePartProviderMetadata(toolPart, chunk.providerMetadata);
 
               const sourcePart = createSourcePartFromToolResult({
                 id: createId("part"),
@@ -1129,6 +1301,7 @@ export class RuntimeTextRunner {
               break;
             }
             case "tool-error": {
+              markToolScopedStreamError(chunk.error);
               const completedAt = now();
               const validationError = invalidToolCallIds.has(chunk.toolCallId);
               const input = validationError ? {} : toRecord(chunk.input);
@@ -1171,6 +1344,7 @@ export class RuntimeTextRunner {
                   completedAt,
                 }),
               );
+              updatePartProviderMetadata(toolPart, chunk.providerMetadata);
               break;
             }
             case "tool-approval-request": {
@@ -1189,6 +1363,7 @@ export class RuntimeTextRunner {
                   toolInput: input,
                   title: chunk.title,
                   startedAt: slot.startedAt,
+                  providerMetadata: chunk.providerMetadata,
                 });
                 const persistedToolCall = this.deps.store.getToolCall(slot.id);
                 if (
@@ -1223,6 +1398,7 @@ export class RuntimeTextRunner {
                 toolInput: input,
                 title: chunk.title,
                 startedAt: slot.startedAt,
+                providerMetadata: chunk.providerMetadata,
               });
               if (toolPart.state.status === "error") {
                 break;
@@ -1231,6 +1407,9 @@ export class RuntimeTextRunner {
                 ...(toolPart.metadata ?? {}),
                 aiSdkToolCallId: chunk.toolCallId,
                 aiSdkApprovalId: chunk.approvalId,
+                ...(chunk.providerMetadata
+                  ? { providerMetadata: structuredClone(chunk.providerMetadata) }
+                  : {}),
               };
               toolPart.state = {
                 status: "waiting_for_permission",
@@ -1259,6 +1438,7 @@ export class RuntimeTextRunner {
                 toolInput: input,
                 title: chunk.title,
                 startedAt: slot.startedAt,
+                providerMetadata: chunk.providerMetadata,
               });
               const persistedToolCall = this.deps.store.getToolCall(slot.id);
               if (
@@ -1327,6 +1507,17 @@ export class RuntimeTextRunner {
               });
               break;
             case "start-step":
+              semanticParts.push({
+                id: createId("part"),
+                conversationId: started.conversation.id,
+                messageId: started.assistantMessage.id,
+                type: "step-start",
+                stepIndex: previousStepCount + streamedStepCount,
+                time: { created: now() },
+              });
+              streamedStepCount += 1;
+              resetActiveStreamParts();
+              break;
             case "finish-step":
               resetActiveStreamParts();
               break;
@@ -1400,6 +1591,7 @@ export class RuntimeTextRunner {
             toolInput: input,
             title,
             startedAt: slot.startedAt,
+            providerMetadata: event.toolCall.providerMetadata,
           });
           toolPart.state = {
             status: "running",
@@ -1413,6 +1605,9 @@ export class RuntimeTextRunner {
         onToolCallFinish: (event) => {
           const completedAt = now();
           const input = toRecord(event.toolCall.input);
+          if (!event.success) {
+            markToolScopedStreamError(event.error);
+          }
           const slot = ensureToolSlot({
             aiSdkToolCallId: event.toolCall.toolCallId,
             toolName: event.toolCall.toolName,
@@ -1445,6 +1640,7 @@ export class RuntimeTextRunner {
             startedAt,
             completedAt,
           }));
+          updatePartProviderMetadata(toolPart, event.toolCall.providerMetadata);
 
           const sourcePart = createSourcePartFromToolResult({
             id: createId("part"),
@@ -1468,11 +1664,17 @@ export class RuntimeTextRunner {
             execute: ({ writer }) => {
               writer.write({
                 type: "error",
-                errorText: safeUiErrorMessage(error),
+                errorText: modelErrorMessage(
+                  error,
+                  this.deps.getErrorMessageSecrets?.() ?? [],
+                ),
               });
             },
             generateId: () => started.assistantMessage.id,
-            onError: safeUiErrorMessage,
+            onError: (streamError) => modelErrorMessage(
+              streamError,
+              this.deps.getErrorMessageSecrets?.() ?? [],
+            ),
           }),
         }), started),
       };
@@ -1484,7 +1686,15 @@ export class RuntimeTextRunner {
         result.toUIMessageStreamResponse({
           consumeSseStream: consumeStream,
           generateMessageId: () => started.assistantMessage.id,
-          onError: safeUiErrorMessage,
+          onError: (streamError) => {
+            if (!isToolScopedStreamError(streamError)) {
+              writeFailure(streamError);
+            }
+            return modelErrorMessage(
+              streamError,
+              this.deps.getErrorMessageSecrets?.() ?? [],
+            );
+          },
         }),
         started,
       ),
@@ -1646,6 +1856,38 @@ function finalizeUnfinishedToolCalls(input: {
   }
 }
 
+function finalizeSemanticToolPartsForFailure(
+  parts: Part[],
+  completedAt: number,
+  message: string,
+): void {
+  for (const part of parts) {
+    if (
+      part.type !== "tool" ||
+      part.state.status === "completed" ||
+      part.state.status === "error" ||
+      part.state.status === "interrupted"
+    ) {
+      continue;
+    }
+    const input = "input" in part.state ? (part.state.input ?? {}) : {};
+    const startedAt = part.time && "start" in part.time
+      ? part.time.start
+      : completedAt;
+    part.state = {
+      status: "error",
+      input,
+      error: {
+        code: "INTERNAL_ERROR",
+        message,
+        retryable: false,
+      },
+      time: { start: startedAt, end: completedAt },
+    };
+    part.time = { start: startedAt, end: completedAt };
+  }
+}
+
 function addTokenUsage(
   previous: TokenUsage | undefined,
   current: TokenUsage,
@@ -1787,9 +2029,6 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
           stepCount: event.steps.length,
         })
     : undefined;
-  const onError: StreamTextOnErrorCallback | undefined = input.onError
-    ? (event) => input.onError?.({ error: event.error })
-    : undefined;
   const prompt = input.messages && input.messages.length > 0
     ? { messages: input.messages }
     : { prompt: input.prompt ?? "" };
@@ -1818,6 +2057,7 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
             toolName: event.toolCall.toolName,
             input: event.toolCall.input,
             title: event.toolCall.title,
+            providerMetadata: event.toolCall.providerMetadata,
           },
         })
       : undefined,
@@ -1829,6 +2069,7 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
               toolName: event.toolCall.toolName,
               input: event.toolCall.input,
               title: event.toolCall.title,
+              providerMetadata: event.toolCall.providerMetadata,
             },
             durationMs: event.toolExecutionMs,
           };
@@ -1846,19 +2087,45 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
         }
       : undefined,
   });
-  if (input.onChunk) {
-    void consumeRuntimeFullStream(
+  const runtimeFactsSettled = input.onChunk
+    ? consumeRuntimeFullStream(
       result.fullStream,
       input.onChunk,
       input.onError,
       input.onAbort,
-    );
-  }
+    )
+    : Promise.resolve();
 
   return {
-    toUIMessageStreamResponse: (options) => result.toUIMessageStreamResponse(options),
+    toUIMessageStreamResponse: (options) => withRuntimeFactsBarrier(
+      result.toUIMessageStreamResponse(options),
+      runtimeFactsSettled,
+    ),
   };
 };
+
+function withRuntimeFactsBarrier(
+  response: Response,
+  runtimeFactsSettled: PromiseLike<void>,
+): Response {
+  if (!response.body) {
+    return response;
+  }
+
+  const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+    },
+    async flush() {
+      await runtimeFactsSettled;
+    },
+  }));
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
 
 async function consumeRuntimeFullStream(
   stream: AsyncIterable<TextStreamPart<ToolSet>>,
@@ -1868,6 +2135,10 @@ async function consumeRuntimeFullStream(
 ): Promise<void> {
   try {
     for await (const part of stream) {
+      if (part.type === "error") {
+        await onError?.({ error: part.error });
+        continue;
+      }
       if (part.type === "abort") {
         await onAbort?.({ reason: "stream aborted" });
         continue;
@@ -1880,99 +2151,6 @@ async function consumeRuntimeFullStream(
   } catch (error) {
     await onError?.({ error });
   }
-}
-
-async function buildModelMessages(
-  messages: Message[],
-  attachmentService?: RuntimeAttachmentService | null,
-): Promise<ModelMessage[]> {
-  const fileParts = messages.flatMap((message) =>
-    message.role === "user"
-      ? message.parts.filter(isPromptFilePart)
-      : [],
-  );
-  const totalBytes = fileParts.reduce((sum, part) => sum + part.byteLength, 0);
-  if (totalBytes > ATTACHMENT_LIMITS.maxRunHistoryAttachmentBytes) {
-    throw new RuntimeAttachmentError(
-      "ATTACHMENT_HISTORY_SIZE_EXCEEDED",
-      "本次运行的历史附件总量超过 100 MiB 限制。",
-      413,
-      { limit_bytes: ATTACHMENT_LIMITS.maxRunHistoryAttachmentBytes },
-    );
-  }
-  if (fileParts.length > 0 && !attachmentService) {
-    throw new RuntimeAttachmentError(
-      "ATTACHMENT_CONTENT_MISSING",
-      "附件存储服务不可用。",
-      503,
-    );
-  }
-
-  const loaded = await mapWithConcurrency(
-    fileParts,
-    ATTACHMENT_LIMITS.readConcurrency,
-    async (part) => [part.id, await attachmentService!.readBytes(part.attachmentId)] as const,
-  );
-  const bytesByPartId = new Map(loaded);
-
-  return messages.flatMap((message): ModelMessage[] => {
-    if (message.role === "user") {
-      if (!message.parts.some(isPromptFilePart)) {
-        const text = extractTextContent(message);
-        return text ? [{ role: "user", content: text }] : [];
-      }
-      const content: UserContent = [];
-      for (const part of message.parts) {
-        if (isPromptTextPart(part)) {
-          content.push({ type: "text", text: part.text });
-          continue;
-        }
-        if (isPromptFilePart(part)) {
-          const data = bytesByPartId.get(part.id);
-          if (!data) {
-            throw new RuntimeAttachmentError(
-              "ATTACHMENT_CONTENT_MISSING",
-              "附件内容未能加载。",
-              500,
-            );
-          }
-          content.push({
-            type: "file",
-            mediaType: part.mediaType,
-            filename: part.filename,
-            data: { type: "data", data },
-          });
-        }
-      }
-      return content.length > 0
-        ? [{ role: "user", content } satisfies ModelMessage]
-        : [];
-    }
-
-    const text = extractTextContent(message);
-    return text
-      ? [{ role: message.role, content: text } satisfies ModelMessage]
-      : [];
-  });
-}
-
-async function mapWithConcurrency<T, TResult>(
-  values: readonly T[],
-  concurrency: number,
-  mapper: (value: T) => Promise<TResult>,
-): Promise<TResult[]> {
-  const results = new Array<TResult>(values.length);
-  let nextIndex = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, values.length) }, async () => {
-      while (nextIndex < values.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        results[index] = await mapper(values[index]!);
-      }
-    }),
-  );
-  return results;
 }
 
 function extractTextContent(message: Message): string | null {
@@ -1989,10 +2167,6 @@ function isPromptTextPart(part: Part): part is TextPart {
   return part.type === "text" && !part.ignored;
 }
 
-function isPromptFilePart(part: Part): part is FilePart {
-  return part.type === "file";
-}
-
 function extractRequestText(request: RunRequest): string {
   return request.parts
     ?.filter((part) => part.type === "text")
@@ -2001,18 +2175,12 @@ function extractRequestText(request: RunRequest): string {
     .join("\n\n") ?? "";
 }
 
-function safeUiErrorMessage(error: unknown): string {
-  if (error instanceof RuntimeAttachmentError) {
-    return error.message;
-  }
-  return "模型执行失败。当前模型可能不支持所发送的附件，请检查模型或附件后重试。";
-}
-
 function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | null {
   if (chunk.type === "text-start") {
     return {
       type: "text-start",
       id: chunk.id,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2021,6 +2189,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       type: "text-delta",
       id: chunk.id,
       text: chunk.text,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2028,6 +2197,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
     return {
       type: "text-end",
       id: chunk.id,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2035,6 +2205,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
     return {
       type: "reasoning-start",
       id: chunk.id,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2043,6 +2214,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       type: "reasoning-delta",
       id: chunk.id,
       text: chunk.text,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2050,6 +2222,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
     return {
       type: "reasoning-end",
       id: chunk.id,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2059,6 +2232,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       toolCallId: chunk.id,
       toolName: chunk.toolName,
       title: chunk.title,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2067,6 +2241,15 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       type: "tool-input-delta",
       toolCallId: chunk.id,
       delta: chunk.delta,
+      providerMetadata: chunk.providerMetadata,
+    };
+  }
+
+  if (chunk.type === "tool-input-end") {
+    return {
+      type: "tool-input-end",
+      toolCallId: chunk.id,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2077,6 +2260,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       toolName: chunk.toolName,
       input: chunk.input,
       title: chunk.title,
+      providerMetadata: chunk.providerMetadata,
       ...("invalid" in chunk && chunk.invalid === true
         ? { invalid: true }
         : {}),
@@ -2091,6 +2275,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       input: chunk.input,
       output: chunk.output,
       title: chunk.title,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2102,6 +2287,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       input: chunk.input,
       error: chunk.error,
       title: chunk.title,
+      providerMetadata: chunk.providerMetadata,
     };
   }
 
@@ -2114,6 +2300,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       input: chunk.toolCall.input,
       title: chunk.toolCall.title,
       isAutomatic: chunk.isAutomatic,
+      providerMetadata: chunk.toolCall.providerMetadata,
     };
   }
 
@@ -2127,6 +2314,7 @@ function toRuntimeTextChunk(chunk: TextStreamPart<ToolSet>): RuntimeTextChunk | 
       approved: chunk.approved,
       reason: chunk.reason,
       title: chunk.toolCall.title,
+      providerMetadata: chunk.toolCall.providerMetadata,
     };
   }
 
@@ -2170,7 +2358,14 @@ function createTextPart(input: {
   created: number;
   completed: number;
   aiSdkTextId?: string;
+  providerMetadata?: Record<string, unknown>;
 }): TextPart {
+  const metadata = {
+    ...(input.aiSdkTextId ? { aiSdkTextId: input.aiSdkTextId } : {}),
+    ...(input.providerMetadata
+      ? { providerMetadata: structuredClone(input.providerMetadata) }
+      : {}),
+  };
   return {
     id: input.id,
     conversationId: input.conversationId,
@@ -2178,7 +2373,7 @@ function createTextPart(input: {
     type: "text",
     text: input.text,
     time: { start: input.created, end: input.completed },
-    ...(input.aiSdkTextId ? { metadata: { aiSdkTextId: input.aiSdkTextId } } : {}),
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
   };
 }
 
@@ -2190,18 +2385,50 @@ function createReasoningPart(input: {
   created: number;
   completed: number;
   aiSdkReasoningId?: string;
+  providerMetadata?: Record<string, unknown>;
 }): ReasoningPart {
+  const metadata = {
+    ...(input.aiSdkReasoningId
+      ? { aiSdkReasoningId: input.aiSdkReasoningId }
+      : {}),
+    ...(input.providerMetadata
+      ? { providerMetadata: structuredClone(input.providerMetadata) }
+      : {}),
+  };
   return {
     id: input.id,
     conversationId: input.conversationId,
     messageId: input.messageId,
     type: "reasoning",
-    text: input.text.trim(),
+    text: input.text,
     time: { start: input.created, end: input.completed },
-    ...(input.aiSdkReasoningId
-      ? { metadata: { aiSdkReasoningId: input.aiSdkReasoningId } }
-      : {}),
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
   };
+}
+
+function readPartProviderMetadata(
+  part: Part,
+): Record<string, unknown> | undefined {
+  const value = part.metadata?.providerMetadata;
+  return isRecord(value) ? value : undefined;
+}
+
+function readProviderToolName(part: ToolPart): string {
+  const providerToolName = part.metadata?.providerToolName;
+  return typeof providerToolName === "string" && providerToolName.trim().length > 0
+    ? providerToolName
+    : part.toolName;
+}
+
+function hasAnthropicReasoningSignature(part: Part): boolean {
+  if (part.type !== "reasoning") {
+    return false;
+  }
+  const providerMetadata = readPartProviderMetadata(part);
+  const anthropic = isRecord(providerMetadata?.anthropic)
+    ? providerMetadata.anthropic
+    : null;
+  return anthropic?.signature != null;
 }
 
 function createToolPart(input: {
@@ -2495,23 +2722,4 @@ function mapStreamAbortReason(reason: string | undefined): InterruptReason {
   }
 
   return "client_disconnect";
-}
-
-function toRuntimeError(error: unknown): RuntimeError {
-  if (error instanceof Error) {
-    return {
-      name: "APIError",
-      data: {
-        message: safeUiErrorMessage(error),
-        isRetryable: false,
-      },
-    };
-  }
-
-  return {
-    name: "UnknownError",
-    data: {
-      message: "模型执行失败，请检查模型与附件后重试。",
-    },
-  };
 }

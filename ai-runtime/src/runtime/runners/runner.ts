@@ -10,6 +10,7 @@ import {
   type RuntimeRunCompleted,
   type RuntimeRunCompletionOptions,
   type RuntimeRunFailed,
+  type RuntimeRunFailureOptions,
   type RuntimeRunInterrupted,
   type RuntimeRunInterruptOptions,
   type RuntimeRunnerDependencies,
@@ -354,7 +355,11 @@ export class RuntimeRunner {
     return { conversation, run, assistantMessage, textPart };
   }
 
-  fail(started: RuntimeRunStarted, error: RuntimeError): RuntimeRunFailed {
+  fail(
+    started: RuntimeRunStarted,
+    error: RuntimeError,
+    options: RuntimeRunFailureOptions = {},
+  ): RuntimeRunFailed {
     const completedAt = this.now();
     const currentConversation =
       this.deps.store.getConversation(started.conversation.id) ??
@@ -374,6 +379,7 @@ export class RuntimeRunner {
     const assistantMessage: AssistantMessage = {
       ...started.assistantMessage,
       status: { type: "error", error },
+      parts: options.parts ?? started.assistantMessage.parts,
       finish: "error",
       error,
       time: { ...started.assistantMessage.time, completed: completedAt },

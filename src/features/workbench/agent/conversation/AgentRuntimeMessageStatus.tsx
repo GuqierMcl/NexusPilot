@@ -1,14 +1,22 @@
 "use client";
 
 import { useAuiState } from "@assistant-ui/react";
-import { AlertCircleIcon, BanIcon } from "lucide-react";
+import { useState } from "react";
+import {
+  AlertCircleIcon,
+  BanIcon,
+  CheckIcon,
+  CopyIcon,
+} from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { getRuntimeMessageStatusView } from "@/features/workbench/agent/state";
 import { cn } from "@/lib/utils";
 
 export function AgentRuntimeMessageStatus() {
   const metadata = useAuiState((state) => state.message.metadata);
   const status = getRuntimeMessageStatusView(metadata);
+  const [copied, setCopied] = useState(false);
 
   if (!status) {
     return null;
@@ -23,6 +31,15 @@ export function AgentRuntimeMessageStatus() {
     );
   }
 
+  const copyDescription = async (): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(status.description);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+
   return (
     <div
       className={cn(
@@ -30,11 +47,24 @@ export function AgentRuntimeMessageStatus() {
         "text-xs text-destructive dark:bg-destructive/5 dark:text-red-200",
       )}
     >
-      <div className="flex items-center gap-1.5 font-medium">
-        <AlertCircleIcon className="size-3.5" />
-        <span>{status.label}</span>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-1.5 font-medium">
+          <AlertCircleIcon className="size-3.5" />
+          <span>{status.label}</span>
+        </div>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className="text-current hover:bg-destructive/10 hover:text-current"
+          aria-label="复制错误信息"
+          title={copied ? "已复制" : "复制错误信息"}
+          onClick={() => void copyDescription()}
+        >
+          {copied ? <CheckIcon /> : <CopyIcon />}
+        </Button>
       </div>
-      <div className="mt-1 line-clamp-2 text-[11px] opacity-90">
+      <div className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] opacity-90 [overflow-wrap:anywhere]">
         {status.description}
       </div>
     </div>

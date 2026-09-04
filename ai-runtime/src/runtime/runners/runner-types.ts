@@ -209,6 +209,10 @@ export interface RuntimeRunFailed {
   error: RuntimeError;
 }
 
+export interface RuntimeRunFailureOptions {
+  parts?: Part[];
+}
+
 export interface RuntimeRunInterruptOptions {
   reason: InterruptReason;
   message?: string;

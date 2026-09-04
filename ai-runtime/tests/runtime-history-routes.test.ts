@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createApp } from "../src/app";
 import {
   RuntimeEventBus,
@@ -364,6 +367,155 @@ describe("runtime history routes", () => {
     });
 
     db.close();
+  });
+
+  test("restores the exact Provider error from a reopened SQLite Snapshot", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "nexuspilot-runtime-error-recovery-"));
+    const databasePath = join(directory, "runtime.sqlite3");
+    let initialDb: ReturnType<typeof openRuntimeDatabase> | null = null;
+    let reopenedDb: ReturnType<typeof openRuntimeDatabase> | null = null;
+    const errorMessage =
+      "  maximum context length exceeded\nrequest  id: snapshot_1  ";
+    const error = {
+      name: "ContextLengthError",
+      data: {
+        message: errorMessage,
+        statusCode: 400,
+        isRetryable: false,
+      },
+    };
+
+    try {
+      initialDb = openRuntimeDatabase(databasePath);
+      const initialStore = new RuntimeSqliteStore(initialDb);
+      initialStore.saveConversation({
+        id: "conv_error_recovery",
+        title: "Recovered Provider error",
+        version: "1",
+        status: { type: "error", error },
+        time: { created: 1, updated: 4 },
+      });
+      initialStore.saveRun({
+        id: "run_error_recovery",
+        conversationId: "conv_error_recovery",
+        assistantMessageId: "msg_error_recovery",
+        agentMode: "ask",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        status: "failed",
+        input: { messageIds: ["msg_error_user"] },
+        output: {
+          messageId: "msg_error_recovery",
+          partIds: ["part_error_partial"],
+        },
+        limits: { maxSteps: 50, maxToolCalls: 300 },
+        finish: "error",
+        error,
+        time: { created: 2, started: 2, completed: 4 },
+      });
+      initialStore.saveMessage({
+        id: "msg_error_user",
+        conversationId: "conv_error_recovery",
+        role: "user",
+        agentMode: "ask",
+        model: { providerId: "openai", modelId: "gpt-4o" },
+        parts: [{
+          id: "part_error_user",
+          conversationId: "conv_error_recovery",
+          messageId: "msg_error_user",
+          type: "text",
+          text: "Trigger a Provider error",
+          time: { created: 2 },
+        }],
+        time: { created: 2, completed: 2 },
+      });
+      initialStore.saveMessage({
+        id: "msg_error_recovery",
+        conversationId: "conv_error_recovery",
+        role: "assistant",
+        runId: "run_error_recovery",
+        parentId: "msg_error_user",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        agentMode: "ask",
+        status: { type: "error", error },
+        parts: [{
+          id: "part_error_partial",
+          conversationId: "conv_error_recovery",
+          messageId: "msg_error_recovery",
+          type: "text",
+          text: "Partial before failure",
+          time: { start: 3, end: 4 },
+        }],
+        finish: "error",
+        error,
+        time: { created: 3, completed: 4 },
+      });
+      initialDb.close();
+      initialDb = null;
+
+      reopenedDb = openRuntimeDatabase(databasePath);
+      const app = await createApp(config(), { runtimeDatabase: reopenedDb });
+      const response = await app.handle(new Request(
+        "http://localhost/v1/conversations/conv_error_recovery/messages?format=ai_sdk",
+      ));
+      const body = await response.json() as {
+        format: string;
+        messages: Array<{
+          id: string;
+          role: string;
+          parts: Array<{ type: string; text?: string }>;
+          metadata?: {
+            custom?: {
+              nexus?: {
+                status?: {
+                  type?: string;
+                  error?: {
+                    name?: string;
+                    data?: { message?: string; statusCode?: number; isRetryable?: boolean };
+                  };
+                };
+              };
+            };
+          };
+        }>;
+      };
+      const recovered = body.messages.find(
+        (message) => message.id === "msg_error_recovery",
+      );
+
+      expect(response.status).toBe(200);
+      expect(body.format).toBe("ai_sdk");
+      expect(recovered).toMatchObject({
+        id: "msg_error_recovery",
+        role: "assistant",
+        parts: [{ type: "text", text: "Partial before failure" }],
+        metadata: {
+          custom: {
+            nexus: {
+              status: {
+                type: "error",
+                error: {
+                  name: "ContextLengthError",
+                  data: {
+                    message: errorMessage,
+                    statusCode: 400,
+                    isRetryable: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+      expect(
+        recovered?.metadata?.custom?.nexus?.status?.error?.data?.message,
+      ).toBe(errorMessage);
+    } finally {
+      initialDb?.close();
+      reopenedDb?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test("gets run detail, run events, and run traces", async () => {

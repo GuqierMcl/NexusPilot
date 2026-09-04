@@ -5,6 +5,7 @@ import {
   RuntimeRunner,
   RuntimeSqliteStore,
   type RuntimeError,
+  type TextPart,
 } from "../src/runtime";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
 
@@ -469,6 +470,36 @@ describe("RuntimeRunner", () => {
     expect(failed.run.error).toEqual(error);
     expect(failed.assistantMessage.status).toEqual({ type: "error", error });
     expect(store.getRun(started.run.id)).toEqual(failed.run);
+
+    db.close();
+  });
+
+  test("preserves accumulated semantic parts when a run fails", () => {
+    const { db, store, runner } = createRunner();
+    const started = runner.start({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Hello",
+    });
+    const partialPart: TextPart = {
+      id: "part_partial" as TextPart["id"],
+      conversationId: started.conversation.id,
+      messageId: started.assistantMessage.id,
+      type: "text" as const,
+      text: "Partial answer",
+      time: { start: 1, end: 2 },
+    };
+    const error: RuntimeError = {
+      name: "ProviderStreamError",
+      data: { message: "provider stream failed" },
+    };
+
+    const failed = runner.fail(started, error, { parts: [partialPart] });
+
+    expect(failed.assistantMessage.parts).toEqual([partialPart]);
+    expect(store.getMessage(started.assistantMessage.id)?.parts).toEqual([
+      partialPart,
+    ]);
 
     db.close();
   });

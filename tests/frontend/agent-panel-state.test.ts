@@ -218,6 +218,30 @@ describe("getRuntimeMessageStatusView", () => {
         });
     });
 
+    test("preserves Runtime error whitespace and newlines exactly", () => {
+        const message = "  maximum context length exceeded\nrequest id: abc  ";
+
+        expect(
+            getRuntimeMessageStatusView({
+                custom: {
+                    nexus: {
+                        status: {
+                            type: "error",
+                            error: {
+                                name: "APICallError",
+                                data: { message },
+                            },
+                        },
+                    },
+                },
+            }),
+        ).toEqual({
+            kind: "failed",
+            label: "执行失败",
+            description: message,
+        });
+    });
+
     test("reads Runtime status from assistant-ui preserved custom metadata", () => {
         expect(
             getRuntimeMessageStatusView({
