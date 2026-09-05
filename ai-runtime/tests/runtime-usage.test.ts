@@ -248,6 +248,7 @@ describe("Runtime per-step ContextUsage", () => {
     const db = openRuntimeDatabase(":memory:");
     const store = new RuntimeSqliteStore(db);
     let id = 0;
+    let forecastCalls = 0;
     const model = new MockLanguageModelV3({
       doStream: async () => ({
         stream: simulateReadableStream({
@@ -285,6 +286,30 @@ describe("Runtime per-step ContextUsage", () => {
           requestIndex: number;
           retainedMessages?: ModelMessage[];
         }) => preparedUsageContext(input),
+        forecastNextTurn: () => {
+          forecastCalls += 1;
+          return {
+            conversationId: "conv_unused",
+            sourceHeadRunId: "run_unused",
+            sourceConversationRevision: 1,
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextWindow: 4_000,
+            estimatedInputTokens: 132,
+            view: "raw" as const,
+            breakdown: {
+              rawTokens: 102,
+              checkpointTokens: 0,
+              safetyStateTokens: 10,
+              systemPromptTokens: 10,
+              toolSchemaTokens: 10,
+            },
+            estimatorVersion: "utf8-bytes-v1",
+            policyVersion: "1",
+            checkpointFormatVersion: "1",
+            reason: "append" as const,
+          };
+        },
       } as never,
     });
 
@@ -298,16 +323,225 @@ describe("Runtime per-step ContextUsage", () => {
 
     expect(chunks.filter((chunk) => chunk.type === "message-metadata")).toEqual([]);
     expect(metadataChunks.map((chunk) => chunk.type)).toEqual(["start", "finish"]);
+    expect(forecastCalls).toBe(1);
     expect(metadataChunks[0]?.messageMetadata).toMatchObject({
       custom: { nexus: { contextUsage: { source: "estimate" } } },
     });
     expect(metadataChunks[1]?.messageMetadata).toMatchObject({
       custom: {
         nexus: {
-          contextUsage: { source: "provider", providerInputTokens: 11 },
+          contextUsage: {
+            estimatedInputTokens: 132,
+            providerInputTokens: 11,
+            reservedOutputTokens: 100,
+            activeTokens: 132,
+            source: "estimate",
+          },
         },
       },
     });
+    expect(store.listContextUsagesByRun(result.started.run.id)[0]).toMatchObject({
+      estimatedInputTokens: 100,
+      nextTurnForecast: {
+        estimatedInputTokens: 132,
+        reason: "append",
+      },
+    });
+    db.close();
+  });
+
+  test("persists and streams a next-turn forecast when pre-turn compaction fails", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let id = 0;
+    let modelCalls = 0;
+    const compactionError = new Error("Context summary generator returned blank output");
+    compactionError.name = "ContextSummaryValidationError";
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        throw new Error("main model must not run");
+      },
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId: (prefix) => `${prefix}_${++id}` as never,
+      now: () => 2_500 + id,
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 4_000,
+            outputLength: 100,
+          },
+        },
+      }),
+      contextManager: {
+        prepare: async (input: { conversationId: string; runId: string }) => {
+          store.appendTrace({
+            id: `trace_${++id}`,
+            conversationId: input.conversationId as never,
+            runId: input.runId as never,
+            type: "context.compaction.failed",
+            level: "error",
+            time: 2_500 + id,
+            payload: {
+              trigger: "auto_pre_turn",
+              requestIndex: 0,
+              sourceHeadRunId: input.runId,
+              sourceConversationRevision: 1,
+              beforeEstimatedInputTokens: 3_500,
+              errorName: "ContextSummaryValidationError",
+            },
+          });
+          throw compactionError;
+        },
+        forecastNextTurn: (input: {
+          conversationId: string;
+          runId: string;
+          providerId: string;
+          modelId: string;
+        }) => ({
+          conversationId: input.conversationId,
+          sourceHeadRunId: input.runId,
+          sourceConversationRevision: 1,
+          providerId: input.providerId,
+          modelId: input.modelId,
+          contextWindow: 4_000,
+          estimatedInputTokens: 3_520,
+          view: "raw" as const,
+          breakdown: {
+            rawTokens: 3_490,
+            checkpointTokens: 0,
+            safetyStateTokens: 10,
+            systemPromptTokens: 10,
+            toolSchemaTokens: 10,
+          },
+          estimatorVersion: "utf8-bytes-v1",
+          policyVersion: "1",
+          checkpointFormatVersion: "1",
+          reason: "append" as const,
+        }),
+      } as never,
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "trigger compaction",
+    });
+    const chunks = parseSseData(await result.response.text());
+    const usage = store.listContextUsagesByRun(result.started.run.id)[0];
+
+    expect(modelCalls).toBe(0);
+    expect(store.getRun(result.started.run.id)).toMatchObject({ status: "failed" });
+    expect(usage).toMatchObject({
+      estimatedInputTokens: 3_520,
+      nextTurnForecast: { estimatedInputTokens: 3_520, reason: "append" },
+    });
+    expect(chunks.find((chunk) => chunk.type === "start")?.messageMetadata).toMatchObject({
+      custom: {
+        nexus: {
+          contextUsage: { activeTokens: 3_520, source: "estimate" },
+          compaction: { status: "failed", beforeTokens: 3_500 },
+        },
+      },
+    });
+    db.close();
+  });
+
+  test("labels model and branch forecast recomputations instead of treating them as append-only", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let id = 0;
+    const reasons: string[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start" as const, id: `text-${++id}` },
+            { type: "text-delta" as const, id: `text-${id}`, delta: "done" },
+            { type: "text-end" as const, id: `text-${id}` },
+            {
+              type: "finish" as const,
+              finishReason: { unified: "stop" as const, raw: undefined },
+              logprobs: undefined,
+              usage: modelUsage(10),
+            },
+          ],
+        }),
+      }),
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId: (prefix) => `${prefix}_${++id}` as never,
+      now: () => 2_800 + id,
+      resolveLanguageModel: ({ providerId, modelId }) => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: { providerId, modelId, contextLength: 4_000, outputLength: 100 },
+        },
+      }),
+      contextManager: {
+        prepare: async (input: { requestIndex: number }) => preparedUsageContext(input),
+        forecastNextTurn: (input: {
+          conversationId: string;
+          runId: string;
+          providerId: string;
+          modelId: string;
+          reason: string;
+        }) => {
+          reasons.push(input.reason);
+          return {
+            conversationId: input.conversationId,
+            sourceHeadRunId: input.runId,
+            sourceConversationRevision: reasons.length,
+            providerId: input.providerId,
+            modelId: input.modelId,
+            contextWindow: 4_000,
+            estimatedInputTokens: 100 + reasons.length,
+            view: "raw" as const,
+            breakdown: {
+              rawTokens: 70 + reasons.length,
+              checkpointTokens: 0,
+              safetyStateTokens: 10,
+              systemPromptTokens: 10,
+              toolSchemaTokens: 10,
+            },
+            estimatorVersion: "utf8-bytes-v1",
+            policyVersion: "1",
+            checkpointFormatVersion: "1",
+            reason: input.reason as "append" | "model_changed" | "branch_changed",
+          };
+        },
+      } as never,
+    });
+
+    const first = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "first",
+    });
+    await first.response.text();
+    const switched = await runner.streamText({
+      conversationId: first.started.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-5",
+      text: "switch model",
+    });
+    await switched.response.text();
+    const edited = await runner.streamText({
+      conversationId: first.started.conversation.id,
+      providerId: "openai",
+      modelId: "gpt-5",
+      text: "replace first",
+      replaceFromMessageId: first.started.userMessage.id,
+    });
+    await edited.response.text();
+
+    expect(reasons).toEqual(["append", "model_changed", "branch_changed"]);
     db.close();
   });
 
@@ -501,6 +735,10 @@ describe("Runtime per-step ContextUsage", () => {
               toolSchemaTokens: 10,
             },
           },
+          instructions: [{
+            role: "system" as const,
+            content: `boundary ${input.requestIndex}`,
+          }],
           messages: [{ role: "user", content: `request ${input.requestIndex}` }],
           marker: input.requestIndex === 0
             ? {
@@ -586,9 +824,10 @@ describe("Runtime per-step ContextUsage", () => {
       result.started.assistantMessage.id,
       result.started.assistantMessage.id,
     ]);
-    expect(preparedMessages[1]).toEqual({
+    expect(preparedMessages[1]).toMatchObject({
       messages: [{ role: "user", content: "request 1" }],
     });
+    expect(JSON.stringify(preparedMessages[1])).toContain("boundary 1");
     expect(store.listContextUsagesByRun(result.started.run.id)).toMatchObject([
       {
         requestIndex: 0,
@@ -630,8 +869,8 @@ describe("Runtime per-step ContextUsage", () => {
             estimatedInputTokens: 102,
             providerInputTokens: 42,
             reservedOutputTokens: 100,
-            activeTokens: 142,
-            source: "provider",
+            activeTokens: 102,
+            source: "estimate",
             view: "raw",
           },
           compaction: {

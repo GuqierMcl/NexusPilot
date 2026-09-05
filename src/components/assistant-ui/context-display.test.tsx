@@ -14,26 +14,27 @@ import {
 } from "./context-display";
 
 describe("ContextDisplay usage", () => {
-  test("uses request-scoped ContextUsage instead of legacy cumulative tokens", () => {
+  test("uses the next-turn forecast instead of Provider input, reserve, or legacy totals", () => {
     expect(getContextDisplayUsage({
       runtimeUsage: {
         contextWindow: 1000,
         estimatedInputTokens: 400,
         providerInputTokens: 380,
         reservedOutputTokens: 120,
-        activeTokens: 500,
-        source: "provider",
+        activeTokens: 400,
+        source: "estimate",
         view: "checkpoint",
         checkpointId: "ckpt_1",
       },
       legacyTotalTokens: 9000,
       legacyContextWindow: 128000,
     })).toEqual({
-      totalTokens: 500,
+      totalTokens: 400,
       modelContextWindow: 1000,
-      percent: 50,
-      source: "provider",
+      percent: 40,
+      source: "estimate",
       view: "checkpoint",
+      providerInputTokens: 380,
       reservedOutputTokens: 120,
       isLegacy: false,
     });
@@ -114,7 +115,7 @@ describe("ContextDisplay usage", () => {
     expect(markup.includes(">640<")).toBe(false);
   });
 
-  test("Runtime tooltip shows uncapped request usage without legacy segments", () => {
+  test("Runtime tooltip separates the forecast, Provider observation, and output reserve", () => {
     const markup = renderToStaticMarkup(createElement(ContextDisplayContentView, {
       usage: {
         totalTokens: 9000,
@@ -126,18 +127,21 @@ describe("ContextDisplay usage", () => {
       totalTokens: 1300,
       percent: 100,
       modelContextWindow: 1000,
-      source: "provider",
+      source: "estimate",
       view: "checkpoint",
+      providerInputTokens: 950,
       reservedOutputTokens: 300,
       isLegacy: false,
     }));
 
     expect(markup.includes("1.3k / 1k")).toBe(true);
-    expect(markup.includes("活动输入")).toBe(true);
-    expect(markup.includes("Provider 观测")).toBe(true);
+    expect(markup.includes("当前上下文估算")).toBe(true);
+    expect(markup.includes("最近 Provider 实测输入")).toBe(true);
+    expect(markup.includes(">950<")).toBe(true);
     expect(markup.includes("检查点")).toBe(true);
-    expect(markup.includes("预留输出")).toBe(true);
+    expect(markup.includes("输出预留")).toBe(true);
     expect(markup.includes(">300<")).toBe(true);
+    expect(markup.includes("活动输入")).toBe(false);
     expect(markup.includes("缓存输入")).toBe(false);
     expect(markup.includes(">9k<")).toBe(false);
   });
@@ -176,7 +180,7 @@ describe("ContextDisplay usage", () => {
       runtimeUsageState,
     }));
 
-    expect(markup.includes(">50%<")).toBe(true);
+    expect(markup.includes(">40%<")).toBe(true);
   });
 
   test("Composer keeps unknown Runtime window metadata without a selected model", () => {

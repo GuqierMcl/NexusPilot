@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { ModelMessage } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 
+import { generateRuntimeContextSummary } from "../src/app";
+
 import {
   ContextCompactionService,
   ContextPreparationLeaseLostError,
@@ -12,7 +14,7 @@ import {
   ContextSummaryValidationError,
   CONTEXT_ESTIMATOR_OVERHEAD,
   DEFAULT_CONTEXT_COMPACTION_POLICY,
-  buildContextSummaryMessages,
+  buildContextSummaryPrompt,
   buildRuntimeSafetyState,
   computeContextPlanRequestHash,
   ModelContextManager,
@@ -21,6 +23,7 @@ import {
   type AssistantMessage,
   type ContextCompactionRequest,
   type ContextCompactionResult,
+  type ContextPreparationClaim,
   type ModelContextPreparationInput,
   type ContextSummaryGenerator,
   type Conversation,
@@ -209,7 +212,17 @@ function estimateSummaryGeneratorInputTokens(
     CONTEXT_ESTIMATOR_OVERHEAD.message
     + CONTEXT_ESTIMATOR_OVERHEAD.part
     + Math.ceil(Buffer.byteLength(text, "utf8") / 3);
-  return framedText(input.system)
+  const instructionMessages = typeof input.instructions === "string"
+    ? [{ role: "system" as const, content: input.instructions }]
+    : Array.isArray(input.instructions)
+      ? input.instructions
+      : [input.instructions];
+  return instructionMessages.reduce((total, instruction) => {
+    if (typeof instruction.content !== "string") {
+      throw new Error("Summary instructions test expects string-only content");
+    }
+    return total + framedText(instruction.content);
+  }, 0)
     + input.messages.reduce((total, message) => {
       if (typeof message.content !== "string") {
         throw new Error("Summary source test expects string-only ModelMessages");
@@ -307,6 +320,129 @@ function preparation(
 }
 
 describe("ContextCompactionService", () => {
+  test("ends summary prompts with a user request for models that stop after assistant history", async () => {
+    const { db, store } = createHistory();
+    try {
+      const model = new MockLanguageModelV3({
+        doGenerate: async ({ prompt }) => {
+          const terminalRole = prompt.at(-1)?.role;
+          const emitsCheckpoint = terminalRole === "user";
+          return {
+            content: emitsCheckpoint
+              ? [{ type: "text" as const, text: "Provider-neutral checkpoint" }]
+              : [],
+            finishReason: { unified: "stop" as const, raw: "stop" },
+            usage: {
+              inputTokens: {
+                total: 100,
+                noCache: 100,
+                cacheRead: undefined,
+                cacheWrite: undefined,
+              },
+              outputTokens: {
+                total: emitsCheckpoint ? 4 : 0,
+                text: emitsCheckpoint ? 4 : 0,
+                reasoning: 0,
+              },
+            },
+            warnings: [],
+          };
+        },
+      });
+      const service = new ContextCompactionService({
+        store,
+        generator: generateRuntimeContextSummary,
+        createId: deterministicIds(),
+      });
+
+      const result = await compactClaimed(
+        store,
+        service,
+        request("manual", { model }),
+      );
+
+      expect(result.status).toBe("created");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("preserves reasoning-only length diagnostics from the production summary adapter", async () => {
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => ({
+        content: [{ type: "reasoning" as const, text: "internal reasoning consumed the budget" }],
+        finishReason: { unified: "length" as const, raw: "max_tokens" },
+        usage: {
+          inputTokens: {
+            total: 100,
+            noCache: 100,
+            cacheRead: undefined,
+            cacheWrite: undefined,
+          },
+          outputTokens: { total: 2_048, text: 0, reasoning: 2_048 },
+        },
+        warnings: [],
+      }),
+    });
+
+    const result = await generateRuntimeContextSummary({
+      model,
+      instructions: "Summarize safely",
+      messages: [{ role: "user", content: "long context" }],
+      maxOutputTokens: 2_048,
+    });
+
+    expect(result).toMatchObject({
+      text: "",
+      finishReason: "length",
+      usage: {
+        outputTokens: 2_048,
+        outputTokenDetails: { textTokens: 0, reasoningTokens: 2_048 },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("internal reasoning consumed the budget");
+  });
+
+  test("passes summary policy and Safety State through generateText instructions", async () => {
+    const { db, store } = createHistory();
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => ({
+        content: [{ type: "text" as const, text: "Provider-neutral checkpoint" }],
+        finishReason: { unified: "stop" as const, raw: undefined },
+        usage: {
+          inputTokens: {
+            total: 32,
+            noCache: 32,
+            cacheRead: undefined,
+            cacheWrite: undefined,
+          },
+          outputTokens: { total: 4, text: 4, reasoning: 0 },
+        },
+        warnings: [],
+      }),
+    });
+    const service = new ContextCompactionService({
+      store,
+      generator: generateRuntimeContextSummary,
+      createId: deterministicIds(),
+    });
+
+    const result = await compactClaimed(
+      store,
+      service,
+      request("manual", { model }),
+    );
+
+    expect(result.status).toBe("created");
+    expect(model.doGenerateCalls.length).toBeGreaterThan(0);
+    const providerPrompt = model.doGenerateCalls[0]?.prompt ?? [];
+    expect(JSON.stringify(providerPrompt.filter((message) => message.role === "system")))
+      .toContain("Runtime Safety State");
+    expect(JSON.stringify(providerPrompt.filter((message) => message.role !== "system")))
+      .toContain("OLD_USER_");
+    db.close();
+  });
+
   test.each(["manual", "auto_pre_turn"] as const)(
     "%s uses the single service path, excludes the current Run, and offers no tools",
     async (trigger) => {
@@ -314,7 +450,25 @@ describe("ContextCompactionService", () => {
       const generatorInputs: Parameters<ContextSummaryGenerator>[0][] = [];
       const generator: ContextSummaryGenerator = async (input) => {
         generatorInputs.push(input);
-        return { text: "The earlier goal and confirmed constraint remain active." };
+        return trigger === "manual"
+          ? { text: "The earlier goal and confirmed constraint remain active." }
+          : {
+              text: "The earlier goal and confirmed constraint remain active.",
+              usage: {
+                inputTokens: undefined,
+                inputTokenDetails: {
+                  noCacheTokens: undefined,
+                  cacheReadTokens: undefined,
+                  cacheWriteTokens: undefined,
+                },
+                outputTokens: undefined,
+                outputTokenDetails: {
+                  textTokens: undefined,
+                  reasoningTokens: undefined,
+                },
+                totalTokens: undefined,
+              },
+            };
       };
       const service = new ContextCompactionService({
         store,
@@ -341,9 +495,441 @@ describe("ContextCompactionService", () => {
       expect(store.listTranscriptMessages("conv_compaction")).toEqual(transcriptBefore);
       expect(store.listRunsByConversation("conv_compaction")).toEqual(runsBefore);
       expect(store.listContextCheckpoints("conv_compaction")).toEqual([result.checkpoint]);
+      expect(result.checkpoint.usage).toMatchObject({
+        purpose: "checkpoint_summary",
+        summaryInvocationCount: 1,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        estimatedInputTokens: estimateSummaryGeneratorInputTokens(generatorInputs[0]!),
+        estimateSource: "estimate",
+        reservedOutputTokens: 2_048,
+        view: "raw",
+      });
+      expect(result.checkpoint.usage).not.toHaveProperty("providerObservation");
       db.close();
     },
   );
+
+  test("persists one summary invocation usage without mutating cumulative Run usage", async () => {
+    const { db, store } = createHistory();
+    const generatorInputs: Parameters<ContextSummaryGenerator>[0][] = [];
+    const service = new ContextCompactionService({
+      store,
+      generator: async (input) => {
+        generatorInputs.push(input);
+        return {
+          text: "The earlier goal remains active.",
+          usage: {
+            inputTokens: 120,
+            inputTokenDetails: {
+              noCacheTokens: 100,
+              cacheReadTokens: 15,
+              cacheWriteTokens: 5,
+            },
+            outputTokens: 30,
+            outputTokenDetails: { textTokens: 24, reasoningTokens: 6 },
+            totalTokens: 150,
+          },
+        };
+      },
+      now: () => 100,
+      createId: deterministicIds(),
+    });
+
+    const result = await compactClaimed(store, service, request("manual"));
+
+    expect(result.status).toBe("created");
+    if (result.status !== "created") throw new Error("Expected checkpoint creation");
+    expect(generatorInputs).toHaveLength(1);
+    expect(result.checkpoint.usage).toMatchObject({
+      conversationId: "conv_compaction",
+      runId: "run_c",
+      requestIndex: 0,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      contextWindow: 4_096,
+      purpose: "checkpoint_summary",
+      summaryInvocationCount: 1,
+      estimatedInputTokens: estimateSummaryGeneratorInputTokens(generatorInputs[0]!),
+      estimateSource: "estimate",
+      reservedOutputTokens: 2_048,
+      view: "raw",
+      providerObservation: {
+        source: "provider",
+        observedInvocationCount: 1,
+        inputTokens: 120,
+        outputTokens: 30,
+        reasoningTokens: 6,
+        cacheReadTokens: 15,
+        cacheWriteTokens: 5,
+        totalTokens: 150,
+      },
+    });
+    const breakdown = result.checkpoint.usage?.breakdown;
+    expect(
+      (breakdown?.rawTokens ?? 0)
+      + (breakdown?.checkpointTokens ?? 0)
+      + (breakdown?.safetyStateTokens ?? 0)
+      + (breakdown?.systemPromptTokens ?? 0)
+      + (breakdown?.toolSchemaTokens ?? 0),
+    ).toBe(result.checkpoint.usage?.estimatedInputTokens ?? 0);
+    expect(store.getRun("run_c")?.usage).toBeUndefined();
+    expect(store.listContextCheckpoints("conv_compaction")[0]?.usage).toEqual(
+      result.checkpoint.usage,
+    );
+    db.close();
+  });
+
+  test("aggregates every rolling summary usage deterministically", async () => {
+    const { db, store } = createHistory();
+    const user = store.getMessage("msg_user_a");
+    if (!user || user.role !== "user") throw new Error("Missing User fixture");
+    store.saveMessage({
+      ...user,
+      parts: [{
+        ...user.parts[0]!,
+        type: "text",
+        text: `BEGIN_${Array.from({ length: 4_000 }, (_, index) =>
+          `${index.toString().padStart(4, "0")}🙂`).join("")}_END`,
+      }],
+    });
+    const generatorInputs: Parameters<ContextSummaryGenerator>[0][] = [];
+    const service = new ContextCompactionService({
+      store,
+      generator: async (input) => {
+        generatorInputs.push(input);
+        return {
+          text: `ROLLING_USAGE_${generatorInputs.length}`,
+          usage: {
+            inputTokens: 10,
+            inputTokenDetails: {
+              noCacheTokens: 7,
+              cacheReadTokens: 2,
+              cacheWriteTokens: 1,
+            },
+            outputTokens: 3,
+            outputTokenDetails: { textTokens: 2, reasoningTokens: 1 },
+            totalTokens: 13,
+          },
+        };
+      },
+      now: () => 100,
+      createId: deterministicIds(),
+    });
+
+    const result = await compactClaimed(store, service, request("manual"));
+
+    expect(result.status).toBe("created");
+    if (result.status !== "created") throw new Error("Expected checkpoint creation");
+    expect(generatorInputs.length).toBeGreaterThan(1);
+    const invocationCount = generatorInputs.length;
+    expect(result.checkpoint.usage).toMatchObject({
+      purpose: "checkpoint_summary",
+      summaryInvocationCount: invocationCount,
+      estimatedInputTokens: generatorInputs.reduce(
+        (total, input) => total + estimateSummaryGeneratorInputTokens(input),
+        0,
+      ),
+      reservedOutputTokens: 2_048 * invocationCount,
+      view: "raw",
+      providerObservation: {
+        source: "provider",
+        observedInvocationCount: invocationCount,
+        inputTokens: 10 * invocationCount,
+        outputTokens: 3 * invocationCount,
+        reasoningTokens: invocationCount,
+        cacheReadTokens: 2 * invocationCount,
+        cacheWriteTokens: invocationCount,
+        totalTokens: 13 * invocationCount,
+      },
+    });
+    db.close();
+  });
+
+  test("retries strict reasoning-only length exhaustion once with a larger output budget", async () => {
+    const { db, store } = createHistory();
+    const outputBudgets: number[] = [];
+    const estimatedInputs: number[] = [];
+    const service = new ContextCompactionService({
+      store,
+      generator: async (input) => {
+        outputBudgets.push(input.maxOutputTokens);
+        estimatedInputs.push(estimateSummaryGeneratorInputTokens(input));
+        if (outputBudgets.length === 1) {
+          return {
+            text: "",
+            finishReason: "length",
+            usage: {
+              inputTokens: 100,
+              inputTokenDetails: {
+                noCacheTokens: 100,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+              },
+              outputTokens: 2_048,
+              outputTokenDetails: { textTokens: 0, reasoningTokens: 2_048 },
+              totalTokens: 2_148,
+            },
+          };
+        }
+        return {
+          text: "The final provider-neutral checkpoint.",
+          finishReason: "stop",
+          usage: {
+            inputTokens: 90,
+            inputTokenDetails: {
+              noCacheTokens: 90,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            },
+            outputTokens: 60,
+            outputTokenDetails: { textTokens: 60, reasoningTokens: 0 },
+            totalTokens: 150,
+          },
+        };
+      },
+      now: () => 100,
+      createId: deterministicIds(),
+    });
+
+    const result = await compactClaimed(store, service, request("manual", {
+      contextWindow: 8_192,
+      policy: {
+        ...DEFAULT_CONTEXT_COMPACTION_POLICY,
+        safetyMarginTokens: 0,
+        softTriggerRatio: 0.1,
+        targetRatio: 0.05,
+      },
+    }));
+
+    expect(result.status).toBe("created");
+    if (result.status !== "created") throw new Error("Expected checkpoint creation");
+    expect(outputBudgets).toEqual([2_048, 4_096]);
+    expect(estimatedInputs[1]!).toBeLessThanOrEqual(estimatedInputs[0]!);
+    expect(result.checkpoint.summary).toBe("The final provider-neutral checkpoint.");
+    expect(result.checkpoint.usage).toMatchObject({
+      summaryInvocationCount: 2,
+      reservedOutputTokens: 6_144,
+      providerObservation: {
+        observedInvocationCount: 2,
+        inputTokens: 190,
+        outputTokens: 2_108,
+        reasoningTokens: 2_048,
+        totalTokens: 2_298,
+      },
+    });
+    db.close();
+  });
+
+  test("fails after exactly one retry when reasoning consumes both summary budgets", async () => {
+    const { db, store } = createHistory();
+    const outputBudgets: number[] = [];
+    const service = new ContextCompactionService({
+      store,
+      generator: async (input) => {
+        outputBudgets.push(input.maxOutputTokens);
+        return {
+          text: "",
+          finishReason: "length",
+          usage: {
+            inputTokens: 100,
+            inputTokenDetails: {
+              noCacheTokens: 100,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            },
+            outputTokens: input.maxOutputTokens,
+            outputTokenDetails: {
+              textTokens: 0,
+              reasoningTokens: input.maxOutputTokens,
+            },
+            totalTokens: 100 + input.maxOutputTokens,
+          },
+        };
+      },
+      createId: deterministicIds(),
+    });
+
+    try {
+      await compactClaimed(store, service, request("manual", {
+        contextWindow: 8_192,
+        policy: {
+          ...DEFAULT_CONTEXT_COMPACTION_POLICY,
+          safetyMarginTokens: 0,
+          softTriggerRatio: 0.1,
+          targetRatio: 0.05,
+        },
+      }));
+      throw new Error("Expected summary validation failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ContextSummaryValidationError);
+      expect((error as ContextSummaryValidationError).diagnostics).toMatchObject({
+        finishReason: "length",
+        outputTokens: 4_096,
+        textTokens: 0,
+        reasoningTokens: 4_096,
+      });
+    }
+    expect(outputBudgets).toEqual([2_048, 4_096]);
+    expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
+    db.close();
+  });
+
+  test("does not exceed the model output limit when a larger summary retry is unavailable", async () => {
+    const { db, store } = createHistory();
+    const outputBudgets: number[] = [];
+    const service = new ContextCompactionService({
+      store,
+      generator: async (input) => {
+        outputBudgets.push(input.maxOutputTokens);
+        return {
+          text: "",
+          finishReason: "length",
+          usage: {
+            inputTokens: 100,
+            inputTokenDetails: {
+              noCacheTokens: 100,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            },
+            outputTokens: input.maxOutputTokens,
+            outputTokenDetails: { textTokens: 0, reasoningTokens: input.maxOutputTokens },
+            totalTokens: 100 + input.maxOutputTokens,
+          },
+        };
+      },
+      createId: deterministicIds(),
+    });
+
+    await expect(compactClaimed(store, service, request("manual", {
+      contextWindow: 8_192,
+      modelOutputLimit: 2_048,
+      policy: {
+        ...DEFAULT_CONTEXT_COMPACTION_POLICY,
+        safetyMarginTokens: 0,
+        softTriggerRatio: 0.1,
+        targetRatio: 0.05,
+      },
+    }))).rejects.toBeInstanceOf(ContextSummaryValidationError);
+    expect(outputBudgets).toEqual([2_048]);
+    db.close();
+  });
+
+  test.each([
+    ["normal blank", "stop" as const, 0, 0],
+    ["length without reasoning", "length" as const, 0, 0],
+    ["length without an explicit zero text count", "length" as const, 100, undefined],
+  ])("does not retry %s summary output", async (_name, finishReason, reasoningTokens, textTokens) => {
+    const { db, store } = createHistory();
+    let calls = 0;
+    const service = new ContextCompactionService({
+      store,
+      generator: async () => {
+        calls += 1;
+        return {
+          text: "",
+          finishReason,
+          usage: {
+            inputTokens: 100,
+            inputTokenDetails: {
+              noCacheTokens: 100,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            },
+            outputTokens: reasoningTokens,
+            outputTokenDetails: { textTokens, reasoningTokens },
+            totalTokens: 100 + reasoningTokens,
+          },
+        };
+      },
+      createId: deterministicIds(),
+    });
+
+    await expect(compactClaimed(store, service, request("manual", {
+      contextWindow: 8_192,
+      policy: {
+        ...DEFAULT_CONTEXT_COMPACTION_POLICY,
+        safetyMarginTokens: 0,
+        softTriggerRatio: 0.1,
+        targetRatio: 0.05,
+      },
+    }))).rejects.toBeInstanceOf(ContextSummaryValidationError);
+    expect(calls).toBe(1);
+    expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
+    db.close();
+  });
+
+  test("preserves unavailable Provider usage scalars across rolling summary calls", async () => {
+    const { db, store } = createHistory();
+    const user = store.getMessage("msg_user_a");
+    if (!user || user.role !== "user") throw new Error("Missing User fixture");
+    store.saveMessage({
+      ...user,
+      parts: [{
+        ...user.parts[0]!,
+        type: "text",
+        text: `BEGIN_${"🙂".repeat(12_000)}_END`,
+      }],
+    });
+    let invocation = 0;
+    const service = new ContextCompactionService({
+      store,
+      generator: async () => {
+        invocation += 1;
+        return {
+          text: `PARTIAL_PROVIDER_USAGE_${invocation}`,
+          usage: invocation === 1
+            ? {
+                inputTokens: 10,
+                inputTokenDetails: {
+                  noCacheTokens: undefined,
+                  cacheReadTokens: undefined,
+                  cacheWriteTokens: 2,
+                },
+                outputTokens: undefined,
+                outputTokenDetails: {
+                  textTokens: undefined,
+                  reasoningTokens: undefined,
+                },
+                totalTokens: undefined,
+              }
+            : {
+                inputTokens: undefined,
+                inputTokenDetails: {
+                  noCacheTokens: undefined,
+                  cacheReadTokens: 3,
+                  cacheWriteTokens: undefined,
+                },
+                outputTokens: 4,
+                outputTokenDetails: {
+                  textTokens: undefined,
+                  reasoningTokens: 1,
+                },
+                totalTokens: 14,
+              },
+        };
+      },
+      now: () => 100,
+      createId: deterministicIds(),
+    });
+
+    const result = await compactClaimed(store, service, request("manual"));
+
+    expect(result.status).toBe("created");
+    if (result.status !== "created") throw new Error("Expected checkpoint creation");
+    expect(invocation).toBeGreaterThan(1);
+    expect(result.checkpoint.usage?.providerObservation).toEqual({
+      source: "provider",
+      observedInvocationCount: invocation,
+      inputTokens: 10,
+      outputTokens: 4 * (invocation - 1),
+      reasoningTokens: invocation - 1,
+      cacheReadTokens: 3 * (invocation - 1),
+      cacheWriteTokens: 2,
+      totalTokens: 14 * (invocation - 1),
+    });
+    db.close();
+  });
 
   test("returns not_needed below the soft threshold without generation or writes", async () => {
     const { db, store } = createHistory();
@@ -922,7 +1508,7 @@ describe("ContextCompactionService", () => {
         expect(JSON.stringify(input.messages)).not.toContain(hugeText);
       }
       const projectedSource = generatorInputs
-        .flatMap((input) => input.messages)
+        .flatMap((input) => input.messages.slice(0, -1))
         .filter((message) => message.role === (partType === "text" ? "user" : "assistant"))
         .map((message) => message.content)
         .join("");
@@ -1058,7 +1644,7 @@ describe("ContextCompactionService", () => {
       permissions: [],
     });
 
-    const source = JSON.stringify(buildContextSummaryMessages({
+    const source = JSON.stringify(buildContextSummaryPrompt({
       messages: [userWithSensitiveParts, assistantWithStructuredParts],
       safetyState,
     }));
@@ -1151,7 +1737,23 @@ describe("ContextCompactionService", () => {
       store,
       generator: async (input) => {
         generatorInputs.push(input);
-        return { text: generatorInputs.length === 1 ? "FIRST_SUMMARY" : "SECOND_SUMMARY" };
+        return {
+          text: generatorInputs.length === 1 ? "FIRST_SUMMARY" : "SECOND_SUMMARY",
+          usage: {
+            inputTokens: generatorInputs.length === 1 ? 1_000 : 10,
+            inputTokenDetails: {
+              noCacheTokens: generatorInputs.length === 1 ? 1_000 : 10,
+              cacheReadTokens: undefined,
+              cacheWriteTokens: undefined,
+            },
+            outputTokens: generatorInputs.length === 1 ? 100 : 2,
+            outputTokenDetails: {
+              textTokens: generatorInputs.length === 1 ? 100 : 2,
+              reasoningTokens: undefined,
+            },
+            totalTokens: generatorInputs.length === 1 ? 1_100 : 12,
+          },
+        };
       },
       now: () => 100 + generatorInputs.length,
       createId: deterministicIds(),
@@ -1212,8 +1814,25 @@ describe("ContextCompactionService", () => {
       throw new Error("Expected checkpoint chain creation");
     }
     expect(second.checkpoint.parentCheckpointId).toBe(first.checkpoint.id);
+    expect(first.checkpoint.usage?.providerObservation?.inputTokens).toBe(1_000);
+    expect(second.checkpoint.usage).toMatchObject({
+      purpose: "checkpoint_summary",
+      summaryInvocationCount: 1,
+      view: "checkpoint",
+      checkpointId: first.checkpoint.id,
+      providerObservation: {
+        source: "provider",
+        observedInvocationCount: 1,
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+      },
+    });
     const secondSource = JSON.stringify(generatorInputs[1]?.messages);
-    expect(secondSource).toContain("FIRST_SUMMARY");
+    const secondInstructions = JSON.stringify(generatorInputs[1]?.instructions);
+    expect(secondInstructions).toContain("FIRST_SUMMARY");
+    expect(secondInstructions).toContain("Runtime Safety State");
+    expect(secondSource).not.toContain("FIRST_SUMMARY");
     expect(secondSource).toContain("recent user");
     expect(secondSource).toContain("C_COMPLETED_");
     expect(secondSource).not.toContain("OLD_USER_");
@@ -1225,6 +1844,53 @@ describe("ContextCompactionService", () => {
 });
 
 describe("ModelContextManager", () => {
+  test("forecasts the completed Assistant in memory without writing plans or checkpoints", () => {
+    const { db, store } = createHistory();
+    const ids = deterministicIds();
+    const manager = new ModelContextManager({
+      store,
+      compactionService: new ContextCompactionService({
+        store,
+        generator: async () => ({ text: "unused" }),
+        createId: ids,
+      }),
+      createId: ids,
+    });
+    const forecastInput = {
+      conversationId: "conv_compaction" as const,
+      runId: "run_c" as const,
+      requestIndex: 1,
+      providerId: "openai",
+      modelId: "gpt-test",
+      contextWindow: 100_000,
+      reservedOutputTokens: 1_024,
+      systemPrompt: "runtime system prompt",
+      toolSchemas: {},
+      policy: DEFAULT_CONTEXT_COMPACTION_POLICY,
+      reason: "append" as const,
+    };
+    const before = manager.forecastNextTurn(forecastInput);
+    const assistant = store.getMessage("msg_assistant_c");
+    if (!assistant || assistant.role !== "assistant") {
+      throw new Error("Missing completed Assistant fixture");
+    }
+    store.saveMessage({
+      ...assistant,
+      parts: assistant.parts.map((part) =>
+        part.type === "text"
+          ? { ...part, text: `${part.text}${" forecast-growth".repeat(200)}` }
+          : part,
+      ),
+    });
+
+    const after = manager.forecastNextTurn(forecastInput);
+    expect(after.estimatedInputTokens).toBeGreaterThan(before.estimatedInputTokens);
+    expect(after.breakdown.rawTokens).toBeGreaterThan(before.breakdown.rawTokens);
+    expect(store.listContextPlansByRun("run_c")).toEqual([]);
+    expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
+    db.close();
+  });
+
   test("appends exact retained model input and binds it to the durable plan identity", async () => {
     const { db, store } = createHistory();
     const currentAssistant = store.getMessage("msg_assistant_c");
@@ -1349,10 +2015,10 @@ describe("ModelContextManager", () => {
   });
 
   test.each([
-    ["auto under hard", "auto_pre_turn" as const, false, true],
-    ["manual", "manual" as const, false, false],
-    ["auto over hard", "auto_pre_turn" as const, true, false],
-  ] as const)("treats timeout as non-cancellation for %s", async (_name, trigger, overHard, fallback) => {
+    ["auto under hard", "auto_pre_turn" as const, false],
+    ["manual", "manual" as const, false],
+    ["auto over hard", "auto_pre_turn" as const, true],
+  ] as const)("treats timeout as non-cancellation for %s", async (_name, trigger, overHard) => {
     const { db, store } = createHistory();
     if (overHard) {
       for (const messageId of ["msg_user_a", "msg_assistant_a"] as const) {
@@ -1379,17 +2045,11 @@ describe("ModelContextManager", () => {
       contextWindow: overHard ? 3_000 : 4_096,
     }));
 
-    if (fallback) {
-      const prepared = await operation;
-      expect(prepared.plan.view).toBe("raw");
-      expect(prepared.plan.reason).toBe("compaction_required");
-    } else {
-      try {
-        await operation;
-        throw new Error("Expected timeout to propagate");
-      } catch (error) {
-        expect(error).toBe(timeoutError);
-      }
+    try {
+      await operation;
+      throw new Error("Expected timeout to propagate");
+    } catch (error) {
+      expect(error).toBe(timeoutError);
     }
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
     db.close();
@@ -1418,7 +2078,7 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toEqual([first.plan]);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     db.close();
   });
 
@@ -1448,7 +2108,7 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     db.close();
   });
 
@@ -1497,7 +2157,7 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     expect(store.getContextPreparationClaim("run_c", 0)).toBeNull();
     db.close();
   });
@@ -1542,7 +2202,7 @@ describe("ModelContextManager", () => {
     );
     expect(generatorCalls).toBe(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     db.close();
   });
 
@@ -1583,7 +2243,7 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(2);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     expect(store.getContextPreparationClaim("run_c", 0)).toBeNull();
     db.close();
   });
@@ -1669,6 +2329,108 @@ describe("ModelContextManager", () => {
     db.close();
   });
 
+  test("renews one owner across rolling summaries beyond the initial five-minute lease", async () => {
+    let clock = 100;
+    const { db, store } = createHistory(":memory:", { now: () => clock });
+    const user = store.getMessage("msg_user_a");
+    if (!user || user.role !== "user") throw new Error("Missing User fixture");
+    const hugeText = `BEGIN_${Array.from({ length: 5_000 }, (_, index) =>
+      `${index.toString().padStart(4, "0")}🙂`).join("")}_END`;
+    store.saveMessage({
+      ...user,
+      parts: [{ ...user.parts[0]!, type: "text", text: hugeText }],
+    });
+    let generatorCalls = 0;
+    const observedClaims: ContextPreparationClaim[] = [];
+    const ids = deterministicIds();
+    const manager = new ModelContextManager({
+      store,
+      compactionService: new ContextCompactionService({
+        store,
+        generator: async () => {
+          generatorCalls += 1;
+          const active = store.getContextPreparationClaim("run_c", 0);
+          expect(active?.expiresAt).toBeGreaterThan(clock);
+          if (active) observedClaims.push(active);
+          clock += 4 * 60 * 1_000;
+          return { text: `LEASED_ROLLING_SUMMARY_${generatorCalls}` };
+        },
+        now: () => clock,
+        createId: ids,
+      }),
+      now: () => clock,
+      createId: ids,
+    });
+
+    const prepared = await manager.prepare(preparation("manual", { contextWindow: 4_096 }));
+
+    expect(generatorCalls).toBeGreaterThan(1);
+    expect(clock).toBeGreaterThan(5 * 60 * 1_000);
+    expect(new Set(observedClaims.map((claim) => claim.ownerId)).size).toBe(1);
+    expect(new Set(observedClaims.map((claim) => claim.fencingToken))).toEqual(new Set([1]));
+    expect(prepared.marker?.status).toBe("created");
+    expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
+    expect(store.listContextPlansByRun("run_c")).toEqual([prepared.plan]);
+    expect(store.getContextPreparationClaim("run_c", 0)).toBeNull();
+    db.close();
+  });
+
+  test("fails closed when one summary invocation consumes the entire renewed lease", async () => {
+    let clock = 100;
+    const { db, store } = createHistory(":memory:", { now: () => clock });
+    const ids = deterministicIds();
+    const manager = new ModelContextManager({
+      store,
+      compactionService: new ContextCompactionService({
+        store,
+        generator: async () => {
+          clock += 5 * 60 * 1_000;
+          return { text: "TOO_LATE_SUMMARY" };
+        },
+        now: () => clock,
+        createId: ids,
+      }),
+      now: () => clock,
+      createId: ids,
+    });
+
+    await expect(manager.prepare(preparation("manual"))).rejects.toBeInstanceOf(
+      ContextPreparationLeaseLostError,
+    );
+    expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
+    expect(store.listContextPlansByRun("run_c")).toEqual([]);
+    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expect(store.getContextPreparationClaim("run_c", 0)).toBeNull();
+    db.close();
+  });
+
+  test("preserves the exact generator failure when its invocation outlives the lease", async () => {
+    let clock = 100;
+    const providerError = new Error("summary provider failed after lease expiry");
+    const { db, store } = createHistory(":memory:", { now: () => clock });
+    const ids = deterministicIds();
+    const manager = new ModelContextManager({
+      store,
+      compactionService: new ContextCompactionService({
+        store,
+        generator: async () => {
+          clock += 5 * 60 * 1_000;
+          throw providerError;
+        },
+        now: () => clock,
+        createId: ids,
+      }),
+      now: () => clock,
+      createId: ids,
+    });
+
+    await expect(manager.prepare(preparation("manual"))).rejects.toBe(providerError);
+    expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
+    expect(store.listContextPlansByRun("run_c")).toEqual([]);
+    expect(store.listEvents("conv_compaction")).toEqual([]);
+    db.close();
+  });
+
   test("fences a live old owner after its expired claim is reclaimed", async () => {
     const directory = mkdtempSync(join(tmpdir(), "nexuspilot-context-fence-"));
     const path = join(directory, "runtime.sqlite");
@@ -1745,7 +2507,7 @@ describe("ModelContextManager", () => {
       const checkpoints = secondStore.listContextCheckpoints("conv_compaction");
       expect(checkpoints).toHaveLength(1);
       expect(checkpoints[0]?.summary).toBe("WINNING_OWNER_SUMMARY");
-      expect(secondStore.listEvents("conv_compaction")).toHaveLength(1);
+      expect(secondStore.listEvents("conv_compaction")).toHaveLength(2);
       expect(secondStore.listContextPlansByRun("run_c")).toHaveLength(1);
       expect(winner.marker?.checkpointId).toBe(checkpoints[0]?.id);
       expect(secondStore.getContextPreparationClaim("run_c", 0)).toBeNull();
@@ -1816,7 +2578,7 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toEqual([first.plan]);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     db.close();
   });
 
@@ -1894,7 +2656,7 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toEqual([first.plan]);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     db.close();
   });
 
@@ -2021,7 +2783,7 @@ describe("ModelContextManager", () => {
     expect(attachmentReads).toBe(2);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expect(store.listEvents("conv_compaction")).toHaveLength(2);
     db.close();
   });
 
@@ -2068,7 +2830,7 @@ describe("ModelContextManager", () => {
     db.close();
   });
 
-  test("replans once without another compaction attempt when source state becomes stale", async () => {
+  test("fails instead of raw fallback when source state becomes stale during compaction", async () => {
     const { db, store } = createHistory();
     let generatorCalls = 0;
     const ids = deterministicIds();
@@ -2084,13 +2846,11 @@ describe("ModelContextManager", () => {
     });
     const manager = new ModelContextManager({ store, compactionService: service, createId: ids });
 
-    const prepared = await manager.prepare(preparation());
-
-    expect(prepared.plan.runId).toBe("run_c");
-    expect(prepared.plan.reason).toBe("compaction_required");
-    expect(prepared.plan.view).toBe("raw");
+    await expect(manager.prepare(preparation())).rejects.toThrow(
+      "Context compaction did not produce a model view within the hard budget",
+    );
     expect(generatorCalls).toBe(1);
-    expect(store.listContextPlansByRun("run_c")).toEqual([prepared.plan]);
+    expect(store.listContextPlansByRun("run_c")).toEqual([]);
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
     expect(store.listEvents("conv_compaction")).toEqual([]);
     db.close();
@@ -2116,13 +2876,14 @@ describe("ModelContextManager", () => {
 
     expect(prepared.plan.reason).toBe("checkpoint_selected");
     expect(prepared.plan.checkpointId).toBeDefined();
-    expect(prepared.messages[0]).toMatchObject({ role: "system" });
-    expect(JSON.stringify(prepared.messages[0])).toContain("CHECKPOINT_MEMORY");
-    expect(prepared.messages[1]).toMatchObject({ role: "system" });
-    expect(JSON.stringify(prepared.messages[1])).toContain("Runtime Safety State");
-    expect(JSON.stringify(prepared.messages.slice(2))).toContain("recent user");
-    expect(JSON.stringify(prepared.messages.slice(2))).toContain("CURRENT_USER_MUST_STAY_RAW");
-    expect(JSON.stringify(prepared.messages.slice(2))).not.toContain("OLD_USER_");
+    expect(prepared.instructions[0]).toMatchObject({ role: "system" });
+    expect(JSON.stringify(prepared.instructions[0])).toContain("CHECKPOINT_MEMORY");
+    expect(prepared.instructions[1]).toMatchObject({ role: "system" });
+    expect(JSON.stringify(prepared.instructions[1])).toContain("Runtime Safety State");
+    expect(prepared.messages.every((message) => message.role !== "system")).toBe(true);
+    expect(JSON.stringify(prepared.messages)).toContain("recent user");
+    expect(JSON.stringify(prepared.messages)).toContain("CURRENT_USER_MUST_STAY_RAW");
+    expect(JSON.stringify(prepared.messages)).not.toContain("OLD_USER_");
     expect(prepared.marker).toMatchObject({
       trigger: "auto_pre_turn",
       coverageThroughRunId: "run_a",
@@ -2195,7 +2956,7 @@ describe("ModelContextManager", () => {
     db.close();
   });
 
-  test("auto pre-turn falls back to complete raw only while it remains within the hard budget", async () => {
+  test("auto pre-turn surfaces a summary failure even while raw remains within the hard budget", async () => {
     const { db, store } = createHistory();
     const summaryError = new Error("summary provider failed\nrequest id: exact");
     const ids = deterministicIds();
@@ -2206,11 +2967,74 @@ describe("ModelContextManager", () => {
     });
     const manager = new ModelContextManager({ store, compactionService: service, createId: ids });
 
-    const prepared = await manager.prepare(preparation("auto_pre_turn"));
+    try {
+      await manager.prepare(preparation("auto_pre_turn"));
+      throw new Error("Expected summary generation to fail");
+    } catch (error) {
+      expect(error).toBe(summaryError);
+    }
+    expect(store.listContextPlansByRun("run_c")).toEqual([]);
+    expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
+    db.close();
+  });
 
-    expect(prepared.plan.reason).toBe("compaction_required");
-    expect(prepared.plan.view).toBe("raw");
-    expect(JSON.stringify(prepared.messages)).toContain("OLD_USER_");
+  test("persists safe preparing and failed lifecycle facts for invalid summary output", async () => {
+    const { db, store } = createHistory();
+    const ids = deterministicIds();
+    const service = new ContextCompactionService({
+      store,
+      generator: async () => ({
+        text: "",
+        finishReason: "stop",
+        usage: {
+          inputTokens: 100,
+          inputTokenDetails: {
+            noCacheTokens: 100,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          },
+          outputTokens: 0,
+          outputTokenDetails: { textTokens: 0, reasoningTokens: 0 },
+          totalTokens: 100,
+        },
+      }),
+      now: () => 100,
+      createId: ids,
+    });
+    const manager = new ModelContextManager({
+      store,
+      compactionService: service,
+      now: () => 100,
+      createId: ids,
+    });
+
+    await expect(manager.prepare(preparation("auto_pre_turn"))).rejects.toBeInstanceOf(
+      ContextSummaryValidationError,
+    );
+
+    const lifecycle = store.listTraces("run_c").filter((trace) =>
+      trace.type === "context.compaction.preparing"
+      || trace.type === "context.compaction.failed"
+    );
+    expect(lifecycle.map((trace) => trace.type)).toEqual([
+      "context.compaction.preparing",
+      "context.compaction.failed",
+    ]);
+    expect(lifecycle[1]?.payload).toMatchObject({
+      trigger: "auto_pre_turn",
+      requestIndex: 0,
+      sourceHeadRunId: "run_c",
+      sourceConversationRevision: 3,
+      beforeEstimatedInputTokens: expect.any(Number),
+      errorName: "ContextSummaryValidationError",
+      finishReason: "stop",
+      outputTokens: 0,
+      textTokens: 0,
+      reasoningTokens: 0,
+    });
+    expect(JSON.stringify(lifecycle)).not.toMatch(
+      /internal reasoning|runtime system prompt|OLD_USER_|request id|api.?key/i,
+    );
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
     db.close();
   });

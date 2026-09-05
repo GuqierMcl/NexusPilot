@@ -12,6 +12,7 @@ import {
   type Run,
   type RuntimeEventEnvelope,
 } from "../src/runtime";
+import { computeContextLineageHash } from "../src/runtime/context/planner";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
 
 function config() {
@@ -483,7 +484,7 @@ describe("runtime history routes", () => {
     db.close();
   });
 
-  test("restores the latest active ContextUsage on its owning Assistant without altering active history identity", async () => {
+  test("restores the durable next-turn forecast without substituting Provider input or output reserve", async () => {
     const { app, db, store } = await createAppWithHistoryFixtures();
     store.saveContextUsage({
       id: "ctxuse_history",
@@ -505,6 +506,27 @@ describe("runtime history routes", () => {
         toolSchemaTokens: 20,
       },
       providerObservation: { source: "provider", inputTokens: 430 },
+      nextTurnForecast: {
+        conversationId: "conv_history",
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 1,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        contextWindow: 1000,
+        estimatedInputTokens: 480,
+        view: "raw",
+        breakdown: {
+          rawTokens: 440,
+          checkpointTokens: 0,
+          safetyStateTokens: 0,
+          systemPromptTokens: 20,
+          toolSchemaTokens: 20,
+        },
+        estimatorVersion: "test",
+        policyVersion: "test",
+        checkpointFormatVersion: "test",
+        reason: "append",
+      },
       estimatorVersion: "test",
       policyVersion: "test",
       checkpointFormatVersion: "test",
@@ -529,12 +551,13 @@ describe("runtime history routes", () => {
         nexus: {
           contextUsage: {
             contextWindow: 1000,
-            estimatedInputTokens: 440,
+            estimatedInputTokens: 480,
             providerInputTokens: 430,
             reservedOutputTokens: 120,
-            activeTokens: 550,
-            source: "provider",
+            activeTokens: 480,
+            source: "estimate",
             view: "raw",
+            forecastReason: "append",
           },
         },
       },
@@ -542,6 +565,111 @@ describe("runtime history routes", () => {
     expect(body.messages.find((message) => message.id === "msg_user")?.metadata)
       .not.toMatchObject({ custom: { nexus: { contextUsage: expect.anything() } } });
 
+    db.close();
+  });
+
+  test("restores a failed compaction marker without a checkpoint or diagnostic payload", async () => {
+    const { app, db, store } = await createAppWithHistoryFixtures();
+    store.appendTrace({
+      id: "trace_compaction_preparing",
+      conversationId: "conv_history",
+      runId: "run_history",
+      type: "context.compaction.preparing",
+      level: "info",
+      time: 20,
+      payload: {
+        trigger: "auto_pre_turn",
+        requestIndex: 0,
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 1,
+        beforeEstimatedInputTokens: 900,
+      },
+    });
+    store.appendTrace({
+      id: "trace_compaction_failed",
+      conversationId: "conv_history",
+      runId: "run_history",
+      type: "context.compaction.failed",
+      level: "error",
+      time: 21,
+      payload: {
+        trigger: "auto_pre_turn",
+        requestIndex: 0,
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 1,
+        beforeEstimatedInputTokens: 900,
+        errorName: "ContextSummaryValidationError",
+        finishReason: "length",
+        outputTokens: 2048,
+        textTokens: 0,
+        reasoningTokens: 2048,
+      },
+    });
+
+    const response = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_history/messages?format=ai_sdk",
+    ));
+    const body = await response.json() as {
+      messages: Array<{
+        id: string;
+        metadata?: { custom?: { nexus?: { compaction?: unknown } } };
+      }>;
+    };
+    const marker = body.messages.find((message) => message.id === "msg_assistant")
+      ?.metadata?.custom?.nexus?.compaction;
+
+    expect(response.status).toBe(200);
+    expect(marker).toEqual({
+      trigger: "auto_pre_turn",
+      createdAt: 21,
+      beforeTokens: 900,
+      status: "failed",
+    });
+    expect(JSON.stringify(marker)).not.toMatch(
+      /ContextSummaryValidationError|length|2048|reasoning|errorName/i,
+    );
+    expect(store.listContextCheckpoints("conv_history")).toEqual([]);
+    db.close();
+  });
+
+  test("converges an abandoned preparing marker after the owning Assistant is terminal", async () => {
+    const { app, db, store } = await createAppWithHistoryFixtures();
+    store.appendTrace({
+      id: "trace_compaction_abandoned_preparing",
+      conversationId: "conv_history",
+      runId: "run_history",
+      type: "context.compaction.preparing",
+      level: "info",
+      time: 20,
+      payload: {
+        trigger: "auto_pre_turn",
+        requestIndex: 0,
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 1,
+        beforeEstimatedInputTokens: 900,
+      },
+    });
+
+    const response = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_history/messages?format=ai_sdk",
+    ));
+    const body = await response.json() as {
+      messages: Array<{
+        id: string;
+        metadata?: { custom?: { nexus?: { compaction?: unknown } } };
+      }>;
+    };
+    const marker = body.messages.find((message) => message.id === "msg_assistant")
+      ?.metadata?.custom?.nexus?.compaction;
+
+    expect(response.status).toBe(200);
+    expect(marker).toEqual({
+      trigger: "auto_pre_turn",
+      createdAt: 20,
+      beforeTokens: 900,
+      status: "failed",
+    });
+    expect(store.listContextCheckpoints("conv_history")).toEqual([]);
     db.close();
   });
 
@@ -574,7 +702,7 @@ describe("runtime history routes", () => {
         coverageThroughRunId: "run_history",
         sourceHeadRunId: "run_history",
         sourceConversationRevision: 1,
-        lineageHash: `sha256:${"1".repeat(64)}`,
+        lineageHash: computeContextLineageHash([first.run], first.run.id),
         sourceStateHash: `sha256:${"2".repeat(64)}`,
         safetyStateHash: `sha256:${"3".repeat(64)}`,
         trigger: "auto_pre_turn",

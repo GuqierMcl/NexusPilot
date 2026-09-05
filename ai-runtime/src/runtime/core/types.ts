@@ -828,6 +828,10 @@ export type EventContextPlanCreated = BaseEvent<
     view: "raw" | "checkpoint";
     checkpointId?: ContextCheckpointId;
     reason: string;
+    checkpointRejections?: Array<{
+      checkpointId: ContextCheckpointId;
+      reason: string;
+    }>;
     trigger:
       | "auto_pre_turn"
       | "auto_mid_turn"
@@ -865,6 +869,9 @@ export type TraceEventType =
   | "stream.started"
   | "stream.finished"
   | "stream.failed"
+  | "context.compaction.preparing"
+  | "context.compaction.failed"
+  | "context.overflow.retrying"
   | "context.overflow.recovered";
 
 export type RuntimeError =

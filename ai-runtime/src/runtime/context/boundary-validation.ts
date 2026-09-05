@@ -224,8 +224,7 @@ function analyzeContextCoverageBoundary(
       || assistant.runId !== run.id
       || assistant.parentId !== user.id
       || !TERMINAL_ASSISTANT_STATUSES.has(assistant.status.type)
-      || run.output?.messageId !== assistant.id
-      || !sameIds(run.output?.partIds ?? [], assistant.parts.map((part) => part.id))
+      || !terminalRunOutputMatchesAssistant(run, assistant)
       || !user.parts.every((part) =>
         part.conversationId === conversationId && part.messageId === user.id,
       )
@@ -244,7 +243,7 @@ function analyzeContextCoverageBoundary(
       if (
         part.conversationId !== conversationId
         || part.messageId !== assistant.id
-        || !run.output.partIds.includes(part.id)
+        || (run.output !== undefined && !run.output.partIds.includes(part.id))
         || !TERMINAL_TOOL_STATUSES.has(part.state.status)
       ) {
         safe = false;
@@ -300,6 +299,15 @@ function isProviderValidationErrorWithoutToolCall(part: ToolPart): boolean {
 
 function sha256(value: string): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function terminalRunOutputMatchesAssistant(
+  run: Run,
+  assistant: AssistantMessage,
+): boolean {
+  if (run.status === "failed" && run.output === undefined) return true;
+  return run.output?.messageId === assistant.id
+    && sameIds(run.output.partIds, assistant.parts.map((part) => part.id));
 }
 
 function sameIds(left: readonly string[], right: readonly string[]): boolean {

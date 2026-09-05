@@ -210,6 +210,11 @@ describe("runtime event envelope", () => {
         view: "checkpoint",
         checkpointId: "ckpt_1",
         reason: "checkpoint_selected",
+        checkpointRejections: [{
+          checkpointId: "ckpt_rejected",
+          reason: "lineage_hash_mismatch",
+          summary: "must be removed",
+        }],
         trigger: "auto_pre_turn",
         budget: {
           contextWindow: 10_000,
@@ -252,6 +257,10 @@ describe("runtime event envelope", () => {
             view: "checkpoint",
             checkpointId: "ckpt_1",
             reason: "checkpoint_selected",
+            checkpointRejections: [{
+              checkpointId: "ckpt_rejected",
+              reason: "lineage_hash_mismatch",
+            }],
             trigger: "auto_pre_turn",
             budget: {
               contextWindow: 10_000,

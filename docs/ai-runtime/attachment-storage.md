@@ -78,7 +78,7 @@ Runtime 只检查协议、安全、所有权、完整性和资源限制。附件
 - 单文件、单消息、总磁盘配额；
 - 过期 UploadSession 清理、无引用附件 GC、启动修复；
 - Provider/adapter 错误的安全展示；
-- 对话编辑、分支裁剪和物理删除时的引用一致性。
+- 对话编辑、append-only 分支与物理删除时的引用一致性。
 
 ### 3.2 Phase 1 不包含
 
@@ -592,12 +592,7 @@ Attachment 上传完成不等于已经成为聊天事实。它只有在 Run 创�
 
 任何一步失败都不得留下半条 User Message、孤立 FilePart、没有引用索引的 Message 或已 busy 但没有 Run 的 Conversation。
 
-消息编辑和分支裁剪必须在同一个事务中：
-
-- 创建替换后的新消息及其附件引用；
-- 删除被替换尾部的消息和旧引用；
-- 保持仍被新消息复用的 Attachment 可用；
-- 在同一事务中把真正无引用的 Attachment 写入 `gc_after = now + 1h`；宽限期内重新绑定时清空 `gc_after`。
+消息编辑必须在同一个 append-only Run-DAG 事务中创建替换后的新消息及其附件引用，并切换 active head。旧分支 Message、FilePart 与 `runtime_message_attachments` 引用仍保留，因此 edit、切换 head 和 context compaction 都不会为旧引用设置 `gc_after`。只有物理删除整个 Conversation（或未来明确、审计级的分支物理删除）移除所有引用后，既有宽限期 GC 才能回收 Attachment/Blob。
 
 active Run 期间继续禁止物理删除 Conversation 或替换相关消息，沿用现有 Conversation busy 约束。
 
@@ -634,7 +629,7 @@ active Run 期间继续禁止物理删除 Conversation 或替换相关消息，�
 - 不把本地内容 URL 作为 `data.type = "url"`；
 - 不根据 Provider/Model catalog 过滤 FilePart；
 - 不对媒体内容做转码或文本抽取；
-- 历史消息中的附件在后续轮次仍进入模型上下文，保持无状态 LLM API 的对话语义；
+- Context Window Manager 只在选定 raw active-lineage tail 后加载附件 bytes；未被 checkpoint 覆盖的历史附件按无状态 LLM API 的对话语义继续进入模型上下文，被覆盖附件保持 transcript reference 但不计入当前 raw attachment byte limit；
 - 同一轮需要读取多个附件时使用有界并发，并保证累计字节上限；
 - Provider 调用结束后释放大 Buffer 引用，不把字节保存在 continuation metadata。
 
@@ -728,7 +723,7 @@ Phase 1 使用以下固定默认值；后续可以暴露 Runtime settings，但�
 | 单附件最大字节数 | 25 MiB | 创建 UploadSession、上传流、模型读取均检查。 |
 | 单消息最大附件数 | 10 | Run request 和 commit transaction 均检查。 |
 | 单消息附件总字节数 | 50 MiB | Run request 和模型投影均检查。 |
-| 单次 Run 全历史附件总字节数 | 100 MiB | 构造模型历史、读取 Blob 前检查。 |
+| 单次模型请求 raw-history 附件总字节数 | 100 MiB | 在 planner 选定 raw tail 后、读取 Blob 前检查；checkpoint 覆盖的附件不计入。 |
 | Runtime pending UploadSession 数量 | 20 | 创建 UploadSession 时按单个 Runtime 实例检查。 |
 | Runtime 物理 Blob 配额 | 2 GiB | 新增唯一 Blob 前检查；去重复用不重复计费。 |
 | pending UploadSession TTL | 24 小时 | 创建时写入 `expires_at`。 |
@@ -798,7 +793,7 @@ UI 应在 Composer 首次添加附件时明确提示：附件会发送到当前�
 | `ATTACHMENT_TOO_LARGE` | 413 | 声明或实际字节数超过限制。 |
 | `ATTACHMENT_COUNT_EXCEEDED` | 422 | 单消息附件数量超过限制。 |
 | `ATTACHMENT_TOTAL_SIZE_EXCEEDED` | 422 | 单消息附件总字节数超过限制。 |
-| `ATTACHMENT_HISTORY_SIZE_EXCEEDED` | 422 | 单次 Run 全历史附件总字节数超过限制。 |
+| `ATTACHMENT_HISTORY_SIZE_EXCEEDED` | 422 | 单次模型请求选定 raw history 的附件总字节数超过限制。 |
 | `ATTACHMENT_LENGTH_MISMATCH` | 422 | 声明、Content-Length 和实际字节数不一致。 |
 | `ATTACHMENT_MEDIA_TYPE_INVALID` | 422 | media type 语法非法。 |
 | `ATTACHMENT_QUOTA_EXCEEDED` | 507 | 新增唯一 Blob 会超过 Runtime 配额。 |
@@ -886,9 +881,9 @@ Runtime Store migration 完成后、health 进入 ready 前执行有界修复：
 | 归档 Conversation | 保留消息、Attachment 引用和 Blob。 |
 | 取消归档 | 不改变附件。 |
 | 物理删除 Conversation | 同事务删除消息和引用，Attachment 进入 GC 宽限期。 |
-| 编辑 User Message | Composer 恢复原 FileParts；替换提交成功后按最终引用集合计算 GC。 |
+| 编辑 User Message | Composer 恢复原 FileParts；创建新 active branch，旧新分支的引用都保留，不因 edit 计算 GC。 |
 | 取消编辑 | 不改变原消息引用；编辑期间新上传且未绑定的附件按 `gc_after` 清理。 |
-| 裁剪消息尾部 | 删除对应引用；外部 Tool 副作用仍不撤销。 |
+| Context compaction / active head change | 不删除任何消息、引用或 Blob；只改变本次模型所选的 context view，外部 Tool 副作用仍不撤销。 |
 | Provider 执行失败 | 保留 User Message、FileParts、Attachment 和 Blob。 |
 | 用户移除 Composer 附件 | 删除未绑定 Attachment 或让 TTL/GC 回收；不影响其他消息引用。 |
 
@@ -916,7 +911,7 @@ Attachment 不使用手工引用计数字段作为唯一事实；引用数由 `r
 - 老库 migration 不改写现有 text-only 消息；
 - User Message、Parts、引用索引和 Run 原子提交；
 - `saveMessage()` 重写 FilePart 时引用索引同步；
-- 删除、编辑和分支裁剪后的引用集合；
+- Conversation 物理删除、append-only edit 与 context compaction 后的引用集合；
 - 外键阻止删除仍被引用的 Attachment/Blob；
 - GC 状态可重入；
 - 启动修复正确识别 missing/corrupt/orphan。
@@ -944,7 +939,7 @@ Attachment 不使用手工引用计数字段作为唯一事实；引用数由 `r
 - 上游模型拒绝附件；
 - Blob 在 Run 开始前丢失；
 - Provider 失败后 User Message 和附件仍存在；
-- 单次 Run 全历史附件超过 100 MiB 时在 Provider 调用前失败；
+- 单次模型请求选定 raw history 的附件超过 100 MiB 时在 Provider 调用前失败；checkpoint 覆盖的附件不计入该请求范围；
 - 没有任何 `supportsVision/supportsAttachments/inputModalities` 发送门禁。
 
 ### 19.5 Frontend 测试
@@ -970,7 +965,7 @@ Phase 1 应按以下依赖顺序实施，每个切片保持可验证：
 4. **Run 协议与消息绑定**：file input part、纯附件消息、原子引用；
 5. **AI SDK 投影与错误**：FilePart bytes、Provider 错误安全展示、continuation；
 6. **Frontend adapter**：Composer 即时上传、进度、内部 scheme、Run 请求映射和历史内容 materialization；
-7. **生命周期**：编辑、裁剪、删除、周期 GC 和启动 diagnostics；
+7. **生命周期**：append-only edit、context compaction、Conversation 删除、周期 GC 和启动 diagnostics；
 8. **文档对账**：更新 provider-model、runner-core、domain、communication-boundaries 和用户指南中的当前事实。
 
 在切片 1–5 完成前，Frontend 不应开放上传按钮；否则会出现 UI 可选文件但 Runtime 丢弃或拒绝的半成品状态。
@@ -988,7 +983,7 @@ Phase 1 只有同时满足以下条件才算完成：
 7. Runtime 不把本地 loopback 内容 URL 发送给 Provider；
 8. 上传中断、进程崩溃、删除失败和并发去重都能通过状态机收敛；
 9. active Run、Permission continuation、消息编辑和 Conversation 删除不会产生悬空引用；
-10. 数量、单文件、单消息总量、单次 Run 全历史总量和磁盘配额均由 Runtime 强制执行；
+10. 数量、单文件、单消息总量、单次模型请求选定 raw history 的附件总量和磁盘配额均由 Runtime 强制执行；checkpoint 覆盖的附件不计入该请求范围；
 11. 内容端点经过认证，不能用 Attachment ID 构造任意路径；
 12. 删除 Conversation 后，无引用 Attachment/Blob 能在宽限期后回收；
 13. 前端 object URL 在切换对话和卸载时被撤销；
@@ -1003,6 +998,6 @@ Phase 1 只有同时满足以下条件才算完成：
 - 应用级加密需要为 Blob 增加算法、nonce 和 wrapped key 元数据，但不改变 Message FilePart；
 - 缩略图、波形和文本抽取结果属于可重建派生资产，不能替代原 Blob；
 - Storage settings 可以调整软配额，但协议仍需保留绝对上限；
-- 对话 compaction 可以减少再次发送历史附件，但不能在仍有消息引用时删除原附件。
+- 对话 compaction 只会减少某个模型请求再次读取的历史附件 bytes；checkpoint 不拥有附件引用。只要不可变 Message 对应的 `runtime_message_attachments` 引用仍存在，就不能删除原 Attachment/Blob。
 
 这些演进不应把 Provider-specific identity、云 URL 或派生文本写成消息附件的唯一事实来源。

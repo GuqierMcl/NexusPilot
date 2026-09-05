@@ -26,6 +26,7 @@ export interface ContextCompactionPolicy {
   safetyMarginTokens: number;
   minRawRuns: number;
   summaryMaxOutputTokens: number;
+  summaryRetryMaxOutputTokens: number;
   summaryMaxChars: number;
   estimatorVersion: string;
   checkpointFormatVersion: string;
@@ -63,6 +64,8 @@ export interface ContextPreparationClaimRelease {
   fencingToken: number;
 }
 
+export const CONTEXT_PREPARATION_CLAIM_TTL_MS = 5 * 60 * 1_000;
+
 export class ContextPreparationLeaseLostError extends Error {
   constructor(runId: RunId, requestIndex: number) {
     super(`Context preparation lease is expired or superseded: ${runId}/${requestIndex}`);
@@ -91,13 +94,22 @@ export interface ContextBudgetSnapshot {
   checkpointTokens: number;
   safetyStateTokens: number;
   estimatedInputTokens: number;
+  /** Present on newly planned requests; optional when reading earlier checkpoint payloads. */
+  summaryMaxOutputTokens?: number;
+  summaryRetryMaxOutputTokens?: number;
+  summaryMaxInputTokens?: number;
+  summaryRetryMaxInputTokens?: number;
 }
 
 export interface ContextProviderUsageObservation {
   source: "provider";
-  inputTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  totalTokens?: number;
+  observedInvocationCount?: number;
 }
 
 export interface ContextUsageBreakdown {
@@ -108,11 +120,38 @@ export interface ContextUsageBreakdown {
   toolSchemaTokens: number;
 }
 
+export type ContextForecastReason =
+  | "append"
+  | "checkpoint_created"
+  | "branch_changed"
+  | "model_changed"
+  | "prompt_policy_changed"
+  | "estimator_policy_changed";
+
+export interface NextTurnContextForecast {
+  conversationId: ConversationId;
+  sourceHeadRunId: RunId;
+  sourceConversationRevision: number;
+  providerId: string;
+  modelId: string;
+  contextWindow?: number;
+  estimatedInputTokens: number;
+  view: "raw" | "checkpoint";
+  checkpointId?: ContextCheckpointId;
+  breakdown: ContextUsageBreakdown;
+  estimatorVersion: string;
+  policyVersion: string;
+  checkpointFormatVersion: string;
+  reason: ContextForecastReason;
+}
+
 export interface ContextUsage {
   id: ContextUsageId;
   conversationId: ConversationId;
   runId: RunId;
   requestIndex: number;
+  purpose?: "checkpoint_summary";
+  summaryInvocationCount?: number;
   providerId: string;
   modelId: string;
   contextWindow?: number;
@@ -123,6 +162,7 @@ export interface ContextUsage {
   checkpointId?: ContextCheckpointId;
   breakdown: ContextUsageBreakdown;
   providerObservation?: ContextProviderUsageObservation;
+  nextTurnForecast?: NextTurnContextForecast;
   estimatorVersion: string;
   policyVersion: string;
   checkpointFormatVersion: string;
@@ -184,11 +224,21 @@ export interface RuntimeSafetyPermissionAudit {
   nonTransferable: true;
 }
 
+export interface RuntimeSafetyContinuation {
+  toolCallId: ToolCall["id"];
+  runId: RunId;
+  prepareOperation: string;
+  expiresAt: number;
+  requiresRevalidation: true;
+}
+
 export interface RuntimeSafetyState {
   version: string;
   conversationId: ConversationId;
   effects: RuntimeSafetyEffect[];
   permissions: RuntimeSafetyPermissionAudit[];
+  /** Optional when reading Safety State records written before prepared-plan projection. */
+  continuations?: RuntimeSafetyContinuation[];
   hash: string;
 }
 
@@ -245,11 +295,27 @@ export interface ContextPlan {
   rawRunIds: RunId[];
   rawRange?: ContextRawRange;
   eligibleCoverageThroughRunId?: RunId;
+  checkpointRejections?: ContextCheckpointRejection[];
   safetyState: RuntimeSafetyState;
   budget: ContextBudgetSnapshot;
   requestHash: string;
   viewHash: string;
   time: { created: number };
+}
+
+export type ContextCheckpointRejectionReason =
+  | "unsupported_format"
+  | "unsupported_compatibility"
+  | "dangling_parent"
+  | "lineage_hash_mismatch"
+  | "coverage_not_active_ancestor"
+  | "unsafe_coverage_boundary"
+  | "raw_tail_too_short"
+  | "target_budget_exceeded";
+
+export interface ContextCheckpointRejection {
+  checkpointId: ContextCheckpointId;
+  reason: ContextCheckpointRejectionReason;
 }
 
 export interface ContextCheckpointCommit {
@@ -260,7 +326,26 @@ export interface ContextCheckpointCommit {
 
 export interface ContextPlanCommit {
   plan: ContextPlan;
+  eventId: `evt_${string}`;
   preparationClaim: ContextPreparationClaim;
+}
+
+export type RuntimeContextDiagnosticCode =
+  | "CHECKPOINT_REJECTED"
+  | "CHECKPOINT_CAS_CONFLICT"
+  | "CHECKPOINT_STARTUP_WARNING"
+  | "CHECKPOINT_STARTUP_REJECTED"
+  | "CONTEXT_PREPARATION_INTERRUPTED";
+
+export interface RuntimeContextDiagnostic {
+  id: `ctxdiag_${string}`;
+  code: RuntimeContextDiagnosticCode;
+  conversationId?: ConversationId;
+  checkpointId?: ContextCheckpointId;
+  runId?: RunId;
+  reason: string;
+  details: Record<string, unknown>;
+  time: { created: number };
 }
 
 export interface ContextPlannerSnapshot {
@@ -279,6 +364,7 @@ export interface ContextPlannerInput {
   providerId: string;
   modelId: string;
   contextWindow?: number;
+  modelOutputLimit?: number;
   reservedOutputTokens: number;
   systemPrompt: string;
   toolSchemas: unknown;

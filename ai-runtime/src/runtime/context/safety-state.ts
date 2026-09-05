@@ -10,6 +10,7 @@ import { RUNTIME_SAFETY_STATE_VERSION } from "./policy";
 import { estimateJsonTokens, stableStringifyJson } from "./token-estimator";
 import type {
   RuntimeSafetyEffect,
+  RuntimeSafetyContinuation,
   RuntimeSafetyPermissionAudit,
   RuntimeSafetyRisk,
   RuntimeSafetyState,
@@ -58,11 +59,25 @@ export function buildRuntimeSafetyState(input: RuntimeSafetyStateInput): Runtime
     .filter((effect): effect is RuntimeSafetyEffect => effect !== null)
     .sort(compareEffects);
   const permissionAudits = permissions.map(projectPermissionAudit);
+  const continuations = input.toolCalls
+    .filter((toolCall) =>
+      toolCall.conversationId === input.conversationId
+      && activeRunIds.has(toolCall.runId)
+      && isNonterminalToolCall(toolCall)
+      && toolCall.metadata?.runtimeToolCore === true
+    )
+    .map((toolCall) => projectContinuation(
+      toolCall,
+      resolveBoundPermission(toolCall, permissionByToolCallId.get(toolCall.id)),
+    ))
+    .filter((continuation): continuation is RuntimeSafetyContinuation => continuation !== null)
+    .sort(compareContinuations);
   const facts = {
     version: RUNTIME_SAFETY_STATE_VERSION,
     conversationId: input.conversationId,
     effects,
     permissions: permissionAudits,
+    continuations,
   };
   const state: RuntimeSafetyState = {
     ...facts,
@@ -78,6 +93,75 @@ export function buildRuntimeSafetyState(input: RuntimeSafetyStateInput): Runtime
     }
   }
   return state;
+}
+
+function projectContinuation(
+  toolCall: ToolCall,
+  permission: Permission | undefined,
+): RuntimeSafetyContinuation | null {
+  const toolPlan = parsePreparedPlan(toolCall.metadata, toolCall.id, "ToolCall");
+  const permissionPlan = permission
+    ? parsePreparedPlan(permission.metadata, toolCall.id, "Permission")
+    : undefined;
+  if (
+    toolPlan
+    && permissionPlan
+    && (
+      toolPlan.prepareOperation !== permissionPlan.prepareOperation
+      || toolPlan.expiresAt !== permissionPlan.expiresAt
+    )
+  ) {
+    throw new Error(`Conflicting prepared-plan facts for ToolCall ${toolCall.id}`);
+  }
+  const plan = toolPlan ?? permissionPlan;
+  return plan
+    ? {
+        toolCallId: toolCall.id,
+        runId: toolCall.runId,
+        prepareOperation: plan.prepareOperation,
+        expiresAt: plan.expiresAt,
+        requiresRevalidation: true,
+      }
+    : null;
+}
+
+function parsePreparedPlan(
+  metadata: Record<string, unknown> | undefined,
+  toolCallId: ToolCall["id"],
+  source: "ToolCall" | "Permission",
+): { prepareOperation: string; expiresAt: number } | undefined {
+  if (!metadata || !("preparedPlan" in metadata)) return undefined;
+  const value = metadata.preparedPlan;
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+    || Object.keys(value).some((key) => key !== "prepareOperation" && key !== "expiresAt")
+    || typeof (value as Record<string, unknown>).prepareOperation !== "string"
+    || (value as Record<string, unknown>).prepareOperation === ""
+    || !Number.isSafeInteger((value as Record<string, unknown>).expiresAt)
+    || ((value as Record<string, unknown>).expiresAt as number) < 0
+  ) {
+    throw new Error(`Invalid ${source} prepared-plan facts for ToolCall ${toolCallId}`);
+  }
+  return value as { prepareOperation: string; expiresAt: number };
+}
+
+function isNonterminalToolCall(toolCall: ToolCall): boolean {
+  return toolCall.state === "pending"
+    || toolCall.state === "validating"
+    || toolCall.state === "waiting_for_permission"
+    || toolCall.state === "running";
+}
+
+function compareContinuations(
+  left: RuntimeSafetyContinuation,
+  right: RuntimeSafetyContinuation,
+): number {
+  return left.runId.localeCompare(right.runId)
+    || left.toolCallId.localeCompare(right.toolCallId)
+    || left.prepareOperation.localeCompare(right.prepareOperation)
+    || left.expiresAt - right.expiresAt;
 }
 
 function resolveBoundPermission(

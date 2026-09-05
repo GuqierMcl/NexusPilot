@@ -2,6 +2,7 @@ import type {
   AssistantContent,
   ModelMessage,
   ProviderMetadata,
+  SystemModelMessage,
   ToolContent,
   ToolResultPart,
   UserContent,
@@ -37,7 +38,7 @@ export interface ModelHistoryProjectionOptions {
 export function projectContextBoundaries(input: {
   checkpoint?: ContextCheckpoint;
   safetyState: RuntimeSafetyState;
-}): ModelMessage[] {
+}): SystemModelMessage[] {
   return [
     ...(input.checkpoint
       ? [{

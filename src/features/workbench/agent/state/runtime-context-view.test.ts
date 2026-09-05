@@ -2,12 +2,33 @@ import { describe, expect, test } from "bun:test";
 
 import {
   getContextDisplayUsage,
+  getLatestAssistantMessageMetadata,
   getRuntimeContextUsageState,
   getRuntimeCompactionMarkerLabel,
   getRuntimeContextUsageView,
 } from "./runtime-context-view";
 
 describe("runtime context view", () => {
+  test("selects the latest assistant metadata by its stable store reference", () => {
+    const olderMetadata = {
+      custom: { nexus: { contextUsage: { view: "raw" } } },
+    };
+    const latestMetadata = {
+      custom: { nexus: { contextUsage: { view: "checkpoint" } } },
+    };
+    const messages = [
+      { role: "assistant", metadata: olderMetadata },
+      { role: "user", metadata: { ignored: true } },
+      { role: "assistant", metadata: latestMetadata },
+    ];
+
+    expect(getLatestAssistantMessageMetadata(messages)).toBe(latestMetadata);
+    expect(getLatestAssistantMessageMetadata(messages)).toBe(latestMetadata);
+    expect(getLatestAssistantMessageMetadata([{ role: "user" }])).toBe(
+      undefined,
+    );
+  });
+
   for (const [name, contextUsage] of [
     ["invalid estimate", { contextWindow: 1000, estimatedInputTokens: -1, reservedOutputTokens: 1, view: "raw" }],
     ["invalid reserve", { contextWindow: 1000, estimatedInputTokens: 1, reservedOutputTokens: -1, view: "raw" }],
@@ -55,7 +76,7 @@ describe("runtime context view", () => {
     });
   }
 
-  test("uses a provider observation before the estimate and reserves output tokens", () => {
+  test("keeps the main context value on the Runtime forecast when Provider usage and reserve differ", () => {
     const view = getRuntimeContextUsageView({
       custom: {
         nexus: {
@@ -78,10 +99,25 @@ describe("runtime context view", () => {
       estimatedInputTokens: 440,
       providerInputTokens: 430,
       reservedOutputTokens: 120,
-      activeTokens: 550,
-      source: "provider",
+      activeTokens: 440,
+      source: "estimate",
       view: "checkpoint",
       checkpointId: "ckpt_1",
+    });
+
+    expect(getContextDisplayUsage({
+      runtimeUsage: view,
+      legacyTotalTokens: 999,
+      legacyContextWindow: 999,
+    })).toEqual({
+      totalTokens: 440,
+      modelContextWindow: 1000,
+      percent: 44,
+      source: "estimate",
+      view: "checkpoint",
+      providerInputTokens: 430,
+      reservedOutputTokens: 120,
+      isLegacy: false,
     });
   });
 
@@ -103,7 +139,7 @@ describe("runtime context view", () => {
       contextWindow: 2000,
       estimatedInputTokens: 300,
       reservedOutputTokens: 200,
-      activeTokens: 500,
+      activeTokens: 300,
       source: "estimate",
       view: "raw",
     });
@@ -125,7 +161,7 @@ describe("runtime context view", () => {
       contextWindow: 0,
       estimatedInputTokens: 300,
       reservedOutputTokens: 200,
-      activeTokens: 500,
+      activeTokens: 300,
       source: "estimate",
       view: "raw",
     });
@@ -151,5 +187,26 @@ describe("runtime context view", () => {
 
     expect(label).toBe("上下文超限后已压缩并重试");
     expect(JSON.stringify(label).includes("must-not-render")).toBe(false);
+  });
+
+  test("renders a failed compaction lifecycle without exposing diagnostic payloads", () => {
+    const label = getRuntimeCompactionMarkerLabel({
+      custom: {
+        nexus: {
+          compaction: {
+            trigger: "auto_pre_turn",
+            createdAt: 10,
+            beforeTokens: 900,
+            status: "failed",
+            errorName: "ContextSummaryValidationError",
+            reasoning: "must-not-render",
+          },
+        },
+      },
+    });
+
+    expect(label).toBe("上下文压缩失败");
+    expect(label?.includes("ContextSummaryValidationError")).toBe(false);
+    expect(label?.includes("must-not-render")).toBe(false);
   });
 });

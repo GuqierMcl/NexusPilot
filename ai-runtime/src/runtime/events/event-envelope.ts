@@ -160,6 +160,17 @@ function sanitizeEventForEnvelope(event: Event): Event | Record<string, unknown>
     }
     properties.budget = safeBudget;
   }
+  if (event.type === "context.plan.created" && Array.isArray(source.checkpointRejections)) {
+    properties.checkpointRejections = source.checkpointRejections.flatMap((value) => {
+      const rejection = readRecord(value);
+      return rejection
+        && typeof rejection.checkpointId === "string"
+        && rejection.checkpointId.startsWith("ckpt_")
+        && typeof rejection.reason === "string"
+        ? [{ checkpointId: rejection.checkpointId, reason: rejection.reason }]
+        : [];
+    });
+  }
   return {
     id: event.id,
     type: event.type,

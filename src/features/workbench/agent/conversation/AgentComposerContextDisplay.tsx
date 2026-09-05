@@ -7,6 +7,7 @@ import {
 } from "@/components/assistant-ui/context-display";
 import { useSelectedAiRuntimeModel } from "@/features/workbench/agent/model";
 import {
+  getLatestAssistantMessageMetadata,
   getRuntimeContextUsageState,
   type RuntimeContextUsageState,
 } from "@/features/workbench/agent/state";
@@ -57,15 +58,14 @@ export function AgentComposerContextDisplayView({
 export function AgentComposerContextDisplay() {
   const { selectedModel } = useSelectedAiRuntimeModel();
   const currentThreadId = useAuiState((state) => state.threadListItem.id);
-  const runtimeUsageState = useAuiState((state) => {
-    for (let index = state.thread.messages.length - 1; index >= 0; index -= 1) {
-      const message = state.thread.messages[index];
-      if (message?.role === "assistant") {
-        return getRuntimeContextUsageState(message.metadata);
-      }
-    }
-    return { kind: "absent" } as const;
-  });
+  // useAuiState compares snapshots with Object.is, so select the stored
+  // metadata reference instead of returning a freshly parsed usage object.
+  const latestAssistantMetadata = useAuiState((state) =>
+    getLatestAssistantMessageMetadata(state.thread.messages),
+  );
+  const runtimeUsageState = getRuntimeContextUsageState(
+    latestAssistantMetadata,
+  );
 
   return (
     <AgentComposerContextDisplayView

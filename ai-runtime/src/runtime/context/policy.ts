@@ -13,6 +13,7 @@ export const DEFAULT_CONTEXT_COMPACTION_POLICY: Readonly<ContextCompactionPolicy
     safetyMarginTokens: 4_096,
     minRawRuns: 2,
     summaryMaxOutputTokens: 2_048,
+    summaryRetryMaxOutputTokens: 4_096,
     summaryMaxChars: 16_000,
     estimatorVersion: CONTEXT_ESTIMATOR_VERSION,
     checkpointFormatVersion: CONTEXT_CHECKPOINT_FORMAT_VERSION,

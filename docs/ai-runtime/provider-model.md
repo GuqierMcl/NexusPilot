@@ -327,7 +327,7 @@ Runtime Store 中每条历史 AssistantMessage 已保存其来源 `providerId/mo
 
 工具名称也属于持久化的 adapter 事实：Runtime canonical ID 保存在 `ToolPart.toolName`，模型实际看到的名称保存在 `ToolPart.metadata.providerToolName`。后续请求的历史 tool-call 与 tool-result 必须共同使用后者；旧记录缺失该字段时才回退原 `toolName`，不得根据当前 Provider 或 registry 伪造映射。
 
-该策略与 OpenCode `MessageV2.toModelMessages` 的模型切换兼容思路一致，但不是 fallback 机制。Runtime 只向用户本次选择的模型发起一次请求；不自动调用历史模型，不因兼容失败剥离更多历史重试，也不创建隐式摘要。目标 AI SDK/Provider 仍不接受该历史时，原始错误直接进入当前 AssistantMessage 的错误状态。
+该策略与 OpenCode `MessageV2.toModelMessages` 的模型切换兼容思路一致，但不是 fallback 机制。Context Window Manager 会先按目标 Provider/model 的窗口重新规划：短 lineage 或较大窗口优先 rehydrate 为完整 raw active lineage；仍需压缩时才可使用不含旧 Provider metadata 的 provider-neutral checkpoint 和 selected raw tail。Runtime 只向用户本次选择的模型发起请求；不自动调用历史模型，也不因兼容失败自动换模型或伪造 signature、response item、token/cache field。目标 AI SDK/Provider 仍不接受上下文时，原始错误直接进入当前 AssistantMessage 的错误状态。
 
 ### Provider/AI SDK 错误边界
 
@@ -337,7 +337,7 @@ AI SDK full stream 的标准 `{ type: "error", error }` part 是模型执行失�
 
 上述模型执行错误与 Provider/model 解析阶段的 HTTP 错误、具体 ToolCall 的业务错误、sidecar/transport 可用性错误保持分层。模型错误在消息流原位置显示并可由 Snapshot 恢复；Tool 错误继续留在对应 tool result/card；transport 状态继续使用产品基础设施提示。
 
-当前 Runtime 尚未实现自动上下文压缩或 token-budget 驱动的摘要/裁剪。Provider 的 `contextLength` 仍是能力事实，不代表 Runner 会自动压缩历史；超过目标上下文时，Provider/AI SDK 错误按上述透明路径展示。
+Provider 的 `contextLength` 和 output length 也是 Context Window Manager 的预算输入。有限、有效的窗口会启用 automatic pre-turn compaction；缺失或无效窗口不会猜测更小的窗口，而是优先发送完整 active raw lineage。summary 首次预算与 reasoning-only retry 阶梯受 Provider/model output length 上限约束；无法获得更大合法预算时不发起伪重试。唯一的运行中恢复是明确 context-overflow 且当前请求尚无 output/tool/Permission/side effect 时，对同一 Provider/model 安全重试一次；其他错误和不安全的 mid-turn overflow 仍按上述透明路径展示。每步的 `ContextUsage` 分别保留 estimate、Provider input observation 和 output reserve；主百分比只使用包含最新 Assistant 的 durable next-turn forecast，不能用 Provider observation、reserve 或累计 `Run.usage` 冒充窗口使用量。
 
 ## 与 Agent Definition 的关系
 

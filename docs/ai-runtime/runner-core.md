@@ -85,9 +85,9 @@ Conversation 表示长期上下文，Run 表示一次执行，Message 表示可�
 
 ### 改写历史后的续写
 
-用户可以改写任意一条已完成的用户消息，并从该点重新执行。该动作不是“复用旧 Run”，也不是分支保留：Runtime 将目标用户消息及其后的有效消息视为一个待替换尾部，在同一事务中移除该尾部及关联 Run 事实，再创建新的用户消息、助手消息和 Run。模型上下文只能由裁剪后的 Store 装配，不能信任前端本地消息数组。
+用户可以改写任意一条已完成的用户消息，并从该点重新执行。该动作创建 append-only Run DAG，而不是复用或删除旧 Run：新 Run 的 `parentRunId` 指向目标 Run 的父 Run，`supersedesRunId` 指向被改写的目标 Run；同一事务创建新的 User/Assistant Message、Run、附件引用、事件与 trace，并把 Conversation 的 `activeHeadRunId` 切换到新 Run、递增 `revision`。旧目标 Run、其后代以及它们的 Message、ToolCall、Permission、Event、Trace 和附件引用都会保留在完整审计 transcript 中。
 
-该命令必须拒绝 active Run，避免“执行中的工具仍在写入旧尾部”与历史裁剪并发。事务提交后才允许发布 `message.removed` / `run.updated` 等 EventBus 失效通知；前端收到通知后仍通过 Snapshot 对账。外部工具已经产生的副作用不属于对话历史，不能因改写而自动撤销。当前不支持助手消息重新生成，也不保留 `superseded` 或可切换分支。
+默认聊天 Snapshot 和下一次模型调用只读取 active lineage，即当前 head 的单一祖先链；审计或诊断读取必须显式请求 transcript/DAG，不能以 created time 猜测分支。该命令仍必须拒绝 active Run，避免执行中的工具与 edit 事务竞争。改写不撤销既有外部副作用：当前模型视图会另外包含由结构化 ToolCall/Permission 事实生成的 Safety State，旧 Permission 也绝不转移到新 Run。新 edit 不产生 `message.removed`；该事件类型只保留给历史兼容投影。早于此 migration 的旧版本若已物理删除过尾部，无法从新 DAG 重建那些已丢失事实。
 
 ### 事件是事实通知，不是动作本身
 
@@ -445,7 +445,7 @@ AssistantMessage 已持久化的 `providerId/modelId` 决定 reasoning 兼容策
 
 `providerMetadata` 在 AI SDK text、reasoning 与 tool call 的 start/delta/end 生命周期中作为不透明 JSON 聚合：start 建立当前值，后续 delta/end 只有实际携带 metadata 时才覆盖，最终值随 Part 通过 SQLite round-trip 保存。reasoning 文本不做 `trim`，以保持签名块结构和原始块内容。
 
-上述兼容投影只执行一次，随后只请求一次用户选择的目标模型。若 AI SDK 或 Provider 仍拒绝历史，Runtime 不回退旧模型、不删除更多历史重试，也不自动生成兼容摘要。
+对于普通的历史兼容拒绝，Runtime 不回退旧模型、不继续剥离历史、不生成专用兼容摘要，也不发起额外的兼容重试；该次失败按 Provider/AI SDK 原文结束。这个规则不排除已在 context policy 中定义的例外：预算驱动的 pre-turn compaction 可使用用户已选择的同一 Provider/model 生成 checkpoint；只有明确 context overflow 且主请求尚无输出、工具、Permission 或副作用时，才可在同一 Provider/model 上重试主请求一次。
 
 ### 模型执行错误透明性
 
@@ -459,7 +459,15 @@ RuntimeError 保留 AI SDK/Provider 原始 `name` 和逐字符 `message`，只�
 
 SSE 继续使用 AI SDK UI message stream 的 `{ type: "error", errorText: <message> }` envelope。Snapshot 恢复同一 AssistantMessage 时复用 Store 中相同的 message。Workbench 可以在原消息位置添加本地“执行失败”标签、有限高度滚动和复制动作，但正文不翻译、不解释、不截断，也不与 assistant-ui 的通用错误卡重复显示。
 
-自动上下文压缩、token 预算、摘要 checkpoint 和不可压缩工具安全账本尚未实现；它们属于后续独立能力，不能通过退化本节的完整历史 projector 来实现。
+### 分支感知的模型上下文与压缩
+
+完整 Audit Transcript、Active Lineage、Runtime/Safety State 与每次请求的 Model Context View 是不同的读取层。`projectModelHistory()` 仍是唯一的 raw Message → AI SDK `ModelMessage[]` projector，但它只接收 Context Window Manager 已选择的 active-lineage raw tail；它不会自行选择分支、预算、checkpoint 或静默裁剪。
+
+每个请求先估算目标 Provider/model 的窗口和输出预留。能安全容纳时优先发送完整 active raw lineage；否则才使用经 ancestry、parent、lineage hash、format/compatibility 校验的 provider-neutral checkpoint，再追加完整 raw tail 和确定性的 Safety State。压缩边界以实际 durable 终态事实判断完整性：`completed` Run 的 output identity 必须与 Assistant parts 一致；失败路径按设计可保留已经聚合的 Assistant/工具事实而不写 `Run.output`，因此 `failed` Run 在 Assistant、ToolPart/ToolCall 全部终态且没有 pending Permission 时仍可被后续 checkpoint 覆盖，不能永久阻断后续压缩。AI SDK 7 调用边界严格分离两个通道：assembled agent prompt、provider-neutral checkpoint 与 Runtime/Safety State 作为 system-level `instructions`，raw user/assistant/tool history 与当前 ToolLoop suffix 作为不含 system role 的 `messages`；rolling summary 同样把 summary prompt、父 checkpoint memory 与 Safety State 放入 `instructions`，并在每次 source chunk 后追加一条 Runtime-owned user generation request。这个终端请求让以历史 Assistant 结束的 OpenAI-compatible prompt 明确进入“现在生成 checkpoint”状态；它参与 summary input budget 与 usage 估算，但不进入 raw transcript 或持久化 Message。Runtime 在初始调用和每次 `prepareStep` 重建后都拒绝 system message 泄漏到 `messages`。planner 将实际考虑但拒绝的 checkpoint ID 与稳定原因写入 `ContextPlan.checkpointRejections`，供 `context.plan.created` 审计；不写 summary、Safety State body 或任意 metadata。checkpoint、plan、usage 与 marker 都是派生、append-only 事实，不能替代或改写 transcript。checkpoint 与 checkpoint event、plan 与 plan event 各自在一个事务中提交；checkpoint 写入由带 CAS/fencing claim 的 `ContextCompactionService` 统一完成，CAS/revalidation 拒绝另写脱敏 durable diagnostic。该 service 同时支持自动和未来入口的 `trigger: "manual"`，但当前没有用户按钮或公开 manual HTTP endpoint。
+
+自动压缩在主模型调用前执行；达到 soft threshold 后，它是必须成功的 gate。summary Provider/校验失败会立即终结当前 Run，主模型调用次数为零，不保存 checkpoint，也不回退到 raw history。只有第一次结果严格满足“空 text、length finish、reasoning tokens 大于零且 text tokens 明确为零”时，Runtime 才在模型 output limit 内扩大预算并缩小 summary input chunk，最多重试一次；reasoning 正文永远不作为 checkpoint。`preparing/failed` 使用只含安全标量的 durable trace，成功 checkpoint 投影为 `created`，安全 overflow 恢复投影为 `recovered`；Snapshot 可恢复终态 marker 而不会泄漏 summary、reasoning 或诊断 payload。
+
+明确的 Provider context-overflow 只有在本次请求尚未输出、调用工具、请求/消费 Permission 或产生副作用时，才可用同一 Provider/model 安全恢复一次；其余错误、已开始的 step 或第二次失败都保留原始 Provider/AI SDK 错误，不自动换模型或不安全重放。替代请求开始前的 `context.overflow.retrying` 仅保留首次错误审计，只有替代请求的 finish 边界才追加 `context.overflow.recovered`；因此第二次构造或执行失败不会向 UI 投影 `recovered`。`Run.usage` 仍是整次 Run 的累计计费 usage；每个模型请求另持久化 `ContextUsage`。请求 estimate、Provider observation 和 output reserve 分别保留；Assistant 完成落盘后，Runtime 重新估算包含最新 Assistant 的 `nextTurnForecast` 并持久化。主上下文百分比始终使用 forecast estimate，Provider actual input 和 reserve 只作辅助信息，因此请求开始、Provider observation、step end 和 Run finish 不会因口径切换而反向跳动。summary 生成若包含多次 rolling 调用，则把本轮每次调用的估算聚合进新 checkpoint 自带的 `ContextUsage`，即使 Provider 没有返回 usage 也保留估算；Provider 实际返回的标量进入可选 `providerObservation`，未返回的单个标量保持缺失而非零，所有标量均缺失时省略 observation。父 checkpoint usage 不继承，且 summary usage 不进入累计 `Run.usage`。完整行为、格式与演进约束见 [context-compaction specification](../comet/changes/ai-runtime-context-compaction/specs/agent-context-compaction/spec.md)。
 
 ## 事件持久化和磁盘写入策略
 

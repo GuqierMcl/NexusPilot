@@ -267,4 +267,60 @@ describe("runtime domain schemas", () => {
     expect(event.type).toBe("permission.resolved");
     expect(trace.type).toBe("permission.decided");
   });
+
+  test("rejects sensitive fields from every context lifecycle trace payload", () => {
+    const lifecyclePayload = {
+      trigger: "auto_pre_turn",
+      requestIndex: 0,
+      sourceHeadRunId: "run_1",
+      sourceConversationRevision: 1,
+      beforeEstimatedInputTokens: 900,
+    };
+    const overflowPayload = {
+      error: {
+        name: "ContextLengthError",
+        data: { message: "maximum context length exceeded" },
+      },
+      requestIndex: 0,
+      sourceHeadRunId: "run_1",
+      sourceConversationRevision: 1,
+      checkpointId: "ckpt_1",
+      beforeEstimatedInputTokens: 900,
+      afterEstimatedInputTokens: 500,
+    };
+    const traces = [
+      {
+        type: "context.compaction.preparing",
+        payload: { ...lifecyclePayload, reasoningText: "private reasoning" },
+      },
+      {
+        type: "context.compaction.failed",
+        payload: {
+          ...lifecyclePayload,
+          errorName: "ContextSummaryValidationError",
+          summary: "private summary",
+        },
+      },
+      {
+        type: "context.overflow.retrying",
+        payload: { ...overflowPayload, providerResponse: { secret: true } },
+      },
+      {
+        type: "context.overflow.recovered",
+        payload: { ...overflowPayload, responseBody: "secret" },
+      },
+    ] as const;
+
+    for (const [index, trace] of traces.entries()) {
+      expect(traceEventSchema.safeParse({
+        id: `trace_context_${index}`,
+        conversationId: "conv_1",
+        runId: "run_1",
+        type: trace.type,
+        level: "warn",
+        time: index + 1,
+        payload: trace.payload,
+      }).success).toBe(false);
+    }
+  });
 });

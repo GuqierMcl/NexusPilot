@@ -176,6 +176,7 @@ export interface RuntimeRunnerStore {
   }): unknown;
   appendEvent(event: Event): void;
   appendTrace(trace: TraceEvent): void;
+  listTraces(runId: RunId): TraceEvent[];
   listContextCheckpoints(conversationId: ConversationId): ContextCheckpoint[];
   getContextPlan(id: ContextPlan["id"]): ContextPlan | null;
   getContextPlanByRunRequest(runId: RunId, requestIndex: number): ContextPlan | null;
@@ -185,6 +186,7 @@ export interface RuntimeRunnerStore {
     requestIndex: number,
   ): ContextPreparationClaim | null;
   claimContextPreparation(claim: ContextPreparationClaimRequest): ContextPreparationClaimResult;
+  renewContextPreparationClaim(claim: ContextPreparationClaimRelease, ttlMs: number): boolean;
   releaseContextPreparationClaim(claim: ContextPreparationClaimRelease): boolean;
   listContextPlansByRun(runId: Run["id"]): ContextPlan[];
   getLatestContextUsage(conversationId: ConversationId): ContextUsage | null;
@@ -194,6 +196,11 @@ export interface RuntimeRunnerStore {
     runId: RunId;
     requestIndex: number;
     providerObservation: NonNullable<ContextUsage["providerObservation"]>;
+  }): ContextUsage;
+  updateContextUsageNextTurnForecast(input: {
+    runId: RunId;
+    requestIndex: number;
+    nextTurnForecast: NonNullable<ContextUsage["nextTurnForecast"]>;
   }): ContextUsage;
   commitContextCheckpoint(input: ContextCheckpointCommit): "committed" | "stale";
   saveContextPlan(input: ContextPlanCommit): void;

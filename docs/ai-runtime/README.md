@@ -13,6 +13,9 @@ Status: **Current**
 - Tool visibility is not authorization. Risk analysis, permission state, prepared plans, and backend checks still apply at execution time.
 - Chat attachments are uploaded through dedicated authenticated endpoints, persisted under Runtime `dataDir`, and referenced by final `att_*` IDs. `/v1/runs` never uploads files or accepts file bytes, paths, URLs, or upload-session IDs.
 - Runtime projects persisted attachment bytes to AI SDK standard `file` parts without using provider/model catalog capabilities as an attachment gate.
+- Conversation history is append-only: the Audit Transcript retains every branch, while the default UI and model history use the Conversation's active Run lineage.
+- Context planning is a derived, request-scoped view: deterministic Safety State plus either full raw active history or a compatible checkpoint and raw tail. Checkpoints never replace audit history.
+- `Run.usage` is cumulative billing usage. Request-scoped `ContextUsage` retains each request estimate and Provider observation, while its durable `nextTurnForecast` powers the primary context-window display after a run finishes.
 
 ## Documentation map
 
@@ -28,6 +31,7 @@ Status: **Current**
 | [settings.md](./settings.md) | Runtime-owned settings and per-run freezing. |
 | [provider-model.md](./provider-model.md) | models.dev catalog, provider configuration, credentials, and model resolution. |
 | [attachment-storage.md](./attachment-storage.md) | Current Runtime-owned chat attachment storage, upload, lifecycle, and multimodal model-input contract. |
+| [Context-compaction specification](../comet/changes/ai-runtime-context-compaction/specs/agent-context-compaction/spec.md) | Binding current behavior for branch-aware context planning, checkpoints, Safety State, and overflow recovery. |
 | [live-eventbus-sse.md](./live-eventbus-sse.md) | Live-only EventBus and scoped SSE. |
 | [communication-boundaries.md](./communication-boundaries.md) | Frontend HTTP/SSE, backend bridge, and health responsibilities. |
 | [backend-bridge.md](./backend-bridge.md) | Authenticated WebSocket transport and Rust Gateway. |
@@ -47,6 +51,8 @@ The sidecar is a focused local service and does not use an `/api` prefix:
 - backend capability transport: authenticated WebSocket bridge.
 
 Run requests select a model and agent mode, and provide typed input parts. They do not accept caller-controlled system prompts, tool registries, execution limits, or provider credentials.
+
+The message-history endpoint defaults to the active lineage and includes the active head/revision. `view=transcript` is the explicit audit/diagnostic view and includes sanitized Run DAG relationships. The Runtime currently exposes no branch-browsing interface and no user-facing manual compaction endpoint; its internal `manual` service trigger exists only to keep future entry points on the same safe orchestration path.
 
 ## AI SDK documentation rule
 

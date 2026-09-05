@@ -33,6 +33,7 @@ describe("runtime database", () => {
     expect(tables).toContain("runtime_message_attachments");
     expect(tables).toContain("runtime_history_diagnostics");
     expect(tables).toContain("runtime_context_preparation_claims");
+    expect(tables).toContain("runtime_context_diagnostics");
 
     const indexes = db
       .query<{ name: string }, []>(
@@ -58,6 +59,8 @@ describe("runtime database", () => {
     expect(indexes).toContain("idx_runtime_runs_parent");
     expect(indexes).toContain("idx_runtime_runs_supersedes");
     expect(indexes).toContain("idx_runtime_history_diagnostics_conversation");
+    expect(indexes).toContain("idx_runtime_context_diagnostics_conversation");
+    expect(indexes).toContain("idx_runtime_context_diagnostics_checkpoint");
 
     const migrations = db
       .query<{ id: string }, []>(
@@ -80,6 +83,7 @@ describe("runtime database", () => {
       "0010_runtime_tool_call_authorization_snapshot",
       "0011_runtime_context_preparation_claims",
       "0012_runtime_context_preparation_fencing",
+      "0013_runtime_context_diagnostics",
     ]);
 
     const runColumns = db
@@ -231,6 +235,7 @@ describe("runtime database", () => {
           "0010_runtime_tool_call_authorization_snapshot",
           "0011_runtime_context_preparation_claims",
           "0012_runtime_context_preparation_fencing",
+          "0013_runtime_context_diagnostics",
         ]);
       } finally {
         secondDb.close();

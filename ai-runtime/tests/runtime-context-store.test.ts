@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
 import * as runtime from "../src/runtime";
 import {
@@ -257,6 +258,33 @@ function usage(id = "ctxuse_1"): ContextUsage {
   };
 }
 
+function nextTurnForecast(
+  overrides: Partial<NonNullable<ContextUsage["nextTurnForecast"]>> = {},
+): NonNullable<ContextUsage["nextTurnForecast"]> {
+  return {
+    conversationId: "conv_context",
+    sourceHeadRunId: "run_c",
+    sourceConversationRevision: 3,
+    providerId: "openai",
+    modelId: "gpt-4o",
+    contextWindow: 1_000,
+    estimatedInputTokens: 510,
+    view: "raw",
+    breakdown: {
+      rawTokens: 468,
+      checkpointTokens: 0,
+      safetyStateTokens: 12,
+      systemPromptTokens: 20,
+      toolSchemaTokens: 10,
+    },
+    estimatorVersion: "utf8-bytes-v1",
+    policyVersion: "1",
+    checkpointFormatVersion: "1",
+    reason: "append",
+    ...overrides,
+  };
+}
+
 function plan(id = "ctxplan_1"): ContextPlan {
   return {
     id: id as ContextPlan["id"],
@@ -335,8 +363,39 @@ function saveContextPlan(store: RuntimeSqliteStore, record: ContextPlan): void {
       requestIndex: record.requestIndex,
       requestHash: record.requestHash,
     },
-    (preparationClaim) => store.saveContextPlan({ plan: record, preparationClaim }),
+    (preparationClaim) => store.saveContextPlan({
+      plan: record,
+      eventId: `evt_plan_${record.id}`,
+      preparationClaim,
+    }),
   );
+}
+
+function readContextDiagnostics(db: ReturnType<typeof openRuntimeDatabase>): Array<{
+  code: string;
+  checkpoint_id: string | null;
+  reason: string;
+  details_json: string;
+}> {
+  const exists = db
+    .query<{ found: number }, []>(
+      `SELECT 1 AS found FROM sqlite_master
+       WHERE type = 'table' AND name = 'runtime_context_diagnostics'`,
+    )
+    .get();
+  if (!exists) return [];
+  return db
+    .query<{
+      code: string;
+      checkpoint_id: string | null;
+      reason: string;
+      details_json: string;
+    }, []>(
+      `SELECT code, checkpoint_id, reason, details_json
+       FROM runtime_context_diagnostics
+       ORDER BY created_at ASC, id ASC`,
+    )
+    .all();
 }
 
 describe("Runtime context schemas and persistence", () => {
@@ -347,6 +406,57 @@ describe("Runtime context schemas and persistence", () => {
     expect(runtime.contextPlanSchema.parse(plan())).toEqual(plan());
     expect(runtime.contextUsageSchema.parse(usage())).toEqual(usage());
     expect(runtime.runtimeSafetyStateSchema.parse(plan().safetyState)).toEqual(plan().safetyState);
+  });
+
+  test("validates raw and checkpoint next-turn forecast identities", () => {
+    expect(() => runtime.contextUsageSchema.parse({
+      ...usage(),
+      nextTurnForecast: nextTurnForecast({ checkpointId: "ckpt_invalid" }),
+    })).toThrow();
+    expect(() => runtime.contextUsageSchema.parse({
+      ...usage(),
+      nextTurnForecast: nextTurnForecast({
+        view: "checkpoint",
+        checkpointId: undefined,
+      }),
+    })).toThrow();
+    const checkpointForecast = nextTurnForecast({
+      view: "checkpoint",
+      checkpointId: "ckpt_valid",
+      reason: "checkpoint_created",
+    });
+    expect(runtime.contextUsageSchema.parse({
+      ...usage(),
+      nextTurnForecast: checkpointForecast,
+    }).nextTurnForecast).toEqual(checkpointForecast);
+  });
+
+  test("adds one immutable next-turn forecast without replacing Provider observation", () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    createHistory(store);
+    store.saveContextUsage(usage());
+    const forecast = nextTurnForecast();
+
+    const updated = store.updateContextUsageNextTurnForecast({
+      runId: "run_c",
+      requestIndex: 0,
+      nextTurnForecast: forecast,
+    });
+    expect(updated.providerObservation).toEqual(usage().providerObservation);
+    expect(updated.nextTurnForecast).toEqual(forecast);
+    expect(store.getLatestContextUsage("conv_context")).toEqual(updated);
+    expect(store.updateContextUsageNextTurnForecast({
+      runId: "run_c",
+      requestIndex: 0,
+      nextTurnForecast: forecast,
+    })).toEqual(updated);
+    expect(() => store.updateContextUsageNextTurnForecast({
+      runId: "run_c",
+      requestIndex: 0,
+      nextTurnForecast: nextTurnForecast({ estimatedInputTokens: 511 }),
+    })).toThrow("Next-turn context forecast is immutable");
+    db.close();
   });
 
   test("persists append-only checkpoint chains, plans, usage, and unknown formats", () => {
@@ -411,6 +521,29 @@ describe("Runtime context schemas and persistence", () => {
     expect(JSON.stringify(checkpointEvent)).not.toContain(first.summary);
     expect(checkpointEvent?.properties).not.toHaveProperty("safetyState");
     expect(checkpointEvent?.properties).not.toHaveProperty("generatedBy");
+    const planEvent = store.listEvents("conv_context").find(
+      (event) => event.type === "context.plan.created",
+    );
+    expect(planEvent).toMatchObject({
+      id: "evt_plan_ctxplan_1",
+      type: "context.plan.created",
+      properties: {
+        planId: "ctxplan_1",
+        conversationId: "conv_context",
+        runId: "run_c",
+        requestIndex: 0,
+        sourceHeadRunId: "run_c",
+        sourceConversationRevision: 3,
+        view: "raw",
+        reason: "raw_within_budget",
+        trigger: "auto_pre_turn",
+      },
+    });
+    expect(planEvent?.properties).not.toHaveProperty("safetyState");
+    expect(JSON.stringify(planEvent)).not.toContain("effects");
+    expect(store.listEvents("conv_context").filter(
+      (event) => event.type === "context.plan.created",
+    )).toHaveLength(1);
     db.close();
   });
 
@@ -425,7 +558,7 @@ describe("Runtime context schemas and persistence", () => {
       const saved = checkpointForStore(store, { id: "ckpt_1", coverageThroughRunId: "run_a" });
       commitContextCheckpoint(store, saved, "evt_ckpt_1");
       saveContextPlan(store, plan());
-      store.saveContextUsage(usage());
+      store.saveContextUsage({ ...usage(), nextTurnForecast: nextTurnForecast() });
       Bun.gc(true);
       db.close(true);
 
@@ -433,13 +566,286 @@ describe("Runtime context schemas and persistence", () => {
       store = new RuntimeSqliteStore(db);
       expect(store.listContextCheckpoints("conv_context")).toEqual([saved]);
       expect(store.listContextPlansByRun("run_c")).toEqual([plan()]);
-      expect(store.getLatestContextUsage("conv_context")).toEqual(usage());
+      expect(store.getLatestContextUsage("conv_context")).toEqual({
+        ...usage(),
+        nextTurnForecast: nextTurnForecast(),
+      });
 
       store.deleteConversation("conv_context");
       expect(store.listContextCheckpoints("conv_context")).toEqual([]);
       expect(store.getContextPlan("ctxplan_1")).toBeNull();
       expect(store.listContextPlansByRun("run_c")).toEqual([]);
       expect(store.getLatestContextUsage("conv_context")).toBeNull();
+      Bun.gc(true);
+      db.close(true);
+      db = undefined;
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // The successful path already closed the handle.
+      }
+      Bun.gc(true);
+      rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+    }
+  });
+
+  test("audits checkpoint integrity and interrupted preparation safely at startup", () => {
+    const directory = mkdtempSync(join(tmpdir(), "nexuspilot-context-integrity-"));
+    const path = join(directory, "runtime.sqlite");
+    let db: ReturnType<typeof openRuntimeDatabase> | undefined;
+    try {
+      db = openRuntimeDatabase(path);
+      const store = new RuntimeSqliteStore(db);
+      createHistory(store);
+      const incompleteLineageConversation: Conversation = {
+        id: "conv_startup_incomplete_lineage",
+        title: "Incomplete startup lineage",
+        version: "1",
+        status: { type: "idle" },
+        activeHeadRunId: "run_startup_incomplete_lineage",
+        revision: 1,
+        time: { created: 40, updated: 41 },
+      };
+      store.saveConversation(incompleteLineageConversation);
+      store.saveRun({
+        id: "run_startup_incomplete_lineage",
+        conversationId: incompleteLineageConversation.id,
+        agentMode: "ask",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        status: "completed",
+        input: { messageIds: [] },
+        limits: { maxSteps: 1, maxToolCalls: 0, maxOutputTokens: 128 },
+        time: { created: 40, completed: 41 },
+      });
+      const valid = checkpointForStore(store, {
+        id: "ckpt_startup_valid",
+        coverageThroughRunId: "run_a",
+        time: { created: 100 },
+      });
+      expect(commitContextCheckpoint(store, valid, "evt_startup_valid")).toBe("committed");
+      const future = checkpointForStore(store, {
+        id: "ckpt_startup_future",
+        coverageThroughRunId: "run_b",
+        parentCheckpointId: valid.id,
+        formatVersion: "future-9",
+        time: { created: 200 },
+      });
+      expect(commitContextCheckpoint(store, future, "evt_startup_future")).toBe("committed");
+      expect(store.claimContextPreparation({
+        runId: "run_c",
+        requestIndex: 9,
+        requestHash: `sha256:${"9".repeat(64)}`,
+        ownerId: "interrupted-owner-secret",
+        ttlMs: 5 * 60 * 1_000,
+      }).status).toBe("acquired");
+      Bun.gc(true);
+      db.close(true);
+      db = undefined;
+
+      const rawDb = new Database(path);
+      try {
+        rawDb.exec("PRAGMA foreign_keys = OFF");
+        const insertCheckpoint = rawDb.query(`
+          INSERT INTO runtime_context_checkpoints (
+            id, conversation_id, coverage_through_run_id, source_head_run_id,
+            source_conversation_revision, parent_checkpoint_id, format_version,
+            compatibility_kind, compatibility_version, payload_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        const validPayload = JSON.parse(JSON.stringify(valid)) as ContextCheckpoint;
+        const danglingPayload = {
+          ...future,
+          id: "ckpt_startup_dangling",
+          parentCheckpointId: "ckpt_missing_parent",
+          formatVersion: "1",
+          time: { created: 300 },
+        } satisfies ContextCheckpoint;
+        insertCheckpoint.run(
+          danglingPayload.id,
+          danglingPayload.conversationId,
+          danglingPayload.coverageThroughRunId,
+          danglingPayload.sourceHeadRunId,
+          danglingPayload.sourceConversationRevision,
+          danglingPayload.parentCheckpointId ?? null,
+          danglingPayload.formatVersion,
+          danglingPayload.compatibility.kind,
+          danglingPayload.compatibility.version,
+          JSON.stringify(danglingPayload),
+          danglingPayload.time.created,
+        );
+
+        const incompleteLineagePayload = {
+          ...validPayload,
+          id: "ckpt_startup_incomplete_lineage",
+          conversationId: incompleteLineageConversation.id,
+          coverageThroughRunId: "run_startup_incomplete_lineage",
+          sourceHeadRunId: "run_startup_incomplete_lineage",
+          sourceConversationRevision: 1,
+          time: { created: 250 },
+        } satisfies ContextCheckpoint;
+        insertCheckpoint.run(
+          incompleteLineagePayload.id,
+          incompleteLineagePayload.conversationId,
+          incompleteLineagePayload.coverageThroughRunId,
+          incompleteLineagePayload.sourceHeadRunId,
+          incompleteLineagePayload.sourceConversationRevision,
+          null,
+          incompleteLineagePayload.formatVersion,
+          incompleteLineagePayload.compatibility.kind,
+          incompleteLineagePayload.compatibility.version,
+          JSON.stringify(incompleteLineagePayload),
+          incompleteLineagePayload.time.created,
+        );
+
+        const childOfFuturePayload = {
+          ...validPayload,
+          id: "ckpt_startup_child_of_future",
+          coverageThroughRunId: "run_b",
+          lineageHash: future.lineageHash,
+          parentCheckpointId: future.id,
+          time: { created: 275 },
+        } satisfies ContextCheckpoint;
+        insertCheckpoint.run(
+          childOfFuturePayload.id,
+          childOfFuturePayload.conversationId,
+          childOfFuturePayload.coverageThroughRunId,
+          childOfFuturePayload.sourceHeadRunId,
+          childOfFuturePayload.sourceConversationRevision,
+          childOfFuturePayload.parentCheckpointId,
+          childOfFuturePayload.formatVersion,
+          childOfFuturePayload.compatibility.kind,
+          childOfFuturePayload.compatibility.version,
+          JSON.stringify(childOfFuturePayload),
+          childOfFuturePayload.time.created,
+        );
+
+        const missingCoveragePayload = {
+          ...validPayload,
+          id: "ckpt_startup_missing_coverage",
+          coverageThroughRunId: "run_missing_coverage",
+          time: { created: 400 },
+        } as ContextCheckpoint;
+        insertCheckpoint.run(
+          missingCoveragePayload.id,
+          missingCoveragePayload.conversationId,
+          missingCoveragePayload.coverageThroughRunId,
+          missingCoveragePayload.sourceHeadRunId,
+          missingCoveragePayload.sourceConversationRevision,
+          null,
+          missingCoveragePayload.formatVersion,
+          missingCoveragePayload.compatibility.kind,
+          missingCoveragePayload.compatibility.version,
+          JSON.stringify(missingCoveragePayload),
+          missingCoveragePayload.time.created,
+        );
+
+        const badLineagePayload = {
+          ...validPayload,
+          id: "ckpt_startup_bad_lineage",
+          lineageHash: `sha256:${"f".repeat(64)}`,
+          time: { created: 500 },
+        } satisfies ContextCheckpoint;
+        insertCheckpoint.run(
+          badLineagePayload.id,
+          badLineagePayload.conversationId,
+          badLineagePayload.coverageThroughRunId,
+          badLineagePayload.sourceHeadRunId,
+          badLineagePayload.sourceConversationRevision,
+          null,
+          badLineagePayload.formatVersion,
+          badLineagePayload.compatibility.kind,
+          badLineagePayload.compatibility.version,
+          JSON.stringify(badLineagePayload),
+          badLineagePayload.time.created,
+        );
+
+        insertCheckpoint.run(
+          "ckpt_startup_malformed",
+          "conv_context",
+          "run_a",
+          "run_c",
+          3,
+          null,
+          "1",
+          "provider-neutral-text",
+          1,
+          JSON.stringify({
+            id: "ckpt_startup_malformed",
+            summary: "STARTUP_SUMMARY_MUST_NOT_LEAK",
+          }),
+          600,
+        );
+      } finally {
+        rawDb.close();
+      }
+
+      db = openRuntimeDatabase(path);
+      let reopenedStore = new RuntimeSqliteStore(db);
+      expect(reopenedStore.listContextCheckpoints("conv_context").map(({ id }) => id)).toEqual([
+        "ckpt_startup_valid",
+        "ckpt_startup_future",
+      ]);
+      expect(reopenedStore.listContextCheckpoints(incompleteLineageConversation.id)).toEqual([]);
+      const firstDiagnostics = readContextDiagnostics(db);
+      expect(firstDiagnostics.map(({ code, checkpoint_id, reason }) => ({
+        code,
+        checkpointId: checkpoint_id,
+        reason,
+      }))).toEqual(expect.arrayContaining([
+        {
+          code: "CHECKPOINT_STARTUP_WARNING",
+          checkpointId: "ckpt_startup_future",
+          reason: "unsupported_format",
+        },
+        {
+          code: "CHECKPOINT_STARTUP_REJECTED",
+          checkpointId: "ckpt_startup_incomplete_lineage",
+          reason: "invalid_source_lineage",
+        },
+        {
+          code: "CHECKPOINT_STARTUP_REJECTED",
+          checkpointId: "ckpt_startup_child_of_future",
+          reason: "dangling_parent",
+        },
+        {
+          code: "CHECKPOINT_STARTUP_REJECTED",
+          checkpointId: "ckpt_startup_dangling",
+          reason: "dangling_parent",
+        },
+        {
+          code: "CHECKPOINT_STARTUP_REJECTED",
+          checkpointId: "ckpt_startup_missing_coverage",
+          reason: "missing_coverage_run",
+        },
+        {
+          code: "CHECKPOINT_STARTUP_REJECTED",
+          checkpointId: "ckpt_startup_bad_lineage",
+          reason: "lineage_hash_mismatch",
+        },
+        {
+          code: "CHECKPOINT_STARTUP_REJECTED",
+          checkpointId: "ckpt_startup_malformed",
+          reason: "invalid_payload",
+        },
+        {
+          code: "CONTEXT_PREPARATION_INTERRUPTED",
+          checkpointId: null,
+          reason: "interrupted_generation",
+        },
+      ]));
+      expect(JSON.stringify(firstDiagnostics)).not.toContain("STARTUP_SUMMARY_MUST_NOT_LEAK");
+      expect(JSON.stringify(firstDiagnostics)).not.toContain("interrupted-owner-secret");
+      const firstDiagnosticCount = firstDiagnostics.length;
+      Bun.gc(true);
+      db.close(true);
+      db = undefined;
+
+      db = openRuntimeDatabase(path);
+      reopenedStore = new RuntimeSqliteStore(db);
+      expect(reopenedStore.listContextCheckpoints("conv_context")).toHaveLength(2);
+      expect(readContextDiagnostics(db)).toHaveLength(firstDiagnosticCount);
       Bun.gc(true);
       db.close(true);
       db = undefined;
@@ -481,6 +887,39 @@ describe("Runtime context schemas and persistence", () => {
     );
     expect(store.listContextCheckpoints(conversation.id)).toEqual([]);
     expect(store.listEvents(conversation.id)).toEqual([]);
+    expect(readContextDiagnostics(db).map((diagnostic) => ({
+      code: diagnostic.code,
+      checkpointId: diagnostic.checkpoint_id,
+      reason: diagnostic.reason,
+      details: JSON.parse(diagnostic.details_json),
+    }))).toEqual([
+      {
+        code: "CHECKPOINT_CAS_CONFLICT",
+        checkpointId: "ckpt_stale",
+        reason: "source_revision_changed",
+        details: {
+          expectedHeadRunId: "run_c",
+          expectedRevision: 3,
+          actualHeadRunId: "run_c",
+          actualRevision: 4,
+          coverageThroughRunId: "run_a",
+          trigger: "auto_pre_turn",
+        },
+      },
+      {
+        code: "CHECKPOINT_CAS_CONFLICT",
+        checkpointId: "ckpt_stale",
+        reason: "source_head_changed",
+        details: {
+          expectedHeadRunId: "run_c",
+          expectedRevision: 3,
+          actualHeadRunId: "run_b",
+          actualRevision: 3,
+          coverageThroughRunId: "run_a",
+          trigger: "auto_pre_turn",
+        },
+      },
+    ]);
     db.close();
   });
 
@@ -499,6 +938,22 @@ describe("Runtime context schemas and persistence", () => {
     );
     expect(store.listContextCheckpoints("conv_context")).toEqual([]);
     expect(store.listEvents("conv_context")).toEqual([]);
+    expect(readContextDiagnostics(db).map((diagnostic) => ({
+      code: diagnostic.code,
+      checkpointId: diagnostic.checkpoint_id,
+      reason: diagnostic.reason,
+      details: JSON.parse(diagnostic.details_json),
+    }))).toEqual([{
+      code: "CHECKPOINT_REJECTED",
+      checkpointId: "ckpt_bad_hash",
+      reason: "lineage_hash_mismatch",
+      details: {
+        sourceHeadRunId: "run_c",
+        sourceConversationRevision: 3,
+        coverageThroughRunId: "run_a",
+        trigger: "auto_pre_turn",
+      },
+    }]);
     db.close();
   });
 
@@ -702,6 +1157,33 @@ describe("Runtime context schemas and persistence", () => {
     db.close();
   });
 
+  test("renews only the unexpired exact preparation owner with the Store clock", () => {
+    const db = openRuntimeDatabase(":memory:");
+    let clock = 10;
+    const store = new RuntimeSqliteStore(db, { now: () => clock });
+    createHistory(store);
+    const acquired = store.claimContextPreparation({
+      runId: "run_c",
+      requestIndex: 0,
+      requestHash: `sha256:${"a".repeat(64)}`,
+      ownerId: "owner-a",
+      ttlMs: 100,
+    });
+    if (acquired.status !== "acquired") throw new Error("Expected initial claim");
+
+    clock = 50;
+    expect(store.renewContextPreparationClaim(acquired.claim, 100)).toBe(true);
+    expect(store.getContextPreparationClaim("run_c", 0)).toEqual({
+      ...acquired.claim,
+      expiresAt: 150,
+    });
+
+    clock = 150;
+    expect(store.renewContextPreparationClaim(acquired.claim, 100)).toBe(false);
+    expect(store.getContextPreparationClaim("run_c", 0)?.expiresAt).toBe(150);
+    db.close();
+  });
+
   test("fences checkpoint, event, and plan writes from an expired superseded owner", () => {
     const db = openRuntimeDatabase(":memory:");
     let clock = 100;
@@ -729,6 +1211,13 @@ describe("Runtime context schemas and persistence", () => {
       coverageThroughRunId: "run_a",
     });
 
+    expect(store.renewContextPreparationClaim(oldOwner.claim, 100)).toBe(false);
+    expect(store.renewContextPreparationClaim(winner.claim, 100)).toBe(true);
+    expect(store.getContextPreparationClaim("run_c", 0)).toMatchObject({
+      ownerId: winner.claim.ownerId,
+      fencingToken: winner.claim.fencingToken,
+    });
+
     expect(() => store.commitContextCheckpoint({
       checkpoint: candidate,
       eventId: "evt_fenced",
@@ -736,6 +1225,7 @@ describe("Runtime context schemas and persistence", () => {
     })).toThrow(runtime.ContextPreparationLeaseLostError);
     expect(() => store.saveContextPlan({
       plan: plan("ctxplan_fenced"),
+      eventId: "evt_plan_fenced_old",
       preparationClaim: oldOwner.claim,
     })).toThrow(runtime.ContextPreparationLeaseLostError);
     expect(store.listContextCheckpoints("conv_context")).toEqual([]);
@@ -749,10 +1239,14 @@ describe("Runtime context schemas and persistence", () => {
     })).toBe("committed");
     store.saveContextPlan({
       plan: plan("ctxplan_fenced"),
+      eventId: "evt_plan_fenced_winner",
       preparationClaim: winner.claim,
     });
     expect(store.listContextCheckpoints("conv_context")).toEqual([candidate]);
-    expect(store.listEvents("conv_context")).toHaveLength(1);
+    expect(store.listEvents("conv_context").map((event) => event.type)).toEqual([
+      "context.checkpoint.created",
+      "context.plan.created",
+    ]);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.releaseContextPreparationClaim(oldOwner.claim)).toBe(false);
     expect(store.releaseContextPreparationClaim(winner.claim)).toBe(true);

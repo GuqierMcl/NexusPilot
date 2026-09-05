@@ -382,6 +382,80 @@ function createRunnerWithDefaultTools(
 }
 
 describe("RuntimeTextRunner", () => {
+  test("passes managed Runtime boundaries through AI SDK instructions", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const model = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start" as const, id: "managed-context-text" },
+            {
+              type: "text-delta" as const,
+              id: "managed-context-text",
+              delta: "managed context accepted",
+            },
+            { type: "text-end" as const, id: "managed-context-text" },
+            {
+              type: "finish" as const,
+              finishReason: { unified: "stop" as const, raw: undefined },
+              logprobs: undefined,
+              usage: sdkModelUsage(12),
+            },
+          ],
+        }),
+      }),
+    });
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      generator: async () => {
+        throw new Error("short raw history must not invoke the summarizer");
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 128_000,
+            outputLength: 4_096,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Send a normal managed message",
+    });
+    const body = await result.response.text();
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(body).toContain("managed context accepted");
+    expect(JSON.stringify(model.doStreamCalls[0]?.prompt)).toContain(
+      "Runtime Safety State",
+    );
+    expect(store.getRun(result.started.run.id)?.status).toBe("completed");
+    db.close();
+  });
+
   test("retries one pre-output context overflow with the same selected model", async () => {
     let requests = 0;
     const preparations: Array<{ requestIndex: number; trigger: string }> = [];
@@ -527,12 +601,16 @@ describe("RuntimeTextRunner", () => {
     expect(store.listMessages(result.started.conversation.id).filter(
       (message) => message.role === "assistant" && message.status.type === "error",
     )).toHaveLength(1);
+    const retryAudit = store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.retrying",
+    );
     const recovery = store.listTraces(result.started.run.id).filter(
       (trace) => trace.type === "context.overflow.recovered",
     );
-    expect(recovery).toHaveLength(1);
-    expect(JSON.stringify(recovery[0])).toContain(firstError.message);
-    expect(JSON.stringify(recovery[0])).not.toContain(secondMessage);
+    expect(retryAudit).toHaveLength(1);
+    expect(JSON.stringify(retryAudit[0])).toContain(firstError.message);
+    expect(JSON.stringify(retryAudit[0])).not.toContain(secondMessage);
+    expect(recovery).toHaveLength(0);
     db.close();
   });
 
@@ -613,6 +691,178 @@ describe("RuntimeTextRunner", () => {
     db.close();
   });
 
+  test.each([
+    [
+      "URL source",
+      {
+        type: "source" as const,
+        sourceType: "url" as const,
+        id: "source-url-1",
+        url: "https://example.com/source",
+        title: "Generated source",
+      },
+    ],
+    [
+      "document source",
+      {
+        type: "source" as const,
+        sourceType: "document" as const,
+        id: "source-document-1",
+        mediaType: "application/pdf",
+        title: "Generated report",
+        filename: "report.pdf",
+      },
+    ],
+    [
+      "file",
+      {
+        type: "file" as const,
+        mediaType: "application/pdf",
+        data: { type: "data" as const, data: new Uint8Array([1, 2, 3]) },
+      },
+    ],
+    [
+      "reasoning file",
+      {
+        type: "reasoning-file" as const,
+        mediaType: "image/png",
+        data: { type: "data" as const, data: new Uint8Array([4, 5, 6]) },
+      },
+    ],
+    [
+      "custom provider content",
+      {
+        type: "custom" as const,
+        kind: "test.generated-artifact" as const,
+        providerMetadata: { test: { artifactId: "artifact-1" } },
+      },
+    ],
+  ] as const)(
+    "keeps original overflow terminal after default SDK %s output",
+    async (_name, semanticPart) => {
+      const providerError = Object.assign(
+        new Error(`maximum context length exceeded\n${_name.toUpperCase().replaceAll(" ", "_")}`),
+        { name: "SemanticPartContextError", statusCode: 400, isRetryable: false },
+      );
+      let requests = 0;
+      const model = new MockLanguageModelV3({
+        doStream: async () => {
+          requests += 1;
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                semanticPart,
+                { type: "error" as const, error: providerError },
+              ] as never,
+            }),
+          };
+        },
+      });
+      const preparationTriggers: string[] = [];
+      const contextManager = {
+        prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+          preparationTriggers.push(input.trigger);
+          return managedPreparedTestContext(input);
+        },
+      };
+      const { db, store, runner } = createRunnerWithModel(model, undefined, contextManager);
+
+      const result = await runner.streamText({
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: `Preserve the ${_name}`,
+      });
+      const body = await result.response.text();
+      const wireErrors = body
+        .split("\n\n")
+        .filter((chunk) => chunk.startsWith("data: {") && chunk.includes("\"type\":\"error\""))
+        .map((chunk) => JSON.parse(chunk.slice("data: ".length)));
+
+      expect(requests).toBe(1);
+      expect(preparationTriggers).toEqual(["auto_pre_turn"]);
+      expect(wireErrors).toEqual([{ type: "error", errorText: providerError.message }]);
+      expect(body).not.toContain("provider_overflow");
+      expect(store.getRun(result.started.run.id)).toMatchObject({
+        status: "failed",
+        error: {
+          name: "SemanticPartContextError",
+          data: {
+            message: providerError.message,
+            statusCode: 400,
+            isRetryable: false,
+          },
+        },
+      });
+      expect(store.listTraces(result.started.run.id).filter(
+        (trace) => trace.type === "context.overflow.recovered",
+      )).toHaveLength(0);
+      expect(store.listMessages(result.started.conversation.id).flatMap(
+        (message) => message.parts.filter((part) => part.type === "compaction"),
+      )).toHaveLength(0);
+      db.close();
+    },
+  );
+
+  test("releases default SDK response readiness on an unsupported semantic part", async () => {
+    const providerError = Object.assign(
+      new Error("maximum context length exceeded\nAFTER_DOCUMENT_SOURCE"),
+      { name: "DelayedSemanticPartContextError", statusCode: 400 },
+    );
+    const releaseOverflow = createDeferred<void>();
+    let requests = 0;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        requests += 1;
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({
+                type: "source",
+                sourceType: "document",
+                id: "source-before-delayed-overflow",
+                mediaType: "application/pdf",
+                title: "Generated report",
+              } as never);
+              void releaseOverflow.promise.then(() => {
+                controller.enqueue({ type: "error", error: providerError } as never);
+                controller.close();
+              });
+            },
+          }),
+        };
+      },
+    });
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) =>
+        managedPreparedTestContext(input),
+    };
+    const { db, store, runner } = createRunnerWithModel(model, undefined, contextManager);
+
+    const operation = runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Release on unsupported semantic output",
+    });
+    const returnedBeforeOverflow = await Promise.race([
+      operation.then(() => true),
+      Bun.sleep(500).then(() => false),
+    ]);
+    releaseOverflow.resolve();
+    const result = await operation;
+    await result.response.text();
+
+    expect(returnedBeforeOverflow).toBe(true);
+    expect(requests).toBe(1);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: { data: { message: providerError.message } },
+    });
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(0);
+    db.close();
+  });
+
   test("owns a request-2 construction rejection and never falls back to attempt 0", async () => {
     const firstError = Object.assign(new Error("maximum context length exceeded\nFIRST_ONLY"), {
       name: "FirstConstructionContextError",
@@ -676,10 +926,13 @@ describe("RuntimeTextRunner", () => {
       (message) => message.role === "assistant" && message.status.type === "error",
     )).toHaveLength(1);
     expect(store.listTraces(result.started.run.id).filter(
-      (trace) => trace.type === "context.overflow.recovered",
+      (trace) => trace.type === "context.overflow.retrying",
     )[0]?.payload).toMatchObject({
       error: { data: { message: firstError.message } },
     });
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(0);
     db.close();
   });
 
@@ -1940,6 +2193,10 @@ describe("RuntimeTextRunner", () => {
         const prepared = managedPreparedTestContext(input);
         return {
           ...prepared,
+          instructions: [{
+            role: "system" as const,
+            content: `boundary ${input.trigger}`,
+          }],
           messages: [
             { role: "user" as const, content: `managed ${input.trigger}` },
             ...(input.retainedMessages ?? []),
@@ -1978,6 +2235,8 @@ describe("RuntimeTextRunner", () => {
     expect(JSON.stringify(laterRetained)).toContain("call_recovered_tool_loop");
     expect(JSON.stringify(laterRetained)).toContain("Example page");
     expect(JSON.stringify(prompts[2])).toContain("call_recovered_tool_loop");
+    expect(JSON.stringify(prompts[1])).toContain("boundary provider_overflow");
+    expect(JSON.stringify(prompts[2])).toContain("boundary auto_mid_turn");
     expect(store.listContextUsagesByRun(result.started.run.id).map((usage) => ({
       requestIndex: usage.requestIndex,
       providerInputTokens: usage.providerObservation?.inputTokens,
@@ -2002,8 +2261,29 @@ describe("RuntimeTextRunner", () => {
     let idSequence = 0;
     let timeSequence = 0;
     const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const mainModel = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start" as const, id: "checkpoint-response" },
+            {
+              type: "text-delta" as const,
+              id: "checkpoint-response",
+              delta: "checkpoint context accepted",
+            },
+            { type: "text-end" as const, id: "checkpoint-response" },
+            {
+              type: "finish" as const,
+              finishReason: { unified: "stop" as const, raw: undefined },
+              logprobs: undefined,
+              usage: sdkModelUsage(64),
+            },
+          ],
+        }),
+      }),
+    });
     const resolveLanguageModel: RuntimeTextRunnerDependencies["resolveLanguageModel"] = () => ({
-      languageModel: new MockLanguageModelV3(),
+      languageModel: mainModel,
       runtimeContext: {
         provider: {
           providerId: "openai",
@@ -2050,18 +2330,12 @@ describe("RuntimeTextRunner", () => {
       createId,
       now: () => 1_000 + timeSequence++,
     });
-    let mainMessages: unknown[] | undefined;
     const runner = new RuntimeTextRunner({
       store,
       createId,
       now: () => 1_000 + timeSequence++,
       resolveLanguageModel,
       contextManager,
-      streamText: async (input) => {
-        mainMessages = input.messages;
-        await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
-        return { toUIMessageStreamResponse: () => new Response("data: {}\\n\\n") };
-      },
     });
     const current = await runner.streamText({
       conversationId: conversationId as never,
@@ -2069,14 +2343,22 @@ describe("RuntimeTextRunner", () => {
       modelId: "gpt-4o",
       text: "CURRENT_RAW_USER",
     });
-    await current.response.text();
+    const body = await current.response.text();
 
-    const serializedMainMessages = JSON.stringify(mainMessages);
+    const providerPrompt = mainModel.doStreamCalls.at(-1)?.prompt ?? [];
+    const providerInstructions = providerPrompt.filter(
+      (message) => message.role === "system",
+    );
+    const providerMessages = providerPrompt.filter(
+      (message) => message.role !== "system",
+    );
     expect(summaryCalls).toBe(1);
-    expect(serializedMainMessages).toContain("CHECKPOINT_SUMMARY");
-    expect(serializedMainMessages).toContain("Runtime Safety State");
-    expect(serializedMainMessages).toContain("CURRENT_RAW_USER");
-    expect(serializedMainMessages).not.toContain("OLD_USER_0");
+    expect(mainModel.doStreamCalls).toHaveLength(1);
+    expect(body).toContain("checkpoint context accepted");
+    expect(JSON.stringify(providerInstructions)).toContain("CHECKPOINT_SUMMARY");
+    expect(JSON.stringify(providerInstructions)).toContain("Runtime Safety State");
+    expect(JSON.stringify(providerMessages)).toContain("CURRENT_RAW_USER");
+    expect(JSON.stringify(providerMessages)).not.toContain("OLD_USER_0");
     const checkpoint = store.listContextCheckpoints(conversationId as never)[0]!;
     expect(checkpoint.coverageThroughRunId).not.toBe(current.started.run.id);
     expect(
@@ -2088,6 +2370,7 @@ describe("RuntimeTextRunner", () => {
   test("runs the context manager after durable Run start before the main model request", async () => {
     let prepareCalls = 0;
     let observedRunStatus: string | undefined;
+    let mainInstructions: unknown;
     let mainMessages: unknown;
     let storeRef: RuntimeSqliteStore | undefined;
     const contextManager = {
@@ -2109,11 +2392,13 @@ describe("RuntimeTextRunner", () => {
             },
             view: "raw",
           },
-          messages: [{ role: "system", content: "checkpoint summary" }],
+          instructions: [{ role: "system", content: "checkpoint summary" }],
+          messages: [{ role: "user", content: "new turn" }],
         };
       },
     };
     const streamText: RuntimeStreamText = async (input) => {
+      mainInstructions = input.instructions;
       mainMessages = input.messages;
       await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
       return {
@@ -2139,7 +2424,8 @@ describe("RuntimeTextRunner", () => {
 
     expect(prepareCalls).toBe(1);
     expect(observedRunStatus).toBe("running");
-    expect(mainMessages).toEqual([{ role: "system", content: "checkpoint summary" }]);
+    expect(JSON.stringify(mainInstructions)).toContain("checkpoint summary");
+    expect(mainMessages).toEqual([{ role: "user", content: "new turn" }]);
   });
 
   test("records an already-aborted normal preparation as a client interruption", async () => {
@@ -2226,14 +2512,13 @@ describe("RuntimeTextRunner", () => {
             },
             view: "raw",
           },
-          messages: [
-            { role: "system", content: "managed context" },
-            ...(input.retainedMessages ?? []),
-          ],
+          instructions: [{ role: "system", content: "managed context" }],
+          messages: [...(input.retainedMessages ?? [])],
         };
       },
     };
     let continuationRequest: {
+      instructions: unknown;
       messages: ModelMessage[];
       maxSteps: number | undefined;
       maxOutputTokens: number | undefined;
@@ -2329,12 +2614,13 @@ describe("RuntimeTextRunner", () => {
         });
       } else {
         continuationRequest = {
+          instructions: structuredClone(input.instructions),
           messages: structuredClone(input.messages ?? []),
           maxSteps: input.maxSteps,
           maxOutputTokens: input.maxOutputTokens,
           timeout: input.timeout,
         };
-        expect(JSON.stringify(input.messages)).toContain("managed context");
+        expect(JSON.stringify(input.instructions)).toContain("managed context");
         expect(JSON.stringify(input.messages)).toContain("call_approval");
         expect(JSON.stringify(input.messages)).toContain("approval_1");
         const execute = input.tools?.np__web__fetch?.execute as unknown as (
@@ -2462,10 +2748,10 @@ describe("RuntimeTextRunner", () => {
       },
     ];
     expect(retainedModelInputs).toEqual([expectedContinuationPrefix]);
-    expect(continuationRequest?.messages).toEqual([
-      { role: "system", content: "managed context" },
-      ...expectedContinuationPrefix,
-    ]);
+    expect(JSON.stringify(continuationRequest?.instructions)).toContain(
+      "managed context",
+    );
+    expect(continuationRequest?.messages).toEqual(expectedContinuationPrefix);
     expect(continuationRequest?.maxSteps).toBe(
       limitsBefore.maxSteps - continuationBefore.stepCount,
     );
@@ -3815,7 +4101,9 @@ describe("RuntimeTextRunner", () => {
   test("passes assembled ask system prompt into AI SDK streamText", async () => {
     let capturedSystem: string | undefined;
     const streamText: RuntimeStreamText = (input) => {
-      capturedSystem = input.system;
+      capturedSystem = typeof input.instructions === "string"
+        ? input.instructions
+        : JSON.stringify(input.instructions);
       void input.onChunk?.({ chunk: { type: "text-delta", text: "Answer" } });
       void input.onFinish?.({ finishReason: "stop" });
 
@@ -4028,7 +4316,9 @@ describe("RuntimeTextRunner", () => {
   test("resolves agent prompt and stores tool policy warnings when tools are unavailable", async () => {
     let capturedSystem: string | undefined;
     const streamText: RuntimeStreamText = (input) => {
-      capturedSystem = input.system;
+      capturedSystem = typeof input.instructions === "string"
+        ? input.instructions
+        : JSON.stringify(input.instructions);
       void input.onChunk?.({ chunk: { type: "text-delta", text: "Agent answer" } });
       void input.onFinish?.({ finishReason: "stop" });
 
@@ -4073,7 +4363,9 @@ describe("RuntimeTextRunner", () => {
     let capturedActiveTools: string[] | undefined;
     let capturedToolNames: string[] | undefined;
     const streamText: RuntimeStreamText = (input) => {
-      capturedSystem = input.system;
+      capturedSystem = typeof input.instructions === "string"
+        ? input.instructions
+        : JSON.stringify(input.instructions);
       capturedActiveTools = input.activeTools;
       capturedToolNames = input.tools ? Object.keys(input.tools) : undefined;
       void input.onChunk?.({ chunk: { type: "text-delta", text: "Agent answer" } });
@@ -4115,7 +4407,9 @@ describe("RuntimeTextRunner", () => {
     let capturedActiveTools: string[] | undefined;
     let capturedToolNames: string[] | undefined;
     const streamText: RuntimeStreamText = (input) => {
-      capturedSystem = input.system;
+      capturedSystem = typeof input.instructions === "string"
+        ? input.instructions
+        : JSON.stringify(input.instructions);
       capturedActiveTools = input.activeTools;
       capturedToolNames = input.tools ? Object.keys(input.tools) : undefined;
       void input.onChunk?.({ chunk: { type: "text-delta", text: "Ask answer" } });

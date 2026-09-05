@@ -68,6 +68,7 @@ type ContextDisplayContextValue = {
   modelContextWindow: number;
   source: "estimate" | "provider" | "legacy" | "invalid";
   view: "raw" | "checkpoint" | "legacy" | "unknown";
+  providerInputTokens?: number;
   reservedOutputTokens?: number;
   isLegacy: boolean;
 };
@@ -145,6 +146,7 @@ export function ContextDisplayRootView({
     modelContextWindow: displayUsage.modelContextWindow,
     source: displayUsage.source,
     view: displayUsage.view,
+    providerInputTokens: displayUsage.providerInputTokens,
     reservedOutputTokens: displayUsage.reservedOutputTokens,
     isLegacy: displayUsage.isLegacy,
   };
@@ -313,6 +315,7 @@ function ContextDisplayContent({
     modelContextWindow,
     source,
     view,
+    providerInputTokens,
     reservedOutputTokens,
     isLegacy,
   } =
@@ -336,6 +339,7 @@ function ContextDisplayContent({
         modelContextWindow={modelContextWindow}
         source={source}
         view={view}
+        providerInputTokens={providerInputTokens}
         reservedOutputTokens={reservedOutputTokens}
         isLegacy={isLegacy}
       />
@@ -350,6 +354,7 @@ export function ContextDisplayContentView({
   modelContextWindow,
   source,
   view,
+  providerInputTokens,
   reservedOutputTokens,
   isLegacy,
 }: ContextDisplayContextValue) {
@@ -393,19 +398,17 @@ export function ContextDisplayContentView({
         {!isLegacy && (
           <div className="mt-3 grid gap-1.5 border-t pt-2 text-muted-foreground">
             <div className="flex items-baseline justify-between gap-6">
-              <span>活动输入</span>
+              <span>{source === "invalid" ? "当前上下文" : "当前上下文估算"}</span>
               <span className="tabular-nums">
-                {formatTokenCount(Math.max(totalTokens - (reservedOutputTokens ?? 0), 0))}
+                {source === "invalid" ? "未知" : formatTokenCount(totalTokens)}
               </span>
             </div>
-            <div className="flex items-baseline justify-between gap-6">
-              <span>输入来源</span>
-              <span>
-                {source === "provider"
-                  ? "Provider 观测"
-                  : source === "estimate" ? "估算" : "未知"}
-              </span>
-            </div>
+            {providerInputTokens !== undefined && (
+              <div className="flex items-baseline justify-between gap-6">
+                <span>最近 Provider 实测输入</span>
+                <span className="tabular-nums">{formatTokenCount(providerInputTokens)}</span>
+              </div>
+            )}
             <div className="flex items-baseline justify-between gap-6">
               <span>上下文视图</span>
               <span>
@@ -415,7 +418,7 @@ export function ContextDisplayContentView({
               </span>
             </div>
             <div className="flex items-baseline justify-between gap-6">
-              <span>预留输出</span>
+              <span>输出预留</span>
               <span className="tabular-nums">{formatTokenCount(reservedOutputTokens ?? 0)}</span>
             </div>
           </div>
@@ -500,7 +503,7 @@ export function ContextDisplayRingBody({
     : view === "raw" ? "原始上下文" : "未知";
   const ariaLabel = isLegacy
     ? `上下文用量：${usageLabel}`
-    : `上下文用量：${usageLabel}；输入来源：${sourceLabel}；上下文视图：${viewLabel}；预留输出：${formatTokenCount(reservedOutputTokens ?? 0)}`;
+    : `上下文用量：${usageLabel}；输入来源：${sourceLabel}；上下文视图：${viewLabel}；输出预留：${formatTokenCount(reservedOutputTokens ?? 0)}`;
 
   return (
     <>

@@ -137,6 +137,7 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 - 判断 AI Runtime 是否已经启动并可以接受前端请求；
 - 展示 Runtime version 和健康状态；
 - 展示附件子系统的只读 `attachments.status` 与脱敏 diagnostics warnings；单个 corrupt/orphan、过期上传或待重试 GC 只产生 warning，不把 Runtime 全局状态改为不可用；
+- 展示上下文子系统的只读 `context.status` 与 checkpoint/preparation diagnostics；只返回安全 code、reason 和 Conversation/Run/checkpoint ID，不返回 summary、Safety State 或诊断 details；
 - 决定是否开放 Frontend 的智能体入口；
 - 按需展示 AI Runtime 当前观察到的只读诊断。
 
@@ -147,15 +148,18 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 - 代替 Run、Conversation、ToolCall 或 Permission Snapshot；
 - 代替 EventBus 的实时 UI 通知。
 
-`backendBridge.state` 与 `attachments` 都只是 AI Runtime 对内部依赖的只读诊断。Frontend 是否开放智能体入口仍只取决于 AI Runtime 自身是否健康；Rust/Tauri 不读取这些字段，也不根据它们调整 Bridge 状态。附件 diagnostics warning 只帮助定位局部损坏或维护重试，不等同于全局 unhealthy。
+`backendBridge.state`、`attachments` 与 `context` 都只是 AI Runtime 对内部依赖的只读诊断。Frontend 是否开放智能体入口仍只取决于 AI Runtime 自身是否健康；Rust/Tauri 不读取这些字段，也不根据它们调整 Bridge 状态。附件或 checkpoint diagnostics warning 只帮助定位局部损坏、未知格式或中断恢复，不等同于全局 unhealthy。
 
-正常状态和局部附件 warning 返回 HTTP 200 与全局 `status: "ok"`。Runtime DB 或附件根目录整体不可用时返回 HTTP 503、全局 `status: "unhealthy"`，并把 `attachments.status` 置为 `unavailable`；这一区分避免单个损坏附件关闭整个智能体入口，同时让致命本地存储故障不会被误报为健康。
+正常状态、局部附件 warning 和 `context.status: "warning"` 返回 HTTP 200 与全局 `status: "ok"`。Runtime DB 或附件根目录整体不可用时返回 HTTP 503、全局 `status: "unhealthy"`，并把对应子系统状态置为 `unavailable`；这一区分避免单个损坏附件或不可用 checkpoint 关闭整个智能体入口，同时让致命本地存储故障不会被误报为健康。
 
 ## 事实来源与失败语义
 
 | 问题 | 事实来源 / 恢复方式 |
 |---|---|
 | Conversation、Run、Message、ToolCall、Permission 当前事实 | Runtime Store 与 Snapshot Read API |
+| 完整审计 transcript 与默认聊天历史 | 显式 `view=transcript` 查询完整 DAG；默认 Snapshot 与模型输入使用 active lineage |
+| 跨分支已发生/可能发生副作用 | 从结构化 ToolCall/Permission/risk 事实生成的 Runtime/Safety State，不从摘要或 UI 文本推断 |
+| 下一轮模型请求的主窗口用量 | active Assistant Snapshot 上 durable `ContextUsage.nextTurnForecast`；request estimate、Provider observation 与 output reserve 是辅助事实，`Run.usage` 仍是累计计费事实 |
 | 当前前台 assistant message 流式渲染 | AI SDK-compatible stream；历史仍从 Runtime Store 恢复 |
 | Frontend 是否错过 EventBus 通知 | 不追踪；需要精确状态时重新读取 Snapshot |
 | Backend Bridge 当前连接与 pending request | AI Runtime/Rust 各自的 Bridge 内存状态和 request map |
@@ -180,6 +184,8 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 - 专用 Attachment Upload、元数据、受认证内容与删除 API，以及 `/v1/runs` 的最终 `attachment_id` 引用；
 - live-only Global EventBus 与 `GET /v1/events`；
 - Frontend EventBus 订阅和 Snapshot invalidation。
+
+默认 message Snapshot 读取 active lineage，并返回 active head/revision；`view=transcript` 是完整 append-only 审计 history 的显式读取方式。Context Window Manager 与 `ContextCompactionService` 在主模型调用前建立 request-scoped context plan；自动压缩和唯一安全 overflow recovery 仍通过主 stream/Store 事实收敛，既不借用 EventBus 承载 summary，也不通过 SSE 重放历史。active Assistant metadata 只投影安全的 compaction lifecycle marker、next-turn forecast 和辅助 usage 标量；`failed` marker 不携带 diagnostics，summary、reasoning 与 Safety State 均不进入前端消息 metadata。
 
 当前仓库已经实现 `/v1/internal/backend-bridge`、Rust Backend Bridge client、ready、heartbeat、request/response transport、断线收敛、主动重连、静态 Gateway dispatcher，以及 Runtime Tool Core 到 Bridge 的 Backend Executor Adapter。生产 Registry 已接入七个只读 Backend Tool、可逆的 `connection.open`、内部 `sql.analyze`、受控 `sql.execute`、五组 Redis prepare/execute operation 与 prepared-plan cleanup；它们只通过该通道交换 AI Runtime 意图与响应，不改变 EventBus/SSE 或 `/health` 的职责。`connection.open` 引起的共享数据库 runtime 变化仍通过相邻的 Workbench Domain Event 通知 React。
 

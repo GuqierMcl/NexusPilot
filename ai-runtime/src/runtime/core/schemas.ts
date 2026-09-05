@@ -690,6 +690,10 @@ export const contextBudgetSnapshotSchema = z
     checkpointTokens: nonnegativeTokenCountSchema,
     safetyStateTokens: nonnegativeTokenCountSchema,
     estimatedInputTokens: nonnegativeTokenCountSchema,
+    summaryMaxOutputTokens: nonnegativeTokenCountSchema.optional(),
+    summaryRetryMaxOutputTokens: nonnegativeTokenCountSchema.optional(),
+    summaryMaxInputTokens: nonnegativeTokenCountSchema.optional(),
+    summaryRetryMaxInputTokens: nonnegativeTokenCountSchema.optional(),
   })
   .strict();
 
@@ -703,12 +707,56 @@ const contextUsageBreakdownSchema = z
   })
   .strict();
 
+const nextTurnContextForecastSchema = z
+  .object({
+    conversationId: z.string().startsWith("conv_"),
+    sourceHeadRunId: z.string().startsWith("run_"),
+    sourceConversationRevision: z.number().int().nonnegative(),
+    providerId: z.string().min(1),
+    modelId: z.string().min(1),
+    contextWindow: z.number().finite().positive().optional(),
+    estimatedInputTokens: nonnegativeTokenCountSchema,
+    view: z.enum(["raw", "checkpoint"]),
+    checkpointId: z.string().startsWith("ckpt_").optional(),
+    breakdown: contextUsageBreakdownSchema,
+    estimatorVersion: z.string().min(1),
+    policyVersion: z.string().min(1),
+    checkpointFormatVersion: z.string().min(1),
+    reason: z.enum([
+      "append",
+      "checkpoint_created",
+      "branch_changed",
+      "model_changed",
+      "prompt_policy_changed",
+      "estimator_policy_changed",
+    ]),
+  })
+  .strict()
+  .superRefine((forecast, context) => {
+    if (forecast.view === "checkpoint" && !forecast.checkpointId) {
+      context.addIssue({
+        code: "custom",
+        path: ["checkpointId"],
+        message: "A checkpoint forecast requires checkpointId",
+      });
+    }
+    if (forecast.view === "raw" && forecast.checkpointId) {
+      context.addIssue({
+        code: "custom",
+        path: ["checkpointId"],
+        message: "A raw forecast cannot reference checkpointId",
+      });
+    }
+  });
+
 export const contextUsageSchema = z
   .object({
     id: z.string().startsWith("ctxuse_"),
     conversationId: z.string().startsWith("conv_"),
     runId: z.string().startsWith("run_"),
     requestIndex: z.number().int().nonnegative(),
+    purpose: z.literal("checkpoint_summary").optional(),
+    summaryInvocationCount: z.number().int().positive().optional(),
     providerId: z.string().min(1),
     modelId: z.string().min(1),
     contextWindow: z.number().finite().positive().optional(),
@@ -721,12 +769,17 @@ export const contextUsageSchema = z
     providerObservation: z
       .object({
         source: z.literal("provider"),
-        inputTokens: nonnegativeTokenCountSchema,
+        inputTokens: nonnegativeTokenCountSchema.optional(),
+        outputTokens: nonnegativeTokenCountSchema.optional(),
+        reasoningTokens: nonnegativeTokenCountSchema.optional(),
         cacheReadTokens: nonnegativeTokenCountSchema.optional(),
         cacheWriteTokens: nonnegativeTokenCountSchema.optional(),
+        totalTokens: nonnegativeTokenCountSchema.optional(),
+        observedInvocationCount: z.number().int().positive().optional(),
       })
       .strict()
       .optional(),
+    nextTurnForecast: nextTurnContextForecastSchema.optional(),
     estimatorVersion: z.string().min(1),
     policyVersion: z.string().min(1),
     checkpointFormatVersion: z.string().min(1),
@@ -806,6 +859,15 @@ export const runtimeSafetyStateSchema = z
         })
         .strict(),
     ),
+    continuations: z.array(
+      z.object({
+        toolCallId: z.string().startsWith("tool_"),
+        runId: z.string().startsWith("run_"),
+        prepareOperation: z.string().min(1),
+        expiresAt: z.number().int().nonnegative(),
+        requiresRevalidation: z.literal(true),
+      }).strict(),
+    ).optional(),
     hash: z.string().startsWith("sha256:"),
   })
   .strict();
@@ -865,6 +927,21 @@ export const contextPlanSchema = z
       .strict()
       .optional(),
     eligibleCoverageThroughRunId: z.string().startsWith("run_").optional(),
+    checkpointRejections: z.array(
+      z.object({
+        checkpointId: z.string().startsWith("ckpt_"),
+        reason: z.enum([
+          "unsupported_format",
+          "unsupported_compatibility",
+          "dangling_parent",
+          "lineage_hash_mismatch",
+          "coverage_not_active_ancestor",
+          "unsafe_coverage_boundary",
+          "raw_tail_too_short",
+          "target_budget_exceeded",
+        ]),
+      }).strict(),
+    ).optional(),
     safetyState: runtimeSafetyStateSchema,
     budget: contextBudgetSnapshotSchema,
     requestHash: z.string().startsWith("sha256:"),
@@ -903,6 +980,9 @@ const traceEventBaseSchema = z.object({
     "stream.started",
     "stream.finished",
     "stream.failed",
+    "context.compaction.preparing",
+    "context.compaction.failed",
+    "context.overflow.retrying",
     "context.overflow.recovered",
   ]),
   level: z.enum(["debug", "info", "warn", "error"]),
@@ -933,9 +1013,52 @@ const contextOverflowRecoveredTracePayloadSchema = z
   })
   .strict();
 
+const contextCompactionLifecycleBasePayloadSchema = z
+  .object({
+    trigger: contextCompactionTriggerSchema,
+    requestIndex: z.number().int().nonnegative(),
+    sourceHeadRunId: z.string().startsWith("run_"),
+    sourceConversationRevision: z.number().int().nonnegative(),
+    beforeEstimatedInputTokens: nonnegativeTokenCountSchema,
+    summaryMaxOutputTokens: nonnegativeTokenCountSchema.optional(),
+    summaryRetryMaxOutputTokens: nonnegativeTokenCountSchema.optional(),
+  })
+  .strict();
+
+const contextCompactionPreparingTracePayloadSchema =
+  contextCompactionLifecycleBasePayloadSchema;
+
+const contextCompactionFailedTracePayloadSchema = z
+  .object({
+    trigger: contextCompactionTriggerSchema,
+    requestIndex: z.number().int().nonnegative(),
+    sourceHeadRunId: z.string().startsWith("run_"),
+    sourceConversationRevision: z.number().int().nonnegative(),
+    beforeEstimatedInputTokens: nonnegativeTokenCountSchema,
+    summaryMaxOutputTokens: nonnegativeTokenCountSchema.optional(),
+    summaryRetryMaxOutputTokens: nonnegativeTokenCountSchema.optional(),
+    errorName: z.string().min(1),
+    finishReason: z.string().min(1).optional(),
+    inputTokens: nonnegativeTokenCountSchema.optional(),
+    outputTokens: nonnegativeTokenCountSchema.optional(),
+    textTokens: nonnegativeTokenCountSchema.optional(),
+    reasoningTokens: nonnegativeTokenCountSchema.optional(),
+    summaryInvocationCount: z.number().int().positive().optional(),
+    summaryReservedOutputTokens: nonnegativeTokenCountSchema.optional(),
+  })
+  .strict();
+
 export const traceEventSchema = traceEventBaseSchema.superRefine((trace, context) => {
-  if (trace.type !== "context.overflow.recovered") return;
-  const parsed = contextOverflowRecoveredTracePayloadSchema.safeParse(trace.payload);
+  const payloadSchema = trace.type === "context.overflow.recovered"
+    || trace.type === "context.overflow.retrying"
+    ? contextOverflowRecoveredTracePayloadSchema
+    : trace.type === "context.compaction.preparing"
+      ? contextCompactionPreparingTracePayloadSchema
+      : trace.type === "context.compaction.failed"
+        ? contextCompactionFailedTracePayloadSchema
+        : undefined;
+  if (!payloadSchema) return;
+  const parsed = payloadSchema.safeParse(trace.payload);
   if (parsed.success) return;
   for (const issue of parsed.error.issues) {
     context.addIssue({

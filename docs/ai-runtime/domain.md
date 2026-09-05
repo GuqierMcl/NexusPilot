@@ -46,6 +46,13 @@ ai-runtime/src/runtime/
 │   └── web-ping.ts            # Runtime-local web.ping executor
 └── index.ts           # runtime barrel export
 
+ai-runtime/src/runtime/context/
+├── planner.ts               # deterministic active-lineage context plans
+├── model-context-manager.ts # request preparation, replan and projection
+├── compaction-service.ts    # single checkpoint generation/CAS seam
+├── safety-state.ts          # structured cross-branch effect projection
+└── types.ts                 # checkpoint, plan, budget, usage and claim contracts
+
 ai-runtime/src/storage/
 ├── runtime-database.ts          # opens ai-runtime.sqlite3 and delegates migrations
 ├── runtime-migration-manager.ts # versioned migration orchestration
@@ -63,7 +70,7 @@ ai-runtime/src/storage/
 
 `createApp()` 在 `runtimeDbPath` 存在时会打开并迁移 runtime SQLite 数据库，然后创建 `RuntimeSqliteStore` 并通过 Elysia decorator 暴露为 `runtimeStore`。`createApp()` 自己打开的数据库句柄会绑定到 Elysia `onStop` 生命周期中关闭；外部通过依赖注入传入的 `runtimeDatabase` 仍由调用方负责关闭。启动时若 Store 中存在 stale active Run，Runtime 会将其修复为 `interrupted`，reason 为 `runtime_recovered_stale_run`。
 
-当前 `POST /v1/runs` 会写入 Conversation、Run、Message、Part 和不可变 Run Tool Snapshot；`agent_mode: "ask"`、`"query"` 与 `"agent"` 通过稀疏 Namespace policy 独立解析工具可见性与 execution ceiling。Ask 不暴露数据库工具，Query 允许数据库只读工具与必要的可逆连接状态操作，Agent 允许完整数据库工具进入受控候选范围。`web.fetch` 与 `web.ping` 已接入 AI SDK 7 ToolLoopAgent 与 Runtime Tool Core；Snapshot 同时冻结 Runtime-owned network policy，Core 独占 ToolCall 持久化，AI SDK callback 只投影 ToolPart/SourcePart。Run stop/interrupt 已通过 `POST /v1/runs/:runId/interrupt` 和 `POST /v1/conversations/:conversationId/interrupt-active-run` 落地；前者是事实层 command，后者是会话列表等 UI 的便捷入口，内部最终仍收敛到明确 `runId`。
+当前 `POST /v1/runs` 会写入 Conversation、Run、Message、Part 和不可变 Run Tool Snapshot；`agent_mode: "ask"`、`"query"` 与 `"agent"` 通过稀疏 Namespace policy 独立解析工具可见性与 execution ceiling。Ask 不暴露数据库工具，Query 允许数据库只读工具与必要的可逆连接状态操作，Agent 允许完整数据库工具进入受控候选范围。`web.fetch` 与 `web.ping` 已接入 AI SDK 7 ToolLoopAgent 与 Runtime Tool Core；Snapshot 同时冻结 Runtime-owned network policy，Core 独占 ToolCall 持久化，AI SDK callback 只投影 ToolPart/SourcePart。Run stop/interrupt 已通过 `POST /v1/runs/:runId/interrupt` 和 `POST /v1/conversations/:conversationId/interrupt-active-run` 落地；前者是事实层 command，后者是会话列表等 UI 的便捷入口，内部最终仍收敛到明确 `runId`。Context Window Manager 在模型调用前创建 request-scoped `ContextPlan`/`ContextUsage`，并在需要时通过唯一 `ContextCompactionService` 追加 checkpoint；这些派生记录不替代 Run、Message 或工具审计事实。
 
 ## 核心契约
 
@@ -78,7 +85,7 @@ ai-runtime/src/storage/
 - `Event`
 - `TraceEvent`
 
-不引入 OpenCode 的 `projectId` 等与 NexusPilot 当前定位不匹配的字段。当前 `Run` 以 `conversationId` 为边界，保存 `agentMode`、provider/model、input/output、usage/cost、finish/error、limits 和 runtime metadata。
+不引入 OpenCode 的 `projectId` 等与 NexusPilot 当前定位不匹配的字段。当前 `Run` 以 `conversationId` 为边界，保存 `parentRunId`、可选 `supersedesRunId`、`agentMode`、provider/model、input/output、usage/cost、finish/error、limits 和 runtime metadata。Conversation 另保存 `activeHeadRunId` 与单调 `revision`：二者共同定义默认 active lineage 和 checkpoint 的并发控制边界。
 
 当前 `Run` 使用 `agentMode` 记录本次执行的内置 agent 运行模式。第一版允许值为 `ask`、`query` 和 `agent`。历史实现中的 `profileId/profile_id` 与公开请求字段 `mode` 已迁移为 `agentMode/agent_mode`，不再作为目标代码字段或 OpenAPI 字段。
 
@@ -135,7 +142,7 @@ AI SDK UIMessage Snapshot 把该状态投影到 `metadata.custom.nexus.status.er
 3. 启用 `PRAGMA foreign_keys = ON`。
 4. 通过版本化 migration manager 执行未应用的 runtime migrations。
 
-当前表：
+当前表（包含 append-only history 与 context-compaction 派生事实）：
 
 - `runtime_conversations`
 - `runtime_runs`
@@ -145,6 +152,11 @@ AI SDK UIMessage Snapshot 把该状态投影到 `metadata.custom.nexus.status.er
 - `runtime_permissions`
 - `runtime_events`
 - `runtime_traces`
+- `runtime_context_checkpoints`
+- `runtime_context_plans`
+- `runtime_context_usage`
+- `runtime_context_preparation_claims`
+- `runtime_context_diagnostics`
 
 ### Runtime Migration Manager
 
@@ -164,8 +176,16 @@ Runtime SQLite schema 由 `runtime_schema_migrations` 表记录版本化迁移�
 - `0001_init_runtime_schema`：创建 Runtime 领域模型需要的 conversations、runs、messages、parts、tool calls、permissions、events 和 traces 表及索引。
 - `0002_runtime_agent_mode_policy`：将运行模式字段迁移为 `agent_mode`，并为 Run 输入增加 prompt/tool policy snapshot。
 - `0003_runtime_interrupted_status`：将历史 `cancelled` 占位状态迁移为 `interrupted`，同步修复 Run、Message、ToolPart 和 ToolCall 状态。
+- `0004_runtime_run_tool_snapshot`：用不可变的 per-Run snapshot 替换旧 Tool policy snapshot。
+- `0005_runtime_tool_permission_state`：用 Runtime-owned Tool Permission 状态、风险事实与 tool-call 绑定替换旧 permission 结构。
+- `0006_runtime_tool_permission_confirmation`：为 Permission 持久化确认要求和面向用户的展示信息。
+- `0007_runtime_chat_attachments`：增加 Runtime-owned attachment/blob、上传和 message-reference 表。
+- `0008_runtime_run_dag`：回填线性 Run 的 parent/head/revision，并为从此版本起的 edit 建立 append-only DAG。
+- `0009_runtime_context_compaction`：增加 checkpoint、plan、request-scoped ContextUsage 和可审计的 context 记录。
+- `0010_runtime_tool_call_authorization_snapshot`、`0011_runtime_context_preparation_claims` 与 `0012_runtime_context_preparation_fencing`：补足 Safety State 所需事实、checkpoint CAS claim 与 fencing。
+- `0013_runtime_context_diagnostics`：增加 append-only、脱敏且可去重的 checkpoint/CAS/启动完整性诊断。
 
-Phase 3 `web_fetch` 和 Phase 7.1 interrupt API 复用既有 `runtime_runs`、`runtime_messages`、`runtime_tool_calls` 与 `runtime_message_parts` 表；除 `cancelled -> interrupted` 数据迁移外，未新增表结构。后续若引入 artifact/blob store、tool output 大对象表或 Snapshot API 专用索引，必须追加新的 `RUNTIME_MIGRATIONS` 版本。
+已发布 migration 不会重写旧 SQL。升级会把可证明的既有线性 history 回填为初始 DAG，但不会也不能恢复升级前旧版本已经物理删除的 edited tail；append-only 保证从 `0008_runtime_run_dag` 起生效。后续 schema 演进仍必须追加新的 `RUNTIME_MIGRATIONS` 版本。
 
 ### Runtime Schema Evolution Rules
 
@@ -180,18 +200,33 @@ Phase 3 `web_fetch` 和 Phase 7.1 interrupt API 复用既有 `runtime_runs`、`r
 
 store 使用 JSON-backed 记录保存完整领域对象，同时保留 relational id、role/type/status、time 等索引字段，便于后续查询和 UI 投影。`RuntimeSqliteStore.close()` 是幂等的，用于释放 SQLite 句柄；应用自己打开的 runtime store 应通过应用生命周期统一清理。
 
-### 改写用户消息并继续
+### Audit Transcript、Active Lineage 与改写用户消息
 
 `POST /v1/runs` 可携带已有会话的 `replace_from_message_id`，表达“改写此条用户消息并从此继续”。该字段只能指向会话中的用户消息，且会话不能有 active Run；助手消息重新生成不属于当前公开能力。
 
-Store 会在一个 SQLite 事务中完成以下操作：
+Store 将所有已提交 Message、Run、ToolCall、Permission、Event、Trace 和 attachment reference 保存为 Audit Transcript。`listActiveLineageMessages(conversationId)` 只返回 `activeHeadRunId` 的祖先链，`listTranscriptMessages(conversationId)` 用于显式审计，`listLineageMessages(conversationId, headRunId)` 与 `listRunAlternatives(runId)` 支持指定 DAG 读取。默认 UI/history 和后续模型上下文使用 active lineage，绝不将 transcript 的时间排序当作当前对话。
 
-1. 移除目标用户消息及其后的 `runtime_messages` 和 message parts。
-2. 移除由这些消息关联的 `runtime_runs`、tool calls、permissions，以及对应的 Run Event/Trace 记录。
-3. 写入改写后的用户消息、正在运行的助手消息、新 Run、语义事件和 trace。
-4. 事务成功后才向 live EventBus 发布 `message.removed`、必要的 `conversation.updated` 和 `run.updated`。
+Store 在一个 SQLite 事务中完成 edit：验证目标是 active lineage 中的 User Message 且 Conversation 不 busy；创建 replacement User/Assistant Message、Run、附件引用、语义事件和 trace；以 `parentRunId = targetRun.parentRunId`、`supersedesRunId = targetRun.id` 写入新 Run；再切换 `activeHeadRunId` 并递增 `revision`。目标 Run、其后代和所有关联事实不会删除，也不会安排 attachment GC；新 edit 不发 `message.removed`。这不会撤销既有外部副作用，且旧 Permission 永远只绑定其原始 ToolCall/Run。
 
-因此 Snapshot API 不会观察到“消息已删但新 Run 尚未写入”的中间状态。该操作只改写 Runtime 的当前会话事实，不撤销已经发生的外部工具副作用；例如数据库写入或网络请求仍需由相应业务能力单独处理。该能力不新增表、列或 migration。
+历史 migration 前已经实际删除的旧尾部仍不可恢复。`message.removed` 保留为旧 Event 的读取兼容性，而非新 edit 的写入语义。
+
+### Context checkpoint、Safety State 与 usage
+
+`ContextCheckpoint` 是覆盖某个完整终态 Run 前缀的版本化、append-only provider-neutral cache，保存 `coverageThroughRunId`、`sourceHeadRunId`、`sourceConversationRevision`、稳定 `lineageHash`、可选 `parentCheckpointId`、format/compatibility、生成 Provider/model、budget、usage 与 trigger。它只能在 coverage 是当前 head 祖先、hash 和格式兼容时使用；较短分支或更大窗口会重新选择完整 raw active lineage，而不会把 checkpoint 当作历史替代品。`failed` Run 的正常终态可以保留已聚合的 Assistant/工具事实而没有 `Run.output`；只要 Assistant 已进入 error 终态、全部 ToolPart/ToolCall 已终态且没有 pending Permission，这类 Run 仍是完整可覆盖边界。边界校验不能把可选 `Run.output` 的缺失误判成永久不可压缩，但 `completed` Run 仍必须具有与 Assistant parts 一致的 output identity。
+
+`RuntimeSafetyState` 独立从结构化 ToolCall、Permission、risk/policy snapshot 和终态结果生成。它持续覆盖 active 与非 active branch 已发生、可能发生或不确定的副作用，并明确 Permission 不能跨 Run/branch 转移；仍处于 active lineage 的 Tool Core prepared plan 只投影经校验的 `prepareOperation`、`expiresAt` 与强制 revalidation 标记，不复制任意 metadata。ToolCall 与绑定 Permission 的 plan link 冲突、格式非法或安全投影超出预算时都 fail closed。自然语言 summary 不是授权、执行或副作用事实来源。
+
+`PreparedModelContext` 将 system-level `instructions` 与普通 `messages` 分开返回。assembled agent prompt、可选 provider-neutral checkpoint 和确定性 Runtime/Safety State 只进入 AI SDK 7 `instructions`；raw active-lineage user/assistant/tool history 与保留的 ToolLoop suffix 只进入 `messages`，且初始调用与每次 `prepareStep` 都执行无 system role 的 fail-fast 校验。checkpoint summarizer 采用相同契约：summary 主指令、rolling checkpoint memory 和 Safety State 属于 `instructions`，待摘要 raw source 属于 `messages`。每次 rolling summary 调用都在 source 之后追加一条 Runtime-owned user generation request，明确要求立即输出 checkpoint，避免以历史 Assistant 结尾的 OpenAI-compatible prompt 被当作已完成对话而返回 `stop` 加零输出；该 request 计入输入预算和 checkpoint usage，但不属于 raw transcript，也不写回 Message Store。
+
+`Run.usage` 是整个 Run（包括多个 step 和 continuation）的累计计费 usage。`ContextUsage` 则以 `runId + requestIndex` 记录单次模型请求的 active window、estimate、output reservation、raw/checkpoint/Safety State breakdown、checkpoint identity 和可选 Provider observation。Assistant 完成并持久化后，Runtime 立即从包含该 Assistant 的 active lineage 计算 `nextTurnForecast`，以不可变更新写回最后一条 request usage；刷新后的 Snapshot 复用相同 forecast。主上下文百分比只取 forecast 的 `estimatedInputTokens / contextWindow`，不会切换到 Provider observation，也不会加入或随着 output reservation 递减；Provider actual input、cache usage 和 reserve 仅作为辅助字段展示。
+
+checkpoint summary 的每次 Provider 调用只聚合进该 checkpoint 自带、`purpose = checkpoint_summary` 的 usage，包含 invocation count 与逐类估算；成功生成后即使 Provider 未返回任何 usage 标量，也始终保留这份估算 usage。Provider 实际提供的 input/output/reasoning/cache/total 标量另存于可选 `providerObservation`，未提供的单个标量保持缺失而不会被记成精确的零；若所有调用都未提供任何标量，则省略整个 `providerObservation`。checkpoint usage 不累加父 checkpoint usage，也不写入 `Run.usage` 或 request-scoped `runtime_context_usage`。active Assistant 的 Snapshot metadata 只暴露经过筛选的 lifecycle marker 与 ContextUsage；任意 Message metadata、summary、reasoning 和 Safety State 不会整体暴露给 UI。
+
+达到 soft threshold 后，自动压缩是主模型调用前必须完成的 gate。Runtime 先写入安全的 `context.compaction.preparing` trace；checkpoint 成功后由 checkpoint/plan 投影为 `created`，summary Provider 或校验失败写入 `context.compaction.failed`。明确 overflow 在发起替代请求前写入内部 `context.overflow.retrying` 审计，只有替代模型请求真正完成后才写 `context.overflow.recovered` 并投影为 `recovered`，第二次请求也失败时不会伪报恢复成功。失败 trace 只允许 trigger、request index、head/revision、token 计数、error name 和 finish reason 等标量，不保存 prompt、summary、reasoning、Provider body 或 secret；主模型不会收到 raw fallback。严格的 reasoning-only length exhaustion（空 text、`finishReason=length`、reasoning tokens 大于零且 text tokens 明确为零）可以在目标模型 output limit 内扩大预算、缩小 input chunk 后重试一次，其他空白或无效输出不重试。
+
+checkpoint 与 `context.checkpoint.created`、plan 与 `context.plan.created` 分别在同一个 SQLite 事务中提交，Event 只携带 ID、选择、预算和被拒 checkpoint 的安全原因，不携带 summary、Safety State body 或任意 Provider/Message metadata。checkpoint CAS 冲突与提交校验拒绝进入 `runtime_context_diagnostics`，不会伪装成成功事件。
+
+Store 在 migration 完成后的启动路径扫描 checkpoint payload/索引列、format/compatibility、parent、coverage/source Run 与 lineage hash，并标记遗留 preparation claim。未知新格式保留为可读但不可选的 warning；损坏 checkpoint 被 planner/listing 忽略，不阻塞其余 Runtime 启动。诊断使用确定性 identity 去重，只保存安全 ID、原因与 allowlisted details，绝不复制 summary 或 claim owner/secret。
 
 ## UI Projection 边界
 
@@ -215,7 +250,7 @@ Projection 不应把多个 `reasoning` part 合并为一个全局文本字段。
 POST /v1/conversations
 GET /v1/conversations
 GET /v1/conversations/:conversationId
-GET /v1/conversations/:conversationId/messages?format=runtime|ui|ai_sdk
+GET /v1/conversations/:conversationId/messages?format=runtime|ui|ai_sdk&view=active|transcript
 GET /v1/conversations/:conversationId/runs
 GET /v1/runs/:runId
 GET /v1/runs/:runId/events
@@ -230,22 +265,21 @@ POST /v1/conversations/:conversationId/interrupt-active-run
 
 `GET /v1/conversations` 面向历史恢复，只返回已有消息记录的 Runtime conversations。没有消息的显式空 conversation 仍可通过 detail endpoint 读取，但不会进入默认历史列表。
 
-其余 Snapshot Read API 只读取 Runtime Store，不执行模型、不调用工具、不修改 Workbench 状态。`format=runtime` 返回 NexusPilot Runtime-native `Message[]`；`format=ui` 返回 NexusPilot 通用 UI-friendly projected message shape；`format=ai_sdk` 返回 AI SDK 7 `UIMessage` shape，用于 assistant-ui `useChatRuntime` 的历史恢复。Runtime-native Message、Part、Run、ToolCall、Event 和 Trace 仍然是事实模型，UI shape 只是读侧投影。`format=ai_sdk` 的 NexusPilot 扩展 metadata 以 `metadata.nexus` 暴露给原始 API 调试，同时以 `metadata.custom.nexus` 暴露给 assistant-ui message state。
+其余 Snapshot Read API 只读取 Runtime Store，不执行模型、不调用工具、不修改 Workbench 状态。消息 endpoint 默认 `view=active`，返回 active head/revision；只有显式 `view=transcript` 才返回完整审计消息及脱敏 Run DAG 关系。`format=runtime` 返回 NexusPilot Runtime-native `Message[]`；`format=ui` 返回 NexusPilot 通用 UI-friendly projected message shape；`format=ai_sdk` 返回 AI SDK 7 `UIMessage` shape，用于 assistant-ui `useChatRuntime` 的历史恢复。active `ai_sdk` 投影只在所属 active Assistant 上恢复 sanitized `preparing/created/failed/recovered` compaction marker、request observation 与 next-turn forecast，并以 `metadata.nexus`/`metadata.custom.nexus` 暴露；summary、reasoning、Safety State、failure diagnostics 和任意 stored Message metadata 不会因此进入普通 UI。
 
 interrupt command API 会修改 Runtime Store 中的 Run、Assistant Message、ToolCall 和 Conversation 事实，并发布 live-only EventBus invalidation。它们不是 Snapshot Read API，但恢复 UI 仍通过后续读取 Snapshot API 完成。
 
 `format=ui` 不等同于 `format=ai_sdk`。前者可以服务 NexusPilot 自有 UI 展示，后者必须跟随 AI SDK 7 `UIMessage.parts` 契约，例如 `source-url`、`file` 和 `tool-*` part。
 
-## 明确未实现
+## 当前不公开的扩展缝
 
-当前领域模型与持久化批次不包含：
+当前实现保留 `ContextCompactionService(trigger: "manual")` 作为与自动流程相同的内部/service-test seam，复用 ancestry、Safety State、planner、CAS/fencing 和 event 契约；没有用户可见的立即压缩按钮，也没有面向用户的 manual HTTP endpoint。当前默认界面也不提供分支浏览、比较、恢复或切换 UI，尽管 transcript/DAG 事实可被显式审计读取。
 
-- 自动上下文压缩、token 预算、摘要 checkpoint 或工具安全账本；当前跨 Run 模型视图使用完整语义历史，不静默按 Part 类型裁剪。
+前端通过 Runtime HTTP/AI SDK-compatible stream 与 Snapshot API 使用这一领域层，而非直接调用模型。需要数据库或工作台能力的 ToolCall 通过受认证的 Rust/Tauri Backend WebSocket Bridge 执行，复用 Rust connection runtime；AI Runtime 不建立第二套数据库 pool。已实现的受控能力包括 `connection.open`、读取类工具和经 Permission/prepared plan 保护的 `sql.execute`，它们仍不能绕过 Rust 领域边界。
 
-- Rust / Tauri IPC 集成。
-- 数据库 workbench 业务工具，如 `connect_profile`、`browse_table_data`。
-- diff 应用、SQL editor 写入或业务对象修改。
+尚未实现：
+
 - resumable stream、durable SSE replay 或后台 Run 恢复继续执行。
-- conversation rename/archive/delete 等 mutation command。
+- 面向用户的 branch 浏览、比较、恢复或切换 UI，以及公开 manual compaction endpoint。
 
-这些能力必须在后续设计中通过 Runtime runner、tool registry、permission/audit、Snapshot Read API 和前端确认协议逐层接入，不能直接堆进 route、store 或 projection helper。
+后续能力必须继续通过 Runtime runner、tool registry、permission/audit、Snapshot Read API 和前端确认协议逐层接入，不能直接堆进 route、store 或 projection helper。

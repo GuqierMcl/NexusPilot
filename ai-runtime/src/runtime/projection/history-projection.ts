@@ -267,44 +267,91 @@ export function buildActiveHistoryContextMetadata(
     if (message.role !== "assistant" || !message.runId) continue;
     const usages = store.listContextUsagesByRun(message.runId);
     const usage = usages.at(-1);
-    if (!usage) continue;
+    const traces = store.listTraces(message.runId);
     const plans = store.listContextPlansByRun(message.runId);
-    const markerAssociation = findLatestMarkerAssociation({
+    const markerAssociation = usage ? findLatestMarkerAssociation({
       conversationId: message.conversationId,
       runId: message.runId,
       plans,
       usages,
       checkpoints,
-    });
+    }) : null;
+    const lifecycleMarker = projectLatestCompactionLifecycleTrace(
+      message.conversationId,
+      message.runId,
+      traces,
+      message.status.type === "complete"
+        || message.status.type === "incomplete"
+        || message.status.type === "error",
+    );
+    const compaction = markerAssociation
+      ? projectCompactionMarker(
+          markerAssociation.usage,
+          markerAssociation.plan,
+          markerAssociation.checkpoint,
+          traces,
+        )
+      : lifecycleMarker;
+    if (!usage && !compaction) continue;
     derived.set(message.runId, {
-      contextUsage: projectContextUsage(usage),
+      ...(usage ? { contextUsage: projectContextUsage(usage) } : {}),
       ...(markerAssociation
-        ? {
-            compaction: projectCompactionMarker(
-              markerAssociation.usage,
-              markerAssociation.plan,
-              markerAssociation.checkpoint,
-              store.listTraces(message.runId),
-            ),
-          }
-        : {}),
+        ? { compaction }
+        : compaction ? { compaction } : {}),
     });
   }
   return derived;
 }
 
+function projectLatestCompactionLifecycleTrace(
+  conversationId: string,
+  runId: RunId,
+  traces: readonly TraceEvent[],
+  assistantIsTerminal: boolean,
+): AiSdkCompactionMarkerView | undefined {
+  const trace = traces.findLast((candidate) =>
+    (candidate.type === "context.compaction.preparing"
+      || candidate.type === "context.compaction.failed")
+    && candidate.conversationId === conversationId
+    && candidate.runId === runId
+    && isCompactionTrigger(candidate.payload.trigger)
+    && isNonNegativeNumber(candidate.payload.beforeEstimatedInputTokens)
+  );
+  if (!trace) return undefined;
+  const status = trace.type === "context.compaction.failed" || assistantIsTerminal
+    ? "failed"
+    : "preparing";
+  return {
+    trigger: trace.payload.trigger as AiSdkCompactionMarkerView["trigger"],
+    createdAt: trace.time,
+    beforeTokens: trace.payload.beforeEstimatedInputTokens as number,
+    status,
+  };
+}
+
+function isCompactionTrigger(value: unknown): boolean {
+  return value === "auto_pre_turn"
+    || value === "auto_mid_turn"
+    || value === "manual"
+    || value === "provider_overflow"
+    || value === "model_switch";
+}
+
 function projectContextUsage(usage: ContextUsage): AiSdkDerivedMessageMetadata["contextUsage"] {
   const providerInputTokens = usage.providerObservation?.inputTokens;
-  const activeInputTokens = providerInputTokens ?? usage.estimatedInputTokens;
+  const forecast = usage.nextTurnForecast;
+  const contextWindow = forecast?.contextWindow ?? usage.contextWindow;
+  const checkpointId = forecast?.checkpointId ?? usage.checkpointId;
   return {
-    ...(usage.contextWindow === undefined ? {} : { contextWindow: usage.contextWindow }),
-    estimatedInputTokens: usage.estimatedInputTokens,
+    ...(contextWindow === undefined ? {} : { contextWindow }),
+    estimatedInputTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
     ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
     reservedOutputTokens: usage.reservedOutputTokens,
-    activeTokens: activeInputTokens + usage.reservedOutputTokens,
-    source: providerInputTokens === undefined ? "estimate" : "provider",
-    view: usage.view,
-    ...(usage.checkpointId ? { checkpointId: usage.checkpointId } : {}),
+    activeTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
+    source: "estimate",
+    view: forecast?.view ?? usage.view,
+    ...(checkpointId ? { checkpointId } : {}),
+    ...(forecast ? { forecastReason: forecast.reason } : {}),
   };
 }
 

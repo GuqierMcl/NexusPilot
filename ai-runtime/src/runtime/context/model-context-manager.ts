@@ -1,9 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { LanguageModel, ModelMessage } from "ai";
+import type { LanguageModel, ModelMessage, SystemModelMessage } from "ai";
 
 import type { RuntimeAttachmentService } from "../attachments";
 import { createRuntimeId, type RuntimeId, type RuntimeIdPrefix } from "../core/ids";
-import type { ConversationId, Message, MessageId, Run, RunId } from "../core/types";
+import type {
+  ConversationId,
+  Message,
+  MessageId,
+  Run,
+  RunId,
+  TraceEvent,
+} from "../core/types";
 import {
   projectContextBoundaries,
   projectModelHistory,
@@ -11,10 +18,14 @@ import {
 import type { RuntimeRunnerStore } from "../runners/runner-types";
 import {
   ContextCompactionService,
+  ContextSummaryValidationError,
   readContextPlannerSnapshot,
 } from "./compaction-service";
 import { computeContextPlanRequestHash, planContextWindow } from "./planner";
-import { ContextPreparationLeaseLostError } from "./types";
+import {
+  CONTEXT_PREPARATION_CLAIM_TTL_MS,
+  ContextPreparationLeaseLostError,
+} from "./types";
 import type {
   ContextCheckpoint,
   ContextCompactionPolicy,
@@ -23,6 +34,8 @@ import type {
   ContextPlannerInput,
   ContextPreparationClaim,
   ContextPlannerSnapshot,
+  ContextForecastReason,
+  NextTurnContextForecast,
 } from "./types";
 import {
   CONTEXT_ESTIMATOR_OVERHEAD,
@@ -38,6 +51,7 @@ export interface ModelContextPreparationInput {
   modelId: string;
   model: LanguageModel;
   contextWindow?: number;
+  modelOutputLimit?: number;
   reservedOutputTokens: number;
   systemPrompt: string;
   toolSchemas: unknown;
@@ -57,20 +71,37 @@ interface ResolvedModelContextPreparationInput extends ModelContextPreparationIn
 }
 
 export interface ContextCompactionMarker {
-  checkpointId: ContextCheckpoint["id"];
+  checkpointId?: ContextCheckpoint["id"];
   trigger: ContextCompactionTrigger;
   auto: boolean;
-  coverageThroughRunId: RunId;
+  coverageThroughRunId?: RunId;
   beforeEstimatedInputTokens: number;
-  afterEstimatedInputTokens: number;
-  status: "created";
+  afterEstimatedInputTokens?: number;
+  status: "preparing" | "created" | "failed" | "recovered";
   time: { created: number };
 }
 
 export interface PreparedModelContext {
   plan: ContextPlan;
+  instructions: SystemModelMessage[];
   messages: ModelMessage[];
   marker?: ContextCompactionMarker;
+}
+
+export interface ModelContextForecastInput {
+  conversationId: ConversationId;
+  runId: RunId;
+  requestIndex: number;
+  providerId: string;
+  modelId: string;
+  contextWindow?: number;
+  modelOutputLimit?: number;
+  reservedOutputTokens: number;
+  systemPrompt: string;
+  toolSchemas: unknown;
+  policy: ContextCompactionPolicy;
+  safetyStateMaxTokens?: number;
+  reason: ContextForecastReason;
 }
 
 export interface ModelContextManagerDependencies {
@@ -95,7 +126,6 @@ export class ContextPreparationInProgressError extends Error {
   }
 }
 
-const CONTEXT_PREPARATION_CLAIM_TTL_MS = 5 * 60 * 1_000;
 const preparationBrokers = new WeakMap<
   object,
   Map<string, { requestHash: string; operation: Promise<PreparedModelContext> }>
@@ -114,6 +144,51 @@ export class ModelContextManager {
     this.attachmentService = dependencies.attachmentService ?? null;
     this.now = dependencies.now ?? Date.now;
     this.createId = dependencies.createId ?? createRuntimeId;
+  }
+
+  forecastNextTurn(input: ModelContextForecastInput): NextTurnContextForecast {
+    const snapshot = readContextPlannerSnapshot(this.store, input.conversationId);
+    const plan = planContextWindow({
+      snapshot,
+      runId: input.runId,
+      requestIndex: input.requestIndex,
+      providerId: input.providerId,
+      modelId: input.modelId,
+      contextWindow: input.contextWindow,
+      modelOutputLimit: input.modelOutputLimit,
+      reservedOutputTokens: input.reservedOutputTokens,
+      systemPrompt: input.systemPrompt,
+      toolSchemas: input.toolSchemas,
+      trigger: "auto_pre_turn",
+      policy: input.policy,
+      planId: this.createId("ctxplan"),
+      createdAt: this.now(),
+      safetyStateMaxTokens: input.safetyStateMaxTokens,
+    });
+    return {
+      conversationId: input.conversationId,
+      sourceHeadRunId: plan.sourceHeadRunId,
+      sourceConversationRevision: plan.sourceConversationRevision,
+      providerId: input.providerId,
+      modelId: input.modelId,
+      ...(plan.budget.contextWindow === undefined
+        ? {}
+        : { contextWindow: plan.budget.contextWindow }),
+      estimatedInputTokens: plan.budget.estimatedInputTokens,
+      view: plan.view,
+      ...(plan.checkpointId ? { checkpointId: plan.checkpointId } : {}),
+      breakdown: {
+        rawTokens: plan.budget.rawHistoryTokens,
+        checkpointTokens: plan.budget.checkpointTokens,
+        safetyStateTokens: plan.budget.safetyStateTokens,
+        systemPromptTokens: plan.budget.systemPromptTokens,
+        toolSchemaTokens: plan.budget.toolSchemaTokens,
+      },
+      estimatorVersion: input.policy.estimatorVersion,
+      policyVersion: input.policy.version,
+      checkpointFormatVersion: input.policy.checkpointFormatVersion,
+      reason: input.reason,
+    };
   }
 
   prepare(input: ModelContextPreparationInput): Promise<PreparedModelContext> {
@@ -155,8 +230,8 @@ export class ModelContextManager {
       this.assertPlanMatchesRequest(durablePlan, input, requestHash);
       const snapshot = readContextPlannerSnapshot(this.store, input.conversationId);
       this.assertPlanSourceIsCurrent(durablePlan, snapshot, input.runId);
-      const messages = await this.assembleMessages(snapshot, durablePlan, input);
-      return { plan: durablePlan, messages };
+      const context = await this.assembleContext(snapshot, durablePlan, input);
+      return { plan: durablePlan, ...context };
     }
 
     const ownerId = `context-preparation:${randomUUID()}`;
@@ -190,15 +265,34 @@ export class ModelContextManager {
       this.assertPlanMatchesRequest(durablePlan, input, requestHash);
       const snapshot = readContextPlannerSnapshot(this.store, input.conversationId);
       this.assertPlanSourceIsCurrent(durablePlan, snapshot, input.runId);
-      const messages = await this.assembleMessages(snapshot, durablePlan, input);
-      return { plan: durablePlan, messages };
+      const context = await this.assembleContext(snapshot, durablePlan, input);
+      return { plan: durablePlan, ...context };
     }
 
     let { snapshot, plan } = this.planFromStore(input, input.runId);
     let createdCheckpoint: ContextCheckpoint | undefined;
 
     if (plan.reason === "compaction_required" && input.trigger !== "auto_mid_turn") {
-      let result: Awaited<ReturnType<ContextCompactionService["compact"]>> | undefined;
+      const lifecyclePayload = {
+        trigger: input.trigger,
+        requestIndex: input.requestIndex,
+        sourceHeadRunId: plan.sourceHeadRunId,
+        sourceConversationRevision: plan.sourceConversationRevision,
+        beforeEstimatedInputTokens: plan.budget.estimatedInputTokens,
+        ...(plan.budget.summaryMaxOutputTokens === undefined
+          ? {}
+          : { summaryMaxOutputTokens: plan.budget.summaryMaxOutputTokens }),
+        ...(plan.budget.summaryRetryMaxOutputTokens === undefined
+          ? {}
+          : { summaryRetryMaxOutputTokens: plan.budget.summaryRetryMaxOutputTokens }),
+      };
+      this.appendCompactionLifecycleTraceOnce({
+        type: "context.compaction.preparing",
+        level: "info",
+        input,
+        payload: lifecyclePayload,
+      });
+      let result: Awaited<ReturnType<ContextCompactionService["compact"]>>;
       try {
         result = await this.compactionService.compact({
           conversationId: input.conversationId,
@@ -211,6 +305,7 @@ export class ModelContextManager {
           modelId: input.modelId,
           model: input.model,
           contextWindow: input.contextWindow,
+          modelOutputLimit: input.modelOutputLimit,
           reservedOutputTokens: input.reservedOutputTokens,
           systemPrompt: input.systemPrompt,
           toolSchemas: input.toolSchemas,
@@ -225,20 +320,33 @@ export class ModelContextManager {
         });
       } catch (error) {
         if (
-          input.trigger !== "auto_pre_turn"
-          || isContextCancellation(error, input.abortSignal)
-          || error instanceof ContextPreparationLeaseLostError
-          || !isRawWithinHardBudget(plan)
+          !isContextCancellation(error, input.abortSignal)
+          && !(error instanceof ContextPreparationLeaseLostError)
         ) {
-          throw error;
+          const diagnostics = error instanceof ContextSummaryValidationError
+            ? error.diagnostics
+            : {};
+          try {
+            this.appendCompactionLifecycleTraceOnce({
+              type: "context.compaction.failed",
+              level: "error",
+              input,
+              payload: {
+                ...lifecyclePayload,
+                errorName: readErrorName(error),
+                ...diagnostics,
+              },
+            });
+          } catch (traceError) {
+            console.error("Failed to persist Context compaction failure lifecycle", traceError);
+          }
         }
-        // The original plan already represents the complete raw lineage. Reuse it
-        // only for this explicit under-hard fallback; no checkpoint was committed.
+        throw error;
       }
-      if (result?.status === "created") {
+      if (result.status === "created") {
         createdCheckpoint = result.checkpoint;
       }
-      if (result?.status === "created" || result?.status === "stale") {
+      if (result.status === "created" || result.status === "stale") {
         const conversation = this.store.getConversation(input.conversationId);
         if (conversation?.activeHeadRunId !== input.runId) {
           throw new ContextPreparationStaleError(input.runId);
@@ -250,9 +358,24 @@ export class ModelContextManager {
     if (
       plan.reason === "compaction_required"
       && input.trigger !== "auto_mid_turn"
-      && !isRawWithinHardBudget(plan)
     ) {
-      throw new Error("Context compaction did not produce a model view within the hard budget");
+      const error = new Error(
+        "Context compaction did not produce a model view within the hard budget",
+      );
+      this.appendCompactionLifecycleTraceOnce({
+        type: "context.compaction.failed",
+        level: "error",
+        input,
+        payload: {
+          trigger: input.trigger,
+          requestIndex: input.requestIndex,
+          sourceHeadRunId: plan.sourceHeadRunId,
+          sourceConversationRevision: plan.sourceConversationRevision,
+          beforeEstimatedInputTokens: plan.budget.estimatedInputTokens,
+          errorName: error.name,
+        },
+      });
+      throw error;
     }
     const proposedPlanId = plan.id;
     plan = this.saveOrReadDurablePlan(
@@ -265,11 +388,36 @@ export class ModelContextManager {
     if (plan.id !== proposedPlanId) {
       snapshot = readContextPlannerSnapshot(this.store, input.conversationId);
     }
-    const messages = await this.assembleMessages(snapshot, plan, input);
+    const context = await this.assembleContext(snapshot, plan, input);
     const marker = createdCheckpoint
       ? createMarker(createdCheckpoint, plan)
       : undefined;
-    return { plan, messages, ...(marker ? { marker } : {}) };
+    return { plan, ...context, ...(marker ? { marker } : {}) };
+  }
+
+  private appendCompactionLifecycleTraceOnce(input: {
+    type: "context.compaction.preparing" | "context.compaction.failed";
+    level: TraceEvent["level"];
+    input: ResolvedModelContextPreparationInput;
+    payload: Record<string, unknown>;
+  }): void {
+    const alreadyRecorded = this.store.listTraces(input.input.runId).some((trace) =>
+      trace.type === input.type
+      && trace.payload.requestIndex === input.input.requestIndex
+      && trace.payload.sourceHeadRunId === input.payload.sourceHeadRunId
+      && trace.payload.sourceConversationRevision
+        === input.payload.sourceConversationRevision
+    );
+    if (alreadyRecorded) return;
+    this.store.appendTrace({
+      id: this.createId("trace"),
+      conversationId: input.input.conversationId,
+      runId: input.input.runId,
+      type: input.type,
+      level: input.level,
+      time: this.now(),
+      payload: input.payload,
+    });
   }
 
   private saveOrReadDurablePlan(
@@ -279,8 +427,13 @@ export class ModelContextManager {
     requestHash: string,
     preparationClaim: ContextPreparationClaim,
   ): ContextPlan {
+    this.renewPreparationClaim(preparationClaim);
     try {
-      this.store.saveContextPlan({ plan, preparationClaim });
+      this.store.saveContextPlan({
+        plan,
+        eventId: this.createId("evt"),
+        preparationClaim,
+      });
       return plan;
     } catch (error) {
       if (!isContextPlanRequestUniqueConstraint(error)) throw error;
@@ -289,6 +442,20 @@ export class ModelContextManager {
       this.assertPlanMatchesRequest(durablePlan, input, requestHash);
       this.assertPlanSourceIsCurrent(durablePlan, snapshot, input.runId);
       return durablePlan;
+    }
+  }
+
+  private renewPreparationClaim(preparationClaim: ContextPreparationClaim): void {
+    if (
+      !this.store.renewContextPreparationClaim(
+        preparationClaim,
+        CONTEXT_PREPARATION_CLAIM_TTL_MS,
+      )
+    ) {
+      throw new ContextPreparationLeaseLostError(
+        preparationClaim.runId,
+        preparationClaim.requestIndex,
+      );
     }
   }
 
@@ -335,6 +502,7 @@ export class ModelContextManager {
         providerId: input.providerId,
         modelId: input.modelId,
         contextWindow: input.contextWindow,
+        modelOutputLimit: input.modelOutputLimit,
         reservedOutputTokens: input.reservedOutputTokens,
         systemPrompt: input.systemPrompt,
         toolSchemas: input.toolSchemas,
@@ -349,11 +517,11 @@ export class ModelContextManager {
     };
   }
 
-  private async assembleMessages(
+  private async assembleContext(
     snapshot: ContextPlannerSnapshot,
     plan: ContextPlan,
     input: ResolvedModelContextPreparationInput,
-  ): Promise<ModelMessage[]> {
+  ): Promise<Pick<PreparedModelContext, "instructions" | "messages">> {
     const checkpoint = plan.checkpointId
       ? snapshot.checkpoints.find((candidate) => candidate.id === plan.checkpointId)
       : undefined;
@@ -369,11 +537,32 @@ export class ModelContextManager {
       target: { providerId: input.providerId, modelId: input.modelId },
       attachmentService: this.attachmentService,
     });
-    return [
-      ...projectContextBoundaries({ checkpoint, safetyState: plan.safetyState }),
-      ...projectedRaw,
+    const rawInstructions = projectedRaw.filter(
+      (message): message is SystemModelMessage => message.role === "system",
+    );
+    const messages = [
+      ...projectedRaw.filter((message) => message.role !== "system"),
       ...(input.retainedMessages ?? []),
     ];
+    assertNoSystemModelMessages(messages);
+    return {
+      instructions: [
+        ...rawInstructions,
+        ...projectContextBoundaries({
+          checkpoint,
+          safetyState: plan.safetyState,
+        }),
+      ],
+      messages,
+    };
+  }
+}
+
+function assertNoSystemModelMessages(messages: readonly ModelMessage[]): void {
+  if (messages.some((message) => message.role === "system")) {
+    throw new Error(
+      "Prepared Runtime model messages must not contain system instructions",
+    );
   }
 }
 
@@ -414,6 +603,16 @@ function isContextCancellation(error: unknown, signal: AbortSignal | undefined):
     && error !== null
     && "name" in error
     && error.name === "AbortError";
+}
+
+function readErrorName(error: unknown): string {
+  return typeof error === "object"
+    && error !== null
+    && "name" in error
+    && typeof error.name === "string"
+    && error.name.length > 0
+    ? error.name
+    : "Error";
 }
 
 function contextPlanIdentityError(): Error {

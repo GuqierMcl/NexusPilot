@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ZodError } from "zod";
 import type { RuntimeDatabase } from "../../storage/runtime-database";
 import { runtimeEventToEnvelope } from "../events/event-envelope";
@@ -44,11 +45,21 @@ import type {
   ContextPreparationClaimRelease,
   ContextPreparationClaimResult,
   ContextUsage,
+  RuntimeContextDiagnostic,
 } from "../context/types";
 import { ContextPreparationLeaseLostError } from "../context/types";
 import { computeContextCoverageSourceState } from "../context/boundary-validation";
-import { computeContextLineageHash } from "../context/planner";
+import {
+  computeContextLineageHash,
+  isContextCheckpointParentChainUsable,
+} from "../context/planner";
 import { buildRuntimeSafetyState } from "../context/safety-state";
+import {
+  CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION,
+  CONTEXT_CHECKPOINT_FORMAT_VERSION,
+  PROVIDER_NEUTRAL_CONTEXT_KIND,
+  RUNTIME_SAFETY_STATE_VERSION,
+} from "../context/policy";
 import { ATTACHMENT_LIMITS, RuntimeAttachmentError } from "../attachments";
 
 function encode(value: unknown): string {
@@ -178,6 +189,30 @@ interface ContextPayloadRow {
   payload_json: string;
 }
 
+interface ContextCheckpointRow extends ContextPayloadRow {
+  id: string;
+  conversation_id: string;
+  coverage_through_run_id: string;
+  source_head_run_id: string;
+  source_conversation_revision: number;
+  parent_checkpoint_id: string | null;
+  format_version: string;
+  compatibility_kind: string;
+  compatibility_version: number;
+  created_at: number;
+}
+
+interface RuntimeContextDiagnosticRow {
+  id: string;
+  code: RuntimeContextDiagnostic["code"];
+  conversation_id: string | null;
+  checkpoint_id: string | null;
+  run_id: string | null;
+  reason: string;
+  details_json: string;
+  created_at: number;
+}
+
 interface ContextPreparationClaimRow {
   run_id: string;
   request_index: number;
@@ -217,6 +252,13 @@ export class RuntimeConversationRevisionConflictError extends Error {
       `actual ${actualRevision ?? "missing"}`,
     );
     this.name = "RuntimeConversationRevisionConflictError";
+  }
+}
+
+class ContextCheckpointRejectedError extends Error {
+  constructor(readonly reason: string, message: string) {
+    super(message);
+    this.name = "ContextCheckpointRejectedError";
   }
 }
 
@@ -261,11 +303,14 @@ export interface RuntimePermissionContinuationCommit {
 
 export class RuntimeSqliteStore {
   private closed = false;
+  private readonly invalidCheckpointIds = new Set<string>();
 
   constructor(
     private readonly db: RuntimeDatabase,
     private readonly options: RuntimeSqliteStoreOptions = {},
-  ) {}
+  ) {
+    this.scanContextIntegrityAtStartup();
+  }
 
   close(): void {
     if (this.closed) {
@@ -721,13 +766,280 @@ export class RuntimeSqliteStore {
 
   listContextCheckpoints(conversationId: ConversationId): ContextCheckpoint[] {
     return this.db
-      .query<ContextPayloadRow, [string]>(
-        `SELECT payload_json FROM runtime_context_checkpoints
+      .query<ContextCheckpointRow, [string]>(
+        `SELECT * FROM runtime_context_checkpoints
          WHERE conversation_id = ?
          ORDER BY created_at ASC, id ASC`,
       )
       .all(conversationId)
-      .map((row) => contextCheckpointSchema.parse(JSON.parse(row.payload_json)) as ContextCheckpoint);
+      .flatMap((row) => {
+        if (this.invalidCheckpointIds.has(row.id)) return [];
+        try {
+          const parsed = contextCheckpointSchema.safeParse(JSON.parse(row.payload_json));
+          return parsed.success ? [parsed.data as ContextCheckpoint] : [];
+        } catch {
+          return [];
+        }
+      });
+  }
+
+  contextDiagnostics(): {
+    status: "ok" | "warning" | "unavailable";
+    warnings: Array<{
+      code: RuntimeContextDiagnostic["code"];
+      conversationId?: ConversationId;
+      checkpointId?: ContextCheckpoint["id"];
+      runId?: RunId;
+      reason: string;
+    }>;
+  } {
+    try {
+      const rows = this.db
+        .query<RuntimeContextDiagnosticRow, []>(
+          `SELECT * FROM runtime_context_diagnostics
+           WHERE code IN (
+             'CHECKPOINT_STARTUP_WARNING',
+             'CHECKPOINT_STARTUP_REJECTED',
+             'CONTEXT_PREPARATION_INTERRUPTED'
+           )
+           ORDER BY created_at ASC, id ASC`,
+        )
+        .all();
+      const warnings = rows.map((row) => ({
+        code: row.code,
+        ...(row.conversation_id
+          ? { conversationId: row.conversation_id as ConversationId }
+          : {}),
+        ...(row.checkpoint_id
+          ? { checkpointId: row.checkpoint_id as ContextCheckpoint["id"] }
+          : {}),
+        ...(row.run_id ? { runId: row.run_id as RunId } : {}),
+        reason: row.reason,
+      }));
+      return { status: warnings.length > 0 ? "warning" : "ok", warnings };
+    } catch {
+      return { status: "unavailable", warnings: [] };
+    }
+  }
+
+  private scanContextIntegrityAtStartup(): void {
+    try {
+      const checkpointRows = this.db
+        .query<ContextCheckpointRow, []>(
+          "SELECT * FROM runtime_context_checkpoints ORDER BY created_at ASC, id ASC",
+        )
+        .all();
+      const startupCheckpoints = new Map<string, {
+        checkpoint: ContextCheckpoint;
+        lineage: Run[];
+        row: ContextCheckpointRow;
+      }>();
+      for (const row of checkpointRows) {
+        const inspected = this.inspectStartupCheckpoint(row);
+        if (inspected) startupCheckpoints.set(row.id, { ...inspected, row });
+      }
+      const checkpointsById = new Map(
+        [...startupCheckpoints.values()].map(({ checkpoint }) => [checkpoint.id, checkpoint]),
+      );
+      for (const { checkpoint, lineage, row } of startupCheckpoints.values()) {
+        const supported = checkpoint.formatVersion === CONTEXT_CHECKPOINT_FORMAT_VERSION
+          && checkpoint.compatibility.kind === PROVIDER_NEUTRAL_CONTEXT_KIND
+          && checkpoint.compatibility.version === CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION
+          && checkpoint.safetyStateVersion === RUNTIME_SAFETY_STATE_VERSION;
+        if (
+          supported
+          && checkpoint.parentCheckpointId
+          && !isContextCheckpointParentChainUsable(checkpoint, checkpointsById, lineage)
+        ) {
+          this.rejectStartupCheckpoint(row, "dangling_parent");
+        }
+      }
+
+      const claims = this.db
+        .query<ContextPreparationClaimRow, []>(
+          `SELECT run_id, request_index, request_hash, owner_id, fencing_token, claimed_at, expires_at
+           FROM runtime_context_preparation_claims
+           ORDER BY claimed_at ASC, run_id ASC, request_index ASC`,
+        )
+        .all();
+      for (const claim of claims) {
+        let conversationId: ConversationId | undefined;
+        try {
+          conversationId = this.getRun(claim.run_id as RunId)?.conversationId;
+        } catch {
+          // A damaged Run must not prevent startup diagnostics for the leftover claim.
+        }
+        this.insertContextDiagnostic({
+          code: "CONTEXT_PREPARATION_INTERRUPTED",
+          ...(conversationId ? { conversationId } : {}),
+          runId: claim.run_id as RunId,
+          reason: "interrupted_generation",
+          details: {
+            requestIndex: claim.request_index,
+            claimedAt: claim.claimed_at,
+            expiresAt: claim.expires_at,
+          },
+        });
+      }
+    } catch {
+      // Context diagnostics are fail-safe: unrelated Runtime startup remains available.
+    }
+  }
+
+  private inspectStartupCheckpoint(
+    row: ContextCheckpointRow,
+  ): { checkpoint: ContextCheckpoint; lineage: Run[] } | null {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(row.payload_json);
+    } catch {
+      this.rejectStartupCheckpoint(row, "invalid_payload");
+      return null;
+    }
+    const parsed = contextCheckpointSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.rejectStartupCheckpoint(row, "invalid_payload");
+      return null;
+    }
+    const checkpoint = parsed.data as ContextCheckpoint;
+    if (
+      checkpoint.id !== row.id
+      || checkpoint.conversationId !== row.conversation_id
+      || checkpoint.coverageThroughRunId !== row.coverage_through_run_id
+      || checkpoint.sourceHeadRunId !== row.source_head_run_id
+      || checkpoint.sourceConversationRevision !== row.source_conversation_revision
+      || (checkpoint.parentCheckpointId ?? null) !== row.parent_checkpoint_id
+      || checkpoint.formatVersion !== row.format_version
+      || checkpoint.compatibility.kind !== row.compatibility_kind
+      || checkpoint.compatibility.version !== row.compatibility_version
+      || checkpoint.time.created !== row.created_at
+    ) {
+      this.rejectStartupCheckpoint(row, "column_mismatch");
+      return null;
+    }
+
+    if (checkpoint.formatVersion !== CONTEXT_CHECKPOINT_FORMAT_VERSION) {
+      this.insertContextDiagnostic({
+        code: "CHECKPOINT_STARTUP_WARNING",
+        conversationId: checkpoint.conversationId,
+        checkpointId: checkpoint.id,
+        runId: checkpoint.sourceHeadRunId,
+        reason: "unsupported_format",
+        details: { formatVersion: checkpoint.formatVersion },
+      });
+    } else if (
+      checkpoint.compatibility.kind !== PROVIDER_NEUTRAL_CONTEXT_KIND
+      || checkpoint.compatibility.version !== CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION
+      || checkpoint.safetyStateVersion !== RUNTIME_SAFETY_STATE_VERSION
+    ) {
+      this.insertContextDiagnostic({
+        code: "CHECKPOINT_STARTUP_WARNING",
+        conversationId: checkpoint.conversationId,
+        checkpointId: checkpoint.id,
+        runId: checkpoint.sourceHeadRunId,
+        reason: "unsupported_compatibility",
+        details: {
+          compatibilityKind: checkpoint.compatibility.kind,
+          compatibilityVersion: checkpoint.compatibility.version,
+          safetyStateVersion: checkpoint.safetyStateVersion,
+        },
+      });
+    }
+
+    let coverageRun: Run | null = null;
+    let sourceRun: Run | null = null;
+    try {
+      coverageRun = this.getRun(checkpoint.coverageThroughRunId);
+      sourceRun = this.getRun(checkpoint.sourceHeadRunId);
+    } catch {
+      this.rejectStartupCheckpoint(row, "invalid_run_payload");
+      return null;
+    }
+    if (!coverageRun || coverageRun.conversationId !== checkpoint.conversationId) {
+      this.rejectStartupCheckpoint(row, "missing_coverage_run");
+      return null;
+    }
+    if (!sourceRun || sourceRun.conversationId !== checkpoint.conversationId) {
+      this.rejectStartupCheckpoint(row, "missing_source_run");
+      return null;
+    }
+
+    let lineage: Run[];
+    try {
+      lineage = this.listLineageRuns(checkpoint.conversationId, checkpoint.sourceHeadRunId);
+    } catch {
+      this.rejectStartupCheckpoint(row, "invalid_source_lineage");
+      return null;
+    }
+    if (!lineage.some((run) => run.id === checkpoint.coverageThroughRunId)) {
+      this.rejectStartupCheckpoint(row, "coverage_not_active_ancestor");
+      return null;
+    }
+    if (
+      computeContextLineageHash(lineage, checkpoint.coverageThroughRunId)
+      !== checkpoint.lineageHash
+    ) {
+      this.rejectStartupCheckpoint(row, "lineage_hash_mismatch");
+      return null;
+    }
+    return { checkpoint, lineage };
+  }
+
+  private rejectStartupCheckpoint(row: ContextCheckpointRow, reason: string): void {
+    this.invalidCheckpointIds.add(row.id);
+    this.insertContextDiagnostic({
+      code: "CHECKPOINT_STARTUP_REJECTED",
+      ...(row.conversation_id.startsWith("conv_")
+        ? { conversationId: row.conversation_id as ConversationId }
+        : {}),
+      ...(row.id.startsWith("ckpt_")
+        ? { checkpointId: row.id as ContextCheckpoint["id"] }
+        : {}),
+      ...(row.source_head_run_id.startsWith("run_")
+        ? { runId: row.source_head_run_id as RunId }
+        : {}),
+      reason,
+      details: {},
+    });
+  }
+
+  private insertContextDiagnostic(
+    input: Omit<RuntimeContextDiagnostic, "id" | "time">,
+  ): void {
+    const identity = encode({
+      code: input.code,
+      conversationId: input.conversationId,
+      checkpointId: input.checkpointId,
+      runId: input.runId,
+      reason: input.reason,
+      details: input.details,
+    });
+    const id = `ctxdiag_${createHash("sha256").update(identity).digest("hex")}`;
+    const lastCreatedAt = this.db
+      .query<{ created_at: number | null }, []>(
+        "SELECT MAX(created_at) AS created_at FROM runtime_context_diagnostics",
+      )
+      .get()?.created_at;
+    const createdAt = Math.max(
+      this.contextPreparationNow(),
+      (lastCreatedAt ?? -1) + 1,
+    );
+    this.db
+      .query(
+        `INSERT OR IGNORE INTO runtime_context_diagnostics (
+          id, code, conversation_id, checkpoint_id, run_id, reason, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.code,
+        input.conversationId ?? null,
+        input.checkpointId ?? null,
+        input.runId ?? null,
+        input.reason,
+        encode(input.details),
+        createdAt,
+      );
   }
 
   getContextPlan(id: ContextPlan["id"]): ContextPlan | null {
@@ -849,6 +1161,41 @@ export class RuntimeSqliteStore {
     return tx();
   }
 
+  renewContextPreparationClaim(claim: ContextPreparationClaimRelease, ttlMs: number): boolean {
+    assertContextPreparationRequestKey(claim.runId, claim.requestIndex);
+    if (
+      !isSha256(claim.requestHash)
+      || claim.ownerId.length === 0
+      || !Number.isSafeInteger(claim.fencingToken)
+      || claim.fencingToken < 1
+      || !Number.isSafeInteger(ttlMs)
+      || ttlMs <= 0
+    ) {
+      throw new Error("Context preparation claim renewal is invalid");
+    }
+    const renewedAt = this.contextPreparationNow();
+    const expiresAt = renewedAt + ttlMs;
+    if (!Number.isSafeInteger(expiresAt)) {
+      throw new Error("Context preparation claim expiry is invalid");
+    }
+    return this.db
+      .query(
+        `UPDATE runtime_context_preparation_claims
+         SET expires_at = MAX(expires_at, ?)
+         WHERE run_id = ? AND request_index = ? AND request_hash = ? AND owner_id = ?
+           AND fencing_token = ? AND expires_at > ?`,
+      )
+      .run(
+        expiresAt,
+        claim.runId,
+        claim.requestIndex,
+        claim.requestHash,
+        claim.ownerId,
+        claim.fencingToken,
+        renewedAt,
+      ).changes > 0;
+  }
+
   releaseContextPreparationClaim(claim: ContextPreparationClaimRelease): boolean {
     assertContextPreparationRequestKey(claim.runId, claim.requestIndex);
     if (
@@ -938,6 +1285,24 @@ export class RuntimeSqliteStore {
         conversation.activeHeadRunId !== checkpoint.sourceHeadRunId
         || conversation.revision !== checkpoint.sourceConversationRevision
       ) {
+        const reason = conversation.activeHeadRunId !== checkpoint.sourceHeadRunId
+          ? "source_head_changed"
+          : "source_revision_changed";
+        this.insertContextDiagnostic({
+          code: "CHECKPOINT_CAS_CONFLICT",
+          conversationId: checkpoint.conversationId,
+          checkpointId: checkpoint.id,
+          runId: checkpoint.sourceHeadRunId,
+          reason,
+          details: {
+            expectedHeadRunId: checkpoint.sourceHeadRunId,
+            expectedRevision: checkpoint.sourceConversationRevision,
+            actualHeadRunId: conversation.activeHeadRunId,
+            actualRevision: conversation.revision,
+            coverageThroughRunId: checkpoint.coverageThroughRunId,
+            trigger: checkpoint.trigger,
+          },
+        });
         return "stale";
       }
 
@@ -952,6 +1317,19 @@ export class RuntimeSqliteStore {
           error instanceof RuntimeHistoryIntegrityError
           && error.conversationId === checkpoint.conversationId
         ) {
+          this.insertContextDiagnostic({
+            code: "CHECKPOINT_CAS_CONFLICT",
+            conversationId: checkpoint.conversationId,
+            checkpointId: checkpoint.id,
+            runId: checkpoint.sourceHeadRunId,
+            reason: "source_lineage_changed",
+            details: {
+              expectedHeadRunId: checkpoint.sourceHeadRunId,
+              expectedRevision: checkpoint.sourceConversationRevision,
+              coverageThroughRunId: checkpoint.coverageThroughRunId,
+              trigger: checkpoint.trigger,
+            },
+          });
           return "stale";
         }
         throw error;
@@ -960,7 +1338,10 @@ export class RuntimeSqliteStore {
         (run) => run.id === checkpoint.coverageThroughRunId,
       );
       if (coverageIndex < 0) {
-        throw new Error("Context checkpoint coverage is not an ancestor of the source head");
+        throw new ContextCheckpointRejectedError(
+          "coverage_not_active_ancestor",
+          "Context checkpoint coverage is not an ancestor of the source head",
+        );
       }
       const coverageRun = lineage[coverageIndex];
       if (
@@ -968,42 +1349,45 @@ export class RuntimeSqliteStore {
         || !["completed", "failed", "interrupted"].includes(coverageRun.status)
         || coverageRun.id === checkpoint.sourceHeadRunId
       ) {
-        throw new Error("Context checkpoint coverage must end after a terminal non-current Run");
+        throw new ContextCheckpointRejectedError(
+          "unsafe_coverage_boundary",
+          "Context checkpoint coverage must end after a terminal non-current Run",
+        );
       }
       const expectedHash = computeContextLineageHash(lineage, checkpoint.coverageThroughRunId);
       if (checkpoint.lineageHash !== expectedHash) {
-        throw new Error("Context checkpoint lineage hash does not match persisted history");
+        throw new ContextCheckpointRejectedError(
+          "lineage_hash_mismatch",
+          "Context checkpoint lineage hash does not match persisted history",
+        );
       }
 
       let parentCheckpoint: ContextCheckpoint | undefined;
       if (checkpoint.parentCheckpointId) {
-        if (checkpoint.parentCheckpointId === checkpoint.id) {
-          throw new Error("Context checkpoint cannot be its own parent");
-        }
-        const parentRow = this.db
-          .query<ContextPayloadRow, [string]>(
-            "SELECT payload_json FROM runtime_context_checkpoints WHERE id = ?",
+        const checkpointsById = new Map<string, ContextCheckpoint>();
+        const parentRows = this.db
+          .query<ContextCheckpointRow, []>(
+            "SELECT * FROM runtime_context_checkpoints ORDER BY created_at ASC, id ASC",
           )
-          .get(checkpoint.parentCheckpointId);
-        if (!parentRow) {
-          throw new Error("Context checkpoint parent was not found");
+          .all();
+        for (const row of parentRows) {
+          if (this.invalidCheckpointIds.has(row.id)) continue;
+          try {
+            const parsed = contextCheckpointSchema.safeParse(JSON.parse(row.payload_json));
+            if (parsed.success) {
+              checkpointsById.set(parsed.data.id, parsed.data as ContextCheckpoint);
+            }
+          } catch {
+            // An unreadable ancestor makes the complete parent chain unusable.
+          }
         }
-        const parent = contextCheckpointSchema.parse(
-          JSON.parse(parentRow.payload_json),
-        ) as ContextCheckpoint;
-        const parentCoverageIndex = lineage.findIndex(
-          (run) => run.id === parent.coverageThroughRunId,
-        );
-        if (
-          parent.conversationId !== checkpoint.conversationId
-          || parentCoverageIndex < 0
-          || parentCoverageIndex >= coverageIndex
-          || parent.lineageHash
-            !== computeContextLineageHash(lineage, parent.coverageThroughRunId)
-        ) {
-          throw new Error("Context checkpoint parent is not on the committed coverage lineage");
+        if (!isContextCheckpointParentChainUsable(checkpoint, checkpointsById, lineage)) {
+          throw new ContextCheckpointRejectedError(
+            "dangling_parent",
+            "Context checkpoint parent chain is not usable on the committed coverage lineage",
+          );
         }
-        parentCheckpoint = parent;
+        parentCheckpoint = checkpointsById.get(checkpoint.parentCheckpointId);
       }
 
       const runs = this.listRunsByConversation(checkpoint.conversationId);
@@ -1035,6 +1419,19 @@ export class RuntimeSqliteStore {
         || checkpoint.safetyStateHash !== sourceState.safetyStateHash
         || checkpoint.sourceStateHash !== sourceState.sourceStateHash
       ) {
+        this.insertContextDiagnostic({
+          code: "CHECKPOINT_CAS_CONFLICT",
+          conversationId: checkpoint.conversationId,
+          checkpointId: checkpoint.id,
+          runId: checkpoint.sourceHeadRunId,
+          reason: "source_state_changed",
+          details: {
+            expectedHeadRunId: checkpoint.sourceHeadRunId,
+            expectedRevision: checkpoint.sourceConversationRevision,
+            coverageThroughRunId: checkpoint.coverageThroughRunId,
+            trigger: checkpoint.trigger,
+          },
+        });
         return "stale";
       }
 
@@ -1090,7 +1487,27 @@ export class RuntimeSqliteStore {
       return "committed";
     });
 
-    const result = tx();
+    let result: "committed" | "stale";
+    try {
+      result = tx();
+    } catch (error) {
+      if (error instanceof ContextCheckpointRejectedError) {
+        this.insertContextDiagnostic({
+          code: "CHECKPOINT_REJECTED",
+          conversationId: checkpoint.conversationId,
+          checkpointId: checkpoint.id,
+          runId: checkpoint.sourceHeadRunId,
+          reason: error.reason,
+          details: {
+            sourceHeadRunId: checkpoint.sourceHeadRunId,
+            sourceConversationRevision: checkpoint.sourceConversationRevision,
+            coverageThroughRunId: checkpoint.coverageThroughRunId,
+            trigger: checkpoint.trigger,
+          },
+        });
+      }
+      throw error;
+    }
     if (result === "committed" && committedEvent) {
       this.options.eventBus?.publish(runtimeEventToEnvelope(committedEvent));
     }
@@ -1099,6 +1516,7 @@ export class RuntimeSqliteStore {
 
   saveContextPlan(input: ContextPlanCommit): void {
     const parsed = contextPlanSchema.parse(input.plan) as ContextPlan;
+    let committedEvent: Event | null = null;
     const tx = this.db.transaction((): void => {
       this.assertActiveContextPreparationClaim(input.preparationClaim);
       if (
@@ -1123,8 +1541,40 @@ export class RuntimeSqliteStore {
           encode(parsed),
           parsed.time.created,
         );
+      committedEvent = {
+        id: input.eventId,
+        type: "context.plan.created",
+        properties: {
+          planId: parsed.id,
+          conversationId: parsed.conversationId,
+          runId: parsed.runId,
+          requestIndex: parsed.requestIndex,
+          sourceHeadRunId: parsed.sourceHeadRunId,
+          sourceConversationRevision: parsed.sourceConversationRevision,
+          view: parsed.view,
+          ...(parsed.checkpointId ? { checkpointId: parsed.checkpointId } : {}),
+          reason: parsed.reason,
+          ...(parsed.checkpointRejections?.length
+            ? { checkpointRejections: parsed.checkpointRejections }
+            : {}),
+          trigger: parsed.trigger,
+          budget: {
+            contextWindow: parsed.budget.contextWindow,
+            estimatedInputTokens: parsed.budget.estimatedInputTokens,
+            rawHistoryTokens: parsed.budget.rawHistoryTokens,
+            checkpointTokens: parsed.budget.checkpointTokens,
+            safetyStateTokens: parsed.budget.safetyStateTokens,
+            reservedOutputTokens: parsed.budget.reservedOutputTokens,
+          },
+        },
+        time: parsed.time.created,
+      };
+      this.insertEvent(committedEvent);
     });
     tx();
+    if (committedEvent) {
+      this.options.eventBus?.publish(runtimeEventToEnvelope(committedEvent));
+    }
   }
 
   private assertActiveContextPreparationClaim(claim: ContextPreparationClaim): void {
@@ -1234,6 +1684,52 @@ export class RuntimeSqliteStore {
         return raced;
       }
       throw new Error("Context usage Provider observation is immutable");
+    }
+    return updated;
+  }
+
+  updateContextUsageNextTurnForecast(input: {
+    runId: RunId;
+    requestIndex: number;
+    nextTurnForecast: NonNullable<ContextUsage["nextTurnForecast"]>;
+  }): ContextUsage {
+    const current = this.getContextUsageByRunRequest(input.runId, input.requestIndex);
+    if (!current) {
+      throw new Error(
+        `Context usage estimate was not found: ${input.runId}/${input.requestIndex}`,
+      );
+    }
+    if (current.nextTurnForecast) {
+      if (
+        JSON.stringify(current.nextTurnForecast)
+        !== JSON.stringify(input.nextTurnForecast)
+      ) {
+        throw new Error("Next-turn context forecast is immutable");
+      }
+      return current;
+    }
+    const updated = contextUsageSchema.parse({
+      ...current,
+      nextTurnForecast: input.nextTurnForecast,
+    }) as ContextUsage;
+    const result = this.db
+      .query(
+        `UPDATE runtime_context_usage
+         SET payload_json = ?
+         WHERE run_id = ? AND request_index = ?
+           AND json_extract(payload_json, '$.nextTurnForecast') IS NULL`,
+      )
+      .run(encode(updated), input.runId, input.requestIndex);
+    if (result.changes === 0) {
+      const raced = this.getContextUsageByRunRequest(input.runId, input.requestIndex);
+      if (
+        raced?.nextTurnForecast
+        && JSON.stringify(raced.nextTurnForecast)
+          === JSON.stringify(input.nextTurnForecast)
+      ) {
+        return raced;
+      }
+      throw new Error("Next-turn context forecast is immutable");
     }
     return updated;
   }

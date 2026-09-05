@@ -12,6 +12,7 @@ export {
 export { useAgentComposerSendBlocker } from "./useAgentComposerSendBlocker";
 export {
   getContextDisplayUsage,
+  getLatestAssistantMessageMetadata,
   getRuntimeCompactionMarkerLabel,
   getRuntimeCompactionMarkerView,
   getRuntimeContextUsageView,

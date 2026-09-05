@@ -16,15 +16,16 @@ export interface AiSdkContextUsageView {
   source: "estimate" | "provider";
   view: "raw" | "checkpoint";
   checkpointId?: string;
+  forecastReason?: string;
 }
 
 export interface AiSdkCompactionMarkerView {
   trigger: "auto_pre_turn" | "auto_mid_turn" | "manual" | "provider_overflow" | "model_switch";
   createdAt: number;
-  coverageThroughRunId: string;
+  coverageThroughRunId?: string;
   beforeTokens: number;
-  afterTokens: number;
-  status: "created" | "recovered";
+  afterTokens?: number;
+  status: "preparing" | "created" | "failed" | "recovered";
 }
 
 export interface AiSdkDerivedMessageMetadata {
@@ -281,6 +282,9 @@ function sanitizeContextUsage(usage: AiSdkContextUsageView): AiSdkContextUsageVi
     source: usage.source,
     view: usage.view,
     ...(typeof usage.checkpointId === "string" ? { checkpointId: usage.checkpointId } : {}),
+    ...(typeof usage.forecastReason === "string"
+      ? { forecastReason: usage.forecastReason }
+      : {}),
   };
 }
 
@@ -288,9 +292,11 @@ function sanitizeCompactionMarker(marker: AiSdkCompactionMarkerView): AiSdkCompa
   return {
     trigger: marker.trigger,
     createdAt: marker.createdAt,
-    coverageThroughRunId: marker.coverageThroughRunId,
+    ...(marker.coverageThroughRunId === undefined
+      ? {}
+      : { coverageThroughRunId: marker.coverageThroughRunId }),
     beforeTokens: marker.beforeTokens,
-    afterTokens: marker.afterTokens,
+    ...(marker.afterTokens === undefined ? {} : { afterTokens: marker.afterTokens }),
     status: marker.status,
   };
 }

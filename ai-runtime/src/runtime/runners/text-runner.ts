@@ -4,6 +4,7 @@ import {
   createUIMessageStreamResponse,
   type GenerateTextOnEndCallback,
   type IdGenerator,
+  type Instructions,
   isStepCount,
   type ModelMessage,
   ToolLoopAgent,
@@ -64,6 +65,7 @@ import type {
   ReasoningPart,
   ToolPart,
   SourcePart,
+  TraceEvent,
 } from "../core/types";
 import type { RuntimeAttachmentService } from "../attachments";
 import { mapAiSdkUsage } from "../core/usage";
@@ -86,7 +88,11 @@ import {
   type ContextOverflowRetryGate,
 } from "../context/overflow-recovery";
 import { DEFAULT_CONTEXT_COMPACTION_POLICY } from "../context/policy";
-import type { ContextPlan, ContextUsage } from "../context/types";
+import type {
+  ContextForecastReason,
+  ContextPlan,
+  ContextUsage,
+} from "../context/types";
 import { stableStringifyJson } from "../context/token-estimator";
 
 export interface RuntimeResolvedLanguageModel {
@@ -256,7 +262,7 @@ type RuntimeToolCallFinishEvent = {
 
 export interface RuntimeStreamTextInput {
   model: LanguageModel;
-  system?: string;
+  instructions?: Instructions;
   prompt?: string;
   messages?: ModelMessage[];
   tools?: ToolSet;
@@ -269,6 +275,8 @@ export interface RuntimeStreamTextInput {
   toolChoice?: "auto" | "none";
   abortSignal?: AbortSignal;
   timeout?: number;
+  /** Called for semantic raw AI SDK output before Runtime presentation conversion. */
+  onModelOutput?: () => void | Promise<void>;
   onChunk?: (event: { chunk: RuntimeTextChunk }) => void | Promise<void>;
   onFinish?: (event: RuntimeStreamFinishEvent) => void | Promise<void>;
   onError?: (event: { error: unknown }) => void | Promise<void>;
@@ -277,7 +285,7 @@ export interface RuntimeStreamTextInput {
   onToolCallFinish?: (event: RuntimeToolCallFinishEvent) => void | Promise<void>;
   prepareStep?: (
     event: RuntimePrepareStepEvent,
-  ) => Promise<{ messages?: ModelMessage[] } | void>;
+  ) => Promise<{ instructions?: Instructions; messages?: ModelMessage[] } | void>;
   onStepEnd?: (event: RuntimeStepEndEvent) => void | Promise<void>;
   messageMetadata?: () => Record<string, unknown> | undefined;
 }
@@ -329,7 +337,7 @@ export interface RuntimeTextRunnerDependencies {
   getToolApprovalPolicy?: () => RuntimeToolApprovalPolicy;
   getNetworkPolicy?: () => RuntimeNetworkPolicy;
   getErrorMessageSecrets?: () => readonly string[];
-  contextManager?: Pick<ModelContextManager, "prepare">;
+  contextManager?: Pick<ModelContextManager, "prepare" | "forecastNextTurn">;
 }
 
 export interface RuntimeTextRunResult {
@@ -722,6 +730,7 @@ export class RuntimeTextRunner {
     let terminalWritten = false;
     let coordinatorState: StreamCoordinatorState = "attempt0";
     let committedAttempt: 0 | 1 = 0;
+    let terminalAttempt: 0 | 1 | undefined;
     let recoveryInvalidated = false;
     let unregisterActiveRun: (() => void) | undefined;
     let releasePendingContinuation = releaseContinuation;
@@ -825,6 +834,144 @@ export class RuntimeTextRunner {
       const providerName = this.deps.toolRegistry?.getProviderName(canonicalName) ?? name;
       return { canonicalName, providerName };
     };
+    let latestContextUsage: ContextUsage | undefined;
+    let latestContextMarker: ContextCompactionMarker | undefined;
+    let pendingOverflowRecoveryPayload: Record<string, unknown> | undefined;
+    const markOverflowRecoverySucceeded = (): void => {
+      if (!pendingOverflowRecoveryPayload) return;
+      const recoveredAt = now();
+      this.deps.store.appendTrace({
+        id: createId("trace"),
+        conversationId: started.conversation.id,
+        runId: started.run.id,
+        type: "context.overflow.recovered",
+        level: "warn",
+        time: recoveredAt,
+        payload: pendingOverflowRecoveryPayload,
+      });
+      pendingOverflowRecoveryPayload = undefined;
+      if (latestContextMarker) {
+        latestContextMarker = {
+          ...latestContextMarker,
+          trigger: "provider_overflow",
+          status: "recovered",
+          time: { created: recoveredAt },
+        };
+      }
+    };
+    const resolveNextTurnForecastReason = (): ContextForecastReason => {
+      if (latestContextMarker?.status === "created"
+        || latestContextMarker?.status === "recovered") {
+        return "checkpoint_created";
+      }
+      if (started.run.supersedesRunId) return "branch_changed";
+      const parentRun = started.run.parentRunId
+        ? this.deps.store.getRun(started.run.parentRunId)
+        : undefined;
+      if (
+        parentRun
+        && (parentRun.providerId !== request.providerId || parentRun.modelId !== request.modelId)
+      ) {
+        return "model_changed";
+      }
+      if (
+        parentRun
+        && (
+          parentRun.agentMode !== started.run.agentMode
+          || stableStringifyJson(parentRun.input.tools)
+            !== stableStringifyJson(started.run.input.tools)
+        )
+      ) {
+        return "prompt_policy_changed";
+      }
+      const parentUsage = parentRun
+        ? this.deps.store.listContextUsagesByRun(parentRun.id).at(-1)
+        : undefined;
+      if (
+        parentUsage
+        && (
+          parentUsage.estimatorVersion !== DEFAULT_CONTEXT_COMPACTION_POLICY.estimatorVersion
+          || parentUsage.policyVersion !== DEFAULT_CONTEXT_COMPACTION_POLICY.version
+          || parentUsage.checkpointFormatVersion
+            !== DEFAULT_CONTEXT_COMPACTION_POLICY.checkpointFormatVersion
+        )
+      ) {
+        return "estimator_policy_changed";
+      }
+      return "append";
+    };
+    const persistTerminalContextForecast = (): void => {
+      if (!this.deps.contextManager?.forecastNextTurn) return;
+      const lifecycleTrace = this.deps.store.listTraces(started.run.id).findLast((trace) =>
+        (trace.type === "context.compaction.preparing"
+          || trace.type === "context.compaction.failed")
+        && Number.isSafeInteger(trace.payload.requestIndex)
+      );
+      const lifecycleRequestIndex = lifecycleTrace
+        && typeof lifecycleTrace.payload.requestIndex === "number"
+        && Number.isSafeInteger(lifecycleTrace.payload.requestIndex)
+        && lifecycleTrace.payload.requestIndex >= 0
+        ? lifecycleTrace.payload.requestIndex
+        : undefined;
+      const requestIndex = latestContextUsage?.requestIndex
+        ?? lifecycleRequestIndex
+        ?? previousStepCount;
+      latestContextUsage ??= this.deps.store.getContextUsageByRunRequest(
+        started.run.id,
+        requestIndex,
+      ) ?? undefined;
+      const forecast = this.deps.contextManager.forecastNextTurn({
+        conversationId: started.conversation.id,
+        runId: started.run.id,
+        requestIndex: requestIndex + 1,
+        providerId: request.providerId,
+        modelId: request.modelId,
+        contextWindow: resolved.runtimeContext.provider.contextLength,
+        modelOutputLimit: resolved.runtimeContext.provider.outputLength,
+        reservedOutputTokens:
+          policy.limits.maxOutputTokens
+          ?? resolved.runtimeContext.provider.outputLength
+          ?? 0,
+        systemPrompt: policy.prompt.system,
+        toolSchemas: policy.toolResolution.snapshot,
+        policy: DEFAULT_CONTEXT_COMPACTION_POLICY,
+        reason: resolveNextTurnForecastReason(),
+      });
+      if (latestContextUsage) {
+        latestContextUsage = this.deps.store.updateContextUsageNextTurnForecast({
+          runId: started.run.id,
+          requestIndex: latestContextUsage.requestIndex,
+          nextTurnForecast: forecast,
+        });
+        return;
+      }
+      latestContextUsage = {
+        id: createId("ctxuse"),
+        conversationId: started.conversation.id,
+        runId: started.run.id,
+        requestIndex,
+        providerId: request.providerId,
+        modelId: request.modelId,
+        ...(forecast.contextWindow === undefined
+          ? {}
+          : { contextWindow: forecast.contextWindow }),
+        estimatedInputTokens: forecast.estimatedInputTokens,
+        estimateSource: "estimate",
+        reservedOutputTokens:
+          policy.limits.maxOutputTokens
+          ?? resolved.runtimeContext.provider.outputLength
+          ?? 0,
+        view: forecast.view,
+        ...(forecast.checkpointId ? { checkpointId: forecast.checkpointId } : {}),
+        breakdown: forecast.breakdown,
+        nextTurnForecast: forecast,
+        estimatorVersion: forecast.estimatorVersion,
+        policyVersion: forecast.policyVersion,
+        checkpointFormatVersion: forecast.checkpointFormatVersion,
+        time: { created: now() },
+      };
+      this.deps.store.saveContextUsage(latestContextUsage);
+    };
     const writeFailure = (error: unknown): void => {
       if (terminalWritten) {
         return;
@@ -858,6 +1005,14 @@ export class RuntimeTextRunner {
         state: "error",
         message: `Runtime Run failed: ${failed.error.name}`,
       });
+      try {
+        persistTerminalContextForecast();
+      } catch (forecastError) {
+        console.error("Failed to persist terminal next-turn context forecast", forecastError);
+      }
+      latestContextMarker = readLatestCompactionLifecycleMarker(
+        this.deps.store.listTraces(started.run.id),
+      ) ?? latestContextMarker;
     };
     const updatePartProviderMetadata = (
       part: Part,
@@ -1143,8 +1298,6 @@ export class RuntimeTextRunner {
 
     let result: RuntimeStreamTextResult;
     let streamedStepCount = 0;
-    let latestContextUsage: ContextUsage | undefined;
-    let latestContextMarker: ContextCompactionMarker | undefined;
     const initialToolCalls = this.deps.store.listToolCallsByRun(started.run.id);
     const overflowGate: ContextOverflowRetryGate = {
       runId: started.run.id,
@@ -1170,6 +1323,7 @@ export class RuntimeTextRunner {
           modelId: request.modelId,
           model: resolved.languageModel,
           contextWindow: resolved.runtimeContext.provider.contextLength,
+          modelOutputLimit: resolved.runtimeContext.provider.outputLength,
           reservedOutputTokens: remainingOutputTokens(
             policy.limits.maxOutputTokens,
             previousUsage,
@@ -1207,7 +1361,7 @@ export class RuntimeTextRunner {
         latestContextMarker = initialPrepared.marker;
       }
       const managedMessages = initialPrepared?.messages;
-      const messages = managedMessages
+      const projectedMessages = managedMessages
         ? managedMessages
         : continuationMessages ?? await projectModelHistory(
           this.deps.store.listActiveLineageMessages(started.conversation.id),
@@ -1219,7 +1373,16 @@ export class RuntimeTextRunner {
             },
           },
         );
-      let lastPreparedModelMessages = messages;
+      const unmanagedInstructions = projectedMessages.filter(
+        (message): message is Extract<ModelMessage, { role: "system" }> =>
+          message.role === "system",
+      );
+      const messages = projectedMessages.filter(
+        (message) => message.role !== "system",
+      );
+      const runtimeInstructions = initialPrepared?.instructions
+        ?? unmanagedInstructions;
+      let lastPreparedModelMessages: ModelMessage[] = messages;
       let streamInput: RuntimeStreamTextInput | undefined;
       const ownsStreamAttempt = (attempt: 0 | 1): boolean =>
         (coordinatorState === "attempt0" && attempt === 0)
@@ -1252,9 +1415,18 @@ export class RuntimeTextRunner {
                 quarantineStaleAttempt(attempt);
               }
             : undefined,
+          onModelOutput: attemptInput.onModelOutput
+            ? () => {
+                if (ownsStreamAttempt(attempt)) return attemptInput.onModelOutput?.();
+                quarantineStaleAttempt(attempt);
+              }
+            : undefined,
           onFinish: attemptInput.onFinish
             ? (event) => {
-                if (ownsStreamAttempt(attempt)) return attemptInput.onFinish?.(event);
+                if (ownsStreamAttempt(attempt)) {
+                  terminalAttempt = attempt;
+                  return attemptInput.onFinish?.(event);
+                }
                 quarantineStaleAttempt(attempt);
               }
             : undefined,
@@ -1297,7 +1469,9 @@ export class RuntimeTextRunner {
             : undefined,
           messageMetadata: attemptInput.messageMetadata
             ? () => {
-                if (ownsStreamAttempt(attempt)) return attemptInput.messageMetadata?.();
+                if (ownsStreamAttempt(attempt) || terminalAttempt === attempt) {
+                  return attemptInput.messageMetadata?.();
+                }
                 quarantineStaleAttempt(attempt);
                 return undefined;
               }
@@ -1307,12 +1481,19 @@ export class RuntimeTextRunner {
       const createManagedPrepareStep = (
         baseRequestIndex: number,
         firstMessages: ModelMessage[],
+        firstInstructions: PreparedModelContext["instructions"] | undefined,
         firstPrepared: boolean,
       ): NonNullable<RuntimeStreamTextInput["prepareStep"]> => async (event) => {
         const requestIndex = baseRequestIndex + event.stepNumber;
         if (event.stepNumber === 0 && firstPrepared) {
           lastPreparedModelMessages = firstMessages;
-          return { messages: firstMessages };
+          return {
+            instructions: combineRuntimeInstructions(
+              policy.prompt.system,
+              firstInstructions,
+            ),
+            messages: firstMessages,
+          };
         }
         const inFlightSuffix = event.messages.slice(lastPreparedModelMessages.length);
         retainedModelMessages = [
@@ -1338,7 +1519,13 @@ export class RuntimeTextRunner {
         latestContextMarker = prepared.marker ?? latestContextMarker;
         // Preserve the AI SDK's exact accumulated response/tool/Permission suffix.
         lastPreparedModelMessages = nextMessages;
-        return { messages: nextMessages };
+        return {
+          instructions: combineRuntimeInstructions(
+            policy.prompt.system,
+            prepared.instructions,
+          ),
+          messages: nextMessages,
+        };
       };
       const createManagedOnStepEnd = (
         baseRequestIndex: number,
@@ -1458,6 +1645,8 @@ export class RuntimeTextRunner {
         if (
           recoveryInvalidated
           || !prepared.marker
+          || !prepared.marker.checkpointId
+          || prepared.marker.afterEstimatedInputTokens === undefined
           || !applicableRun
           || !applicableConversation
           || applicableConversation.activeHeadRunId !== started.run.id
@@ -1487,32 +1676,42 @@ export class RuntimeTextRunner {
           createdAt: now(),
         });
         latestContextMarker = prepared.marker ?? latestContextMarker;
+        pendingOverflowRecoveryPayload = {
+          error: toRuntimeModelError(
+            error,
+            this.deps.getErrorMessageSecrets?.() ?? [],
+          ),
+          requestIndex,
+          sourceHeadRunId: prepared.plan.sourceHeadRunId,
+          sourceConversationRevision: prepared.plan.sourceConversationRevision,
+          checkpointId: prepared.marker.checkpointId,
+          beforeEstimatedInputTokens: prepared.marker.beforeEstimatedInputTokens,
+          afterEstimatedInputTokens: prepared.marker.afterEstimatedInputTokens,
+        };
         this.deps.store.appendTrace({
           id: createId("trace"),
           conversationId: started.conversation.id,
           runId: started.run.id,
-          type: "context.overflow.recovered",
+          type: "context.overflow.retrying",
           level: "warn",
           time: now(),
-          payload: {
-            error: toRuntimeModelError(
-              error,
-              this.deps.getErrorMessageSecrets?.() ?? [],
-            ),
-            requestIndex,
-            sourceHeadRunId: prepared.plan.sourceHeadRunId,
-            sourceConversationRevision: prepared.plan.sourceConversationRevision,
-            checkpointId: prepared.marker.checkpointId,
-            beforeEstimatedInputTokens: prepared.marker.beforeEstimatedInputTokens,
-            afterEstimatedInputTokens: prepared.marker.afterEstimatedInputTokens,
-          },
+          payload: pendingOverflowRecoveryPayload,
         });
         lastPreparedModelMessages = prepared.messages;
         const replacementInput: RuntimeStreamTextInput = {
           ...streamInput,
+          instructions: combineRuntimeInstructions(
+            policy.prompt.system,
+            prepared.instructions,
+          ),
           messages: prepared.messages,
           prompt: undefined,
-          prepareStep: createManagedPrepareStep(requestIndex, prepared.messages, true),
+          prepareStep: createManagedPrepareStep(
+            requestIndex,
+            prepared.messages,
+            prepared.instructions,
+            true,
+          ),
           onStepEnd: createManagedOnStepEnd(requestIndex),
         };
         coordinatorState = "attempt1";
@@ -1554,7 +1753,10 @@ export class RuntimeTextRunner {
         : undefined;
       streamInput = {
         model: resolved.languageModel,
-        system: policy.prompt.system,
+        instructions: combineRuntimeInstructions(
+          policy.prompt.system,
+          runtimeInstructions,
+        ),
         ...(messages.length > 0 ? { messages } : { prompt: request.text ?? "" }),
         maxSteps: Math.max(1, policy.limits.maxSteps - previousStepCount),
         maxOutputTokens: remainingOutputTokens(
@@ -1581,6 +1783,7 @@ export class RuntimeTextRunner {
           ? createManagedPrepareStep(
               previousStepCount,
               messages,
+              runtimeInstructions,
               initialPrepared !== undefined,
             )
           : undefined,
@@ -1593,6 +1796,9 @@ export class RuntimeTextRunner {
               latestContextMarker,
             )
           : undefined,
+        onModelOutput: () => {
+          overflowGate.modelOutputObserved = true;
+        },
         onChunk: ({ chunk }) => {
           if (
             (chunk.type === "text-delta" || chunk.type === "reasoning-delta")
@@ -1992,6 +2198,7 @@ export class RuntimeTextRunner {
             previousUsage,
             mapAiSdkUsage(totalUsage),
           );
+          markOverflowRecoverySucceeded();
           const pendingPermissions = this.deps.store
             .listPendingPermissionsByRun(started.run.id);
           if (pendingPermissions.length > 0) {
@@ -2011,12 +2218,39 @@ export class RuntimeTextRunner {
             return;
           }
           cleanupPreparedRun();
-          runner.completeText(started, finalText, {
+          const completed = runner.completeText(started, finalText, {
             finish: mapAiSdkFinishReason(finishReason),
             usage,
             parts: semanticParts,
             appendTextPart: !semanticParts.some((part) => part.type === "text"),
           });
+          if (
+            latestContextUsage
+            && this.deps.contextManager?.forecastNextTurn
+          ) {
+            const forecast = this.deps.contextManager.forecastNextTurn({
+              conversationId: completed.conversation.id,
+              runId: completed.run.id,
+              requestIndex: latestContextUsage.requestIndex + 1,
+              providerId: request.providerId,
+              modelId: request.modelId,
+              contextWindow: resolved.runtimeContext.provider.contextLength,
+              modelOutputLimit: resolved.runtimeContext.provider.outputLength,
+              reservedOutputTokens:
+                policy.limits.maxOutputTokens
+                ?? resolved.runtimeContext.provider.outputLength
+                ?? 0,
+              systemPrompt: policy.prompt.system,
+              toolSchemas: policy.toolResolution.snapshot,
+              policy: DEFAULT_CONTEXT_COMPACTION_POLICY,
+              reason: resolveNextTurnForecastReason(),
+            });
+            latestContextUsage = this.deps.store.updateContextUsageNextTurnForecast({
+              runId: completed.run.id,
+              requestIndex: latestContextUsage.requestIndex,
+              nextTurnForecast: forecast,
+            });
+          }
         },
         onError: async ({ error }) => {
           if (!await retryContextOverflow(error)) writeFailure(error);
@@ -2124,6 +2358,14 @@ export class RuntimeTextRunner {
         response: withRuntimeHeaders(createUIMessageStreamResponse({
           stream: createUIMessageStream({
             execute: ({ writer }) => {
+              writer.write({
+                type: "start",
+                messageId: started.assistantMessage.id,
+                messageMetadata: projectSafeContextMetadata(
+                  latestContextUsage,
+                  latestContextMarker,
+                ),
+              });
               writer.write({
                 type: "error",
                 errorText: modelErrorMessage(
@@ -2585,29 +2827,67 @@ function projectSafeContextMetadata(
   const nexus: Record<string, unknown> = {};
   if (usage) {
     const providerInputTokens = usage.providerObservation?.inputTokens;
-    const activeInputTokens = providerInputTokens ?? usage.estimatedInputTokens;
+    const forecast = usage.nextTurnForecast;
+    const contextWindow = forecast?.contextWindow ?? usage.contextWindow;
+    const checkpointId = forecast?.checkpointId ?? usage.checkpointId;
     nexus.contextUsage = {
-      ...(usage.contextWindow ? { contextWindow: usage.contextWindow } : {}),
-      estimatedInputTokens: usage.estimatedInputTokens,
+      ...(contextWindow ? { contextWindow } : {}),
+      estimatedInputTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
       ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
       reservedOutputTokens: usage.reservedOutputTokens,
-      activeTokens: activeInputTokens + usage.reservedOutputTokens,
-      source: providerInputTokens === undefined ? "estimate" : "provider",
-      view: usage.view,
-      ...(usage.checkpointId ? { checkpointId: usage.checkpointId } : {}),
+      activeTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
+      source: "estimate",
+      view: forecast?.view ?? usage.view,
+      ...(checkpointId ? { checkpointId } : {}),
+      ...(forecast ? { forecastReason: forecast.reason } : {}),
     };
   }
   if (marker) {
     nexus.compaction = {
       trigger: marker.trigger,
       createdAt: marker.time.created,
-      coverageThroughRunId: marker.coverageThroughRunId,
+      ...(marker.coverageThroughRunId === undefined
+        ? {}
+        : { coverageThroughRunId: marker.coverageThroughRunId }),
       beforeTokens: marker.beforeEstimatedInputTokens,
-      afterTokens: marker.afterEstimatedInputTokens,
+      ...(marker.afterEstimatedInputTokens === undefined
+        ? {}
+        : { afterTokens: marker.afterEstimatedInputTokens }),
       status: marker.status,
     };
   }
   return { nexus, custom: { nexus } };
+}
+
+function readLatestCompactionLifecycleMarker(
+  traces: readonly TraceEvent[],
+): ContextCompactionMarker | undefined {
+  const trace = traces.findLast((candidate) =>
+    (candidate.type === "context.compaction.preparing"
+      || candidate.type === "context.compaction.failed")
+    && isContextCompactionTrigger(candidate.payload.trigger)
+    && typeof candidate.payload.beforeEstimatedInputTokens === "number"
+    && Number.isSafeInteger(candidate.payload.beforeEstimatedInputTokens)
+    && candidate.payload.beforeEstimatedInputTokens >= 0
+  );
+  if (!trace) return undefined;
+  return {
+    trigger: trace.payload.trigger as ContextCompactionMarker["trigger"],
+    auto: trace.payload.trigger !== "manual",
+    beforeEstimatedInputTokens: trace.payload.beforeEstimatedInputTokens as number,
+    status: trace.type === "context.compaction.failed" ? "failed" : "preparing",
+    time: { created: trace.time },
+  };
+}
+
+function isContextCompactionTrigger(
+  value: unknown,
+): value is ContextCompactionMarker["trigger"] {
+  return value === "auto_pre_turn"
+    || value === "auto_mid_turn"
+    || value === "manual"
+    || value === "provider_overflow"
+    || value === "model_switch";
 }
 
 function scheduleConversationTitleGeneration(input: {
@@ -2661,6 +2941,7 @@ function scheduleConversationTitleGeneration(input: {
 }
 
 const defaultStreamText: RuntimeStreamText = async (input) => {
+  assertNoSystemModelMessages(input.messages);
   const activeTools = input.activeTools?.length ? (input.activeTools as never) : undefined;
   let callbackFailure: { error: unknown } | undefined;
   const recordCallbackFailure = (error: unknown): void => {
@@ -2690,7 +2971,7 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
 
   const agent = new ToolLoopAgent({
     model: input.model,
-    instructions: input.system,
+    instructions: input.instructions,
     tools: input.tools,
     activeTools,
     stopWhen: isStepCount(input.maxSteps ?? 1),
@@ -2702,10 +2983,12 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
     prepareStep: input.prepareStep || input.onStepEnd
       ? async (event) => {
           throwIfCallbackFailed();
-          return (await input.prepareStep?.({
+          const prepared = await input.prepareStep?.({
             stepNumber: event.stepNumber,
             messages: event.messages,
-          })) ?? {};
+          });
+          assertNoSystemModelMessages(prepared?.messages);
+          return prepared ?? {};
         }
       : undefined,
   });
@@ -2771,6 +3054,7 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
     ? consumeRuntimeFullStream(
       result.fullStream,
       input.onChunk,
+      input.onModelOutput,
       input.onError,
       input.onAbort,
       markResponseReady,
@@ -2791,27 +3075,80 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
       }),
       runtimeFactsSettled,
       () => callbackFailure,
+      input.messageMetadata,
     ),
   };
 };
+
+function combineRuntimeInstructions(
+  primary: string,
+  boundaries: PreparedModelContext["instructions"] | undefined,
+): Instructions {
+  if (!boundaries?.length) return primary;
+  return [
+    { role: "system", content: primary },
+    ...boundaries,
+  ];
+}
+
+function assertNoSystemModelMessages(
+  messages: readonly ModelMessage[] | undefined,
+): void {
+  if (messages?.some((message) => message.role === "system")) {
+    throw new Error(
+      "Runtime stream messages must not contain system instructions",
+    );
+  }
+}
 
 function withRuntimeFactsBarrier(
   response: Response,
   runtimeFactsSettled: PromiseLike<void>,
   getCallbackFailure?: () => { error: unknown } | undefined,
+  getFinalMessageMetadata?: () => Record<string, unknown> | undefined,
 ): Response {
   if (!response.body) {
     return response;
   }
 
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  const pendingFinalBlocks: Array<{ block: string; separator: string }> = [];
   const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
-      controller.enqueue(chunk);
+      buffer += decoder.decode(chunk, { stream: true });
+      while (true) {
+        const separatorMatch = /\r?\n\r?\n/.exec(buffer);
+        if (!separatorMatch || separatorMatch.index === undefined) break;
+        const block = buffer.slice(0, separatorMatch.index);
+        const separator = separatorMatch[0];
+        buffer = buffer.slice(separatorMatch.index + separator.length);
+        if (pendingFinalBlocks.length > 0 || isUiFinishSseBlock(block)) {
+          pendingFinalBlocks.push({ block, separator });
+        } else {
+          controller.enqueue(encoder.encode(block + separator));
+        }
+      }
     },
-    async flush() {
+    async flush(controller) {
+      buffer += decoder.decode();
+      if (buffer.length > 0) {
+        if (pendingFinalBlocks.length > 0 || isUiFinishSseBlock(buffer)) {
+          pendingFinalBlocks.push({ block: buffer, separator: "" });
+        } else {
+          controller.enqueue(encoder.encode(buffer));
+        }
+      }
       await runtimeFactsSettled;
       const failure = getCallbackFailure?.();
       if (failure) throw failure.error;
+      const finalMetadata = getFinalMessageMetadata?.();
+      for (const pending of pendingFinalBlocks) {
+        controller.enqueue(encoder.encode(
+          replaceUiFinishSseMetadata(pending.block, finalMetadata) + pending.separator,
+        ));
+      }
     },
   }));
   return new Response(body, {
@@ -2821,15 +3158,51 @@ function withRuntimeFactsBarrier(
   });
 }
 
+function isUiFinishSseBlock(block: string): boolean {
+  return readSseJsonPayload(block)?.type === "finish";
+}
+
+function replaceUiFinishSseMetadata(
+  block: string,
+  metadata: Record<string, unknown> | undefined,
+): string {
+  if (!metadata) return block;
+  const lines = block.split(/\r?\n/);
+  const dataIndex = lines.findIndex((line) => line.startsWith("data:"));
+  if (dataIndex < 0) return block;
+  const payload = readSseJsonPayload(block);
+  if (!payload || payload.type !== "finish") return block;
+  lines[dataIndex] = `data: ${JSON.stringify({ ...payload, messageMetadata: metadata })}`;
+  return lines.join(block.includes("\r\n") ? "\r\n" : "\n");
+}
+
+function readSseJsonPayload(block: string): Record<string, unknown> | null {
+  const dataLine = block.split(/\r?\n/).find((line) => line.startsWith("data:"));
+  if (!dataLine) return null;
+  const raw = dataLine.slice("data:".length).trim();
+  if (!raw || raw === "[DONE]") return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 async function consumeRuntimeFullStream(
   stream: AsyncIterable<TextStreamPart<ToolSet>>,
   onChunk: NonNullable<RuntimeStreamTextInput["onChunk"]>,
+  onModelOutput?: RuntimeStreamTextInput["onModelOutput"],
   onError?: RuntimeStreamTextInput["onError"],
   onAbort?: RuntimeStreamTextInput["onAbort"],
   onResponseReady?: () => void,
 ): Promise<void> {
   try {
     for await (const part of stream) {
+      const semanticModelOutput = isSemanticModelOutputPart(part);
+      if (semanticModelOutput) {
+        await onModelOutput?.();
+      }
       if (part.type === "error") {
         await onError?.({ error: part.error });
         onResponseReady?.();
@@ -2843,7 +3216,9 @@ async function consumeRuntimeFullStream(
       const chunk = toRuntimeTextChunk(part);
       if (chunk) {
         await onChunk({ chunk });
-        if (isPublishableRuntimeChunk(chunk)) onResponseReady?.();
+        if (semanticModelOutput || isPublishableRuntimeChunk(chunk)) onResponseReady?.();
+      } else if (semanticModelOutput) {
+        onResponseReady?.();
       }
       if (part.type === "finish") onResponseReady?.();
     }
@@ -2851,6 +3226,40 @@ async function consumeRuntimeFullStream(
     await onError?.({ error });
   } finally {
     onResponseReady?.();
+  }
+}
+
+function isSemanticModelOutputPart(part: TextStreamPart<ToolSet>): boolean {
+  switch (part.type) {
+    case "text-delta":
+    case "reasoning-delta":
+      return part.text.length > 0;
+    case "source":
+    case "file":
+    case "reasoning-file":
+    case "custom":
+      return true;
+    case "start":
+    case "start-step":
+    case "text-start":
+    case "text-end":
+    case "reasoning-start":
+    case "reasoning-end":
+    case "tool-input-start":
+    case "tool-input-delta":
+    case "tool-input-end":
+    case "tool-call":
+    case "tool-result":
+    case "tool-error":
+    case "tool-output-denied":
+    case "tool-approval-request":
+    case "tool-approval-response":
+    case "finish-step":
+    case "finish":
+    case "abort":
+    case "error":
+    case "raw":
+      return false;
   }
 }
 

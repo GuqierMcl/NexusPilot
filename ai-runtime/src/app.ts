@@ -310,7 +310,7 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
         runtimeStore?.close();
       }
     })
-    .use(healthRoutes(backendBridge, attachmentService, Boolean(runtimeDatabase)))
+    .use(healthRoutes(backendBridge, attachmentService, runtimeStore))
     .use(backendBridgeRoutes(backendBridge))
     .use(providerRoutes({
       providerService,
@@ -352,14 +352,18 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
     );
 }
 
-const generateRuntimeContextSummary: ContextSummaryGenerator = async (input) => {
+export const generateRuntimeContextSummary: ContextSummaryGenerator = async (input) => {
   const result = await generateText({
     model: input.model,
-    system: input.system,
+    instructions: input.instructions,
     messages: input.messages,
     maxOutputTokens: input.maxOutputTokens,
     abortSignal: input.abortSignal,
     timeout: input.timeoutMs,
   });
-  return { text: result.text, usage: result.usage };
+  return {
+    text: result.text,
+    finishReason: result.finishReason,
+    usage: result.usage,
+  };
 };

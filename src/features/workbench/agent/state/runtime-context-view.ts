@@ -14,6 +14,7 @@ export interface RuntimeContextUsageView {
   source: "estimate" | "provider";
   view: "raw" | "checkpoint";
   checkpointId?: string;
+  forecastReason?: string;
 }
 
 export type RuntimeContextUsageState =
@@ -24,10 +25,10 @@ export type RuntimeContextUsageState =
 export interface RuntimeCompactionMarkerView {
   trigger: ContextCompactionTrigger;
   createdAt: number;
-  coverageThroughRunId: string;
+  coverageThroughRunId?: string;
   beforeTokens: number;
-  afterTokens: number;
-  status: "created" | "recovered";
+  afterTokens?: number;
+  status: "preparing" | "created" | "failed" | "recovered";
 }
 
 export interface ContextDisplayUsageView {
@@ -36,8 +37,26 @@ export interface ContextDisplayUsageView {
   percent: number | null;
   source: "estimate" | "provider" | "legacy" | "invalid";
   view: "raw" | "checkpoint" | "legacy" | "unknown";
+  providerInputTokens?: number;
   reservedOutputTokens?: number;
   isLegacy: boolean;
+}
+
+interface AssistantMessageMetadataSource {
+  role?: unknown;
+  metadata?: unknown;
+}
+
+export function getLatestAssistantMessageMetadata(
+  messages: readonly AssistantMessageMetadataSource[],
+): unknown {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "assistant") {
+      return message.metadata;
+    }
+  }
+  return undefined;
 }
 
 export function getRuntimeContextUsageView(
@@ -76,7 +95,6 @@ export function getRuntimeContextUsageState(
   const providerInputTokens = isNonNegativeFinite(record.providerInputTokens)
     ? record.providerInputTokens
     : undefined;
-  const activeInputTokens = providerInputTokens ?? estimatedInputTokens;
   return {
     kind: "valid",
     value: {
@@ -84,11 +102,14 @@ export function getRuntimeContextUsageState(
       estimatedInputTokens,
       ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
       reservedOutputTokens,
-      activeTokens: activeInputTokens + reservedOutputTokens,
-      source: providerInputTokens === undefined ? "estimate" : "provider",
+      activeTokens: estimatedInputTokens,
+      source: "estimate",
       view: record.view,
       ...(typeof record.checkpointId === "string" && record.checkpointId.length > 0
         ? { checkpointId: record.checkpointId }
+        : {}),
+      ...(typeof record.forecastReason === "string"
+        ? { forecastReason: record.forecastReason }
         : {}),
     },
   };
@@ -102,20 +123,23 @@ export function getRuntimeCompactionMarkerView(
     !marker
     || !isContextCompactionTrigger(marker.trigger)
     || !isNonNegativeFinite(marker.createdAt)
-    || typeof marker.coverageThroughRunId !== "string"
-    || marker.coverageThroughRunId.length === 0
     || !isNonNegativeFinite(marker.beforeTokens)
-    || !isNonNegativeFinite(marker.afterTokens)
-    || (marker.status !== "created" && marker.status !== "recovered")
+    || !isContextCompactionStatus(marker.status)
+    || ((marker.status === "created" || marker.status === "recovered")
+      && (typeof marker.coverageThroughRunId !== "string"
+        || marker.coverageThroughRunId.length === 0
+        || !isNonNegativeFinite(marker.afterTokens)))
   ) {
     return null;
   }
   return {
     trigger: marker.trigger,
     createdAt: marker.createdAt,
-    coverageThroughRunId: marker.coverageThroughRunId,
+    ...(typeof marker.coverageThroughRunId === "string"
+      ? { coverageThroughRunId: marker.coverageThroughRunId }
+      : {}),
     beforeTokens: marker.beforeTokens,
-    afterTokens: marker.afterTokens,
+    ...(isNonNegativeFinite(marker.afterTokens) ? { afterTokens: marker.afterTokens } : {}),
     status: marker.status,
   };
 }
@@ -123,12 +147,23 @@ export function getRuntimeCompactionMarkerView(
 export function getRuntimeCompactionMarkerLabel(metadata: unknown): string | null {
   const marker = getRuntimeCompactionMarkerView(metadata);
   if (!marker) return null;
+  if (marker.status === "preparing") return "正在压缩较早上下文";
+  if (marker.status === "failed") return "上下文压缩失败";
   if (marker.status === "recovered" || marker.trigger === "provider_overflow") {
     return "上下文超限后已压缩并重试";
   }
   return marker.trigger === "manual"
     ? "已手动压缩较早上下文"
     : "已自动压缩较早上下文";
+}
+
+function isContextCompactionStatus(
+  value: unknown,
+): value is RuntimeCompactionMarkerView["status"] {
+  return value === "preparing"
+    || value === "created"
+    || value === "failed"
+    || value === "recovered";
 }
 
 export function getContextDisplayUsage(input: {
@@ -159,6 +194,9 @@ export function getContextDisplayUsage(input: {
         : null,
       source: input.runtimeUsage.source,
       view: input.runtimeUsage.view,
+      ...(input.runtimeUsage.providerInputTokens === undefined
+        ? {}
+        : { providerInputTokens: input.runtimeUsage.providerInputTokens }),
       reservedOutputTokens: input.runtimeUsage.reservedOutputTokens,
       isLegacy: false,
     };

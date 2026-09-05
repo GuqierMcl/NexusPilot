@@ -1,4 +1,11 @@
-import type { LanguageModel, LanguageModelUsage, ModelMessage } from "ai";
+import type {
+  FinishReason,
+  Instructions,
+  LanguageModel,
+  LanguageModelUsage,
+  ModelMessage,
+  SystemModelMessage,
+} from "ai";
 
 import { createRuntimeId, type RuntimeId, type RuntimeIdPrefix } from "../core/ids";
 import type { ConversationId, MessageId, Run, RunId } from "../core/types";
@@ -16,7 +23,9 @@ import {
 } from "./policy";
 import {
   buildContextSummaryMemoryMessage,
+  buildContextSummaryRequestMessage,
   buildContextSummarySafetyMessage,
+  CONTEXT_SUMMARY_REQUEST_PROMPT,
   CONTEXT_SUMMARY_SYSTEM_PROMPT,
   sanitizeContextSummaryText,
 } from "./summary-prompt";
@@ -27,19 +36,28 @@ import type {
   ContextCompactionTrigger,
   ContextPreparationClaim,
   ContextPlannerSnapshot,
+  ContextUsage,
+  ContextUsageBreakdown,
 } from "./types";
-import { ContextPreparationLeaseLostError } from "./types";
+import {
+  CONTEXT_PREPARATION_CLAIM_TTL_MS,
+  ContextPreparationLeaseLostError,
+} from "./types";
 import { computeContextCoverageSourceState } from "./boundary-validation";
 
 export interface ContextSummaryGenerator {
   (input: {
     model: LanguageModel;
-    system: string;
+    instructions: Instructions;
     messages: ModelMessage[];
-    maxOutputTokens: 2048;
+    maxOutputTokens: number;
     abortSignal?: AbortSignal;
     timeoutMs?: number;
-  }): Promise<{ text: string; usage?: LanguageModelUsage }>;
+  }): Promise<{
+    text: string;
+    finishReason?: FinishReason;
+    usage?: LanguageModelUsage;
+  }>;
 }
 
 export interface ContextCompactionRequest {
@@ -53,6 +71,7 @@ export interface ContextCompactionRequest {
   modelId: string;
   model: LanguageModel;
   contextWindow?: number;
+  modelOutputLimit?: number;
   reservedOutputTokens: number;
   systemPrompt: string;
   toolSchemas: unknown;
@@ -81,8 +100,21 @@ export interface ContextCompactionServiceDependencies {
   createId?: <TPrefix extends RuntimeIdPrefix>(prefix: TPrefix) => RuntimeId<TPrefix>;
 }
 
+export interface ContextSummaryValidationDiagnostics {
+  finishReason?: FinishReason;
+  inputTokens?: number;
+  outputTokens?: number;
+  textTokens?: number;
+  reasoningTokens?: number;
+  summaryInvocationCount?: number;
+  summaryReservedOutputTokens?: number;
+}
+
 export class ContextSummaryValidationError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly diagnostics: Readonly<ContextSummaryValidationDiagnostics> = {},
+  ) {
     super(message);
     this.name = "ContextSummaryValidationError";
   }
@@ -137,6 +169,7 @@ export class ContextCompactionService {
       providerId: input.providerId,
       modelId: input.modelId,
       contextWindow: input.contextWindow,
+      modelOutputLimit: input.modelOutputLimit,
       reservedOutputTokens: input.reservedOutputTokens,
       systemPrompt: input.systemPrompt,
       toolSchemas: input.toolSchemas,
@@ -163,10 +196,6 @@ export class ContextCompactionService {
     ) {
       throw new Error("Context compaction candidate boundary is stale or unsafe");
     }
-    if (input.policy.summaryMaxOutputTokens !== 2_048) {
-      throw new Error("Context summary max output tokens must be 2048 for format version 1");
-    }
-
     const lineage = resolveSnapshotLineage(snapshot, input.expectedHeadRunId);
     const coverageThroughRunId = plan.eligibleCoverageThroughRunId;
     const coverageIndex = lineage.findIndex((run) => run.id === coverageThroughRunId);
@@ -184,18 +213,54 @@ export class ContextCompactionService {
     if (!sourceState.safe) {
       throw new Error("Context compaction boundary became unsafe before generation");
     }
-    const summary = await generateRollingSummary({
+    const summaryMaxOutputTokens = capSummaryOutputTokens(
+      input.policy.summaryMaxOutputTokens,
+      input.modelOutputLimit,
+    );
+    const summaryRetryMaxOutputTokens = capSummaryOutputTokens(
+      input.policy.summaryRetryMaxOutputTokens,
+      input.modelOutputLimit,
+    );
+    const generatedSummary = await generateRollingSummary({
       generator: this.generator,
       model: input.model,
       contextWindow: input.contextWindow!,
       safetyMarginTokens: input.policy.safetyMarginTokens,
+      summaryMaxOutputTokens,
+      summaryRetryMaxOutputTokens,
       summaryMaxChars: input.policy.summaryMaxChars,
       sourceMessages: sourceState.sourceMessages,
-      safetyMessage: buildContextSummarySafetyMessage(plan.safetyState),
+      safetyInstruction: buildContextSummarySafetyMessage(plan.safetyState),
       parentSummary: parentCheckpoint?.summary,
       abortSignal: input.abortSignal,
       timeoutMs: input.timeoutMs,
+      renewPreparationClaim: () => this.renewPreparationClaim(input.preparationClaim),
     });
+    const checkpointCreatedAt = this.now();
+    const checkpointUsage = {
+      id: this.createId("ctxuse"),
+      conversationId: input.conversationId,
+      runId: input.runId,
+      requestIndex: input.requestIndex,
+      purpose: "checkpoint_summary",
+      summaryInvocationCount: generatedSummary.usage.invocationCount,
+      providerId: input.providerId,
+      modelId: input.modelId,
+      contextWindow: input.contextWindow,
+      estimatedInputTokens: sumUsageBreakdown(generatedSummary.usage.breakdown),
+      estimateSource: "estimate",
+      reservedOutputTokens: generatedSummary.usage.reservedOutputTokens,
+      view: parentCheckpoint ? "checkpoint" : "raw",
+      ...(parentCheckpoint ? { checkpointId: parentCheckpoint.id } : {}),
+      breakdown: generatedSummary.usage.breakdown,
+      ...(generatedSummary.usage.providerObservation
+        ? { providerObservation: generatedSummary.usage.providerObservation }
+        : {}),
+      estimatorVersion: input.policy.estimatorVersion,
+      policyVersion: input.policy.version,
+      checkpointFormatVersion: input.policy.checkpointFormatVersion,
+      time: { created: checkpointCreatedAt },
+    } satisfies ContextUsage;
     const checkpoint: ContextCheckpoint = {
       id: this.createId("ckpt"),
       conversationId: input.conversationId,
@@ -213,11 +278,13 @@ export class ContextCompactionService {
         version: input.policy.compatibilityVersion,
       },
       generatedBy: { providerId: input.providerId, modelId: input.modelId },
-      summary,
+      summary: generatedSummary.summary,
       safetyStateVersion: plan.safetyState.version,
       budget: plan.budget,
-      time: { created: this.now() },
+      usage: checkpointUsage,
+      time: { created: checkpointCreatedAt },
     };
+    this.renewPreparationClaim(input.preparationClaim);
     const committed = this.store.commitContextCheckpoint({
       checkpoint,
       eventId: this.createId("evt"),
@@ -227,6 +294,20 @@ export class ContextCompactionService {
       ? { status: "created", checkpoint }
       : { status: "stale" };
   }
+
+  private renewPreparationClaim(preparationClaim: ContextPreparationClaim): void {
+    if (
+      !this.store.renewContextPreparationClaim(
+        preparationClaim,
+        CONTEXT_PREPARATION_CLAIM_TTL_MS,
+      )
+    ) {
+      throw new ContextPreparationLeaseLostError(
+        preparationClaim.runId,
+        preparationClaim.requestIndex,
+      );
+    }
+  }
 }
 
 interface RollingSummaryInput {
@@ -234,87 +315,334 @@ interface RollingSummaryInput {
   model: LanguageModel;
   contextWindow: number;
   safetyMarginTokens: number;
+  summaryMaxOutputTokens: number;
+  summaryRetryMaxOutputTokens: number;
   summaryMaxChars: number;
   sourceMessages: ModelMessage[];
-  safetyMessage: ModelMessage;
+  safetyInstruction: SystemModelMessage;
   parentSummary?: string;
   abortSignal?: AbortSignal;
   timeoutMs?: number;
+  renewPreparationClaim: () => void;
 }
 
-async function generateRollingSummary(input: RollingSummaryInput): Promise<string> {
-  const availableInputTokens = Math.floor(
-    input.contextWindow - 2_048 - input.safetyMarginTokens,
-  );
+interface RollingSummaryUsage {
+  invocationCount: number;
+  reservedOutputTokens: number;
+  breakdown: ContextUsageBreakdown;
+  providerObservation?: NonNullable<ContextUsage["providerObservation"]>;
+}
+
+async function generateRollingSummary(input: RollingSummaryInput): Promise<{
+  summary: string;
+  usage: RollingSummaryUsage;
+}> {
   let rollingSummary = input.parentSummary;
   const remaining = input.sourceMessages.map((message) => ({
     role: message.role,
     content: requireStringContent(message),
   }));
   let generatedAtLeastOnce = false;
+  let invocationCount = 0;
+  let reservedOutputTokens = 0;
+  const breakdown: ContextUsageBreakdown = {
+    rawTokens: 0,
+    checkpointTokens: 0,
+    safetyStateTokens: 0,
+    systemPromptTokens: 0,
+    toolSchemaTokens: 0,
+  };
+  let observedInvocationCount = 0;
+  const providerTotals: Omit<
+    NonNullable<ContextUsage["providerObservation"]>,
+    "source" | "observedInvocationCount"
+  > = {};
 
   while (remaining.length > 0 || !generatedAtLeastOnce) {
-    const fixedMessages: ModelMessage[] = [
+    const fixedInstructions: SystemModelMessage[] = [
       ...(rollingSummary === undefined
         ? []
         : [buildContextSummaryMemoryMessage(rollingSummary)]),
-      input.safetyMessage,
+      input.safetyInstruction,
     ];
-    const fixedTokens = estimateSummaryInvocationTokens(fixedMessages);
-    if (fixedTokens > availableInputTokens) {
-      throw new ContextSummaryInputBudgetError(fixedTokens, availableInputTokens);
+    let chunk = selectSummaryChunk({
+      remaining,
+      fixedInstructions,
+      contextWindow: input.contextWindow,
+      safetyMarginTokens: input.safetyMarginTokens,
+      maxOutputTokens: input.summaryMaxOutputTokens,
+    });
+    let generated = await invokeSummaryGenerator({
+      ...input,
+      fixedInstructions,
+      messages: chunk.messages,
+      maxOutputTokens: input.summaryMaxOutputTokens,
+    });
+    recordSummaryInvocation({
+      generated,
+      fixedInstructions,
+      messages: chunk.messages,
+      maxOutputTokens: input.summaryMaxOutputTokens,
+      breakdown,
+      providerTotals,
+      onObserved: () => { observedInvocationCount += 1; },
+    });
+    invocationCount += 1;
+    reservedOutputTokens += input.summaryMaxOutputTokens;
+
+    if (
+      isReasoningOnlyLengthExhaustion(generated)
+      && input.summaryRetryMaxOutputTokens > input.summaryMaxOutputTokens
+    ) {
+      chunk = selectSummaryChunk({
+        remaining,
+        fixedInstructions,
+        contextWindow: input.contextWindow,
+        safetyMarginTokens: input.safetyMarginTokens,
+        maxOutputTokens: input.summaryRetryMaxOutputTokens,
+      });
+      generated = await invokeSummaryGenerator({
+        ...input,
+        fixedInstructions,
+        messages: chunk.messages,
+        maxOutputTokens: input.summaryRetryMaxOutputTokens,
+      });
+      recordSummaryInvocation({
+        generated,
+        fixedInstructions,
+        messages: chunk.messages,
+        maxOutputTokens: input.summaryRetryMaxOutputTokens,
+        breakdown,
+        providerTotals,
+        onObserved: () => { observedInvocationCount += 1; },
+      });
+      invocationCount += 1;
+      reservedOutputTokens += input.summaryRetryMaxOutputTokens;
     }
 
-    const messages: ModelMessage[] = [...fixedMessages];
-    let usedTokens = fixedTokens;
-    while (remaining.length > 0) {
-      const next = remaining[0]!;
-      const wholeTokens = estimateSummaryMessageTokens(next.content);
-      if (usedTokens + wholeTokens <= availableInputTokens) {
-        messages.splice(messages.length - 1, 0, next as ModelMessage);
-        usedTokens += wholeTokens;
-        remaining.shift();
-        continue;
-      }
-      const contentTokenCapacity = availableInputTokens
-        - usedTokens
-        - CONTEXT_ESTIMATOR_OVERHEAD.message
-        - CONTEXT_ESTIMATOR_OVERHEAD.part;
-      if (contentTokenCapacity <= 0) break;
-      const [prefix, suffix] = splitTextByTokenCapacity(next.content, contentTokenCapacity);
-      if (prefix.length === 0) break;
-      messages.splice(messages.length - 1, 0, { role: next.role, content: prefix } as ModelMessage);
-      usedTokens += estimateSummaryMessageTokens(prefix);
-      if (suffix.length === 0) {
-        remaining.shift();
-      } else {
-        next.content = suffix;
-      }
-      break;
+    try {
+      rollingSummary = validateSummary(generated, input.summaryMaxChars);
+    } catch (error) {
+      if (!(error instanceof ContextSummaryValidationError)) throw error;
+      throw new ContextSummaryValidationError(error.message, {
+        ...error.diagnostics,
+        summaryInvocationCount: invocationCount,
+        summaryReservedOutputTokens: reservedOutputTokens,
+      });
     }
-    if (remaining.length > 0 && messages.length === fixedMessages.length) {
-      throw new ContextSummaryInputBudgetError(
-        fixedTokens + CONTEXT_ESTIMATOR_OVERHEAD.message + CONTEXT_ESTIMATOR_OVERHEAD.part + 1,
-        availableInputTokens,
-      );
-    }
+    remaining.splice(0, remaining.length, ...chunk.remaining);
+    generatedAtLeastOnce = true;
+  }
+  return {
+    summary: rollingSummary!,
+    usage: {
+      invocationCount,
+      reservedOutputTokens,
+      breakdown,
+      ...(observedInvocationCount > 0
+        ? {
+            providerObservation: {
+              source: "provider" as const,
+              observedInvocationCount,
+              ...providerTotals,
+            },
+          }
+        : {}),
+    },
+  };
+}
 
+function capSummaryOutputTokens(configured: number, modelLimit: number | undefined): number {
+  if (modelLimit === undefined) return configured;
+  if (!Number.isSafeInteger(modelLimit) || modelLimit <= 0) {
+    throw new Error("Context summary model output limit must be a positive safe integer");
+  }
+  return Math.min(configured, modelLimit);
+}
+
+function selectSummaryChunk(input: {
+  remaining: readonly { role: ModelMessage["role"]; content: string }[];
+  fixedInstructions: readonly SystemModelMessage[];
+  contextWindow: number;
+  safetyMarginTokens: number;
+  maxOutputTokens: number;
+}): {
+  messages: ModelMessage[];
+  remaining: { role: ModelMessage["role"]; content: string }[];
+} {
+  const availableInputTokens = Math.floor(
+    input.contextWindow - input.maxOutputTokens - input.safetyMarginTokens,
+  );
+  const fixedTokens = estimateSummaryInvocationTokens(input.fixedInstructions);
+  if (fixedTokens > availableInputTokens) {
+    throw new ContextSummaryInputBudgetError(fixedTokens, availableInputTokens);
+  }
+  const remaining = input.remaining.map((message) => ({ ...message }));
+  const messages: ModelMessage[] = [];
+  let usedTokens = fixedTokens;
+  while (remaining.length > 0) {
+    const next = remaining[0]!;
+    const wholeTokens = estimateSummaryMessageTokens(next.content);
+    if (usedTokens + wholeTokens <= availableInputTokens) {
+      messages.push(next as ModelMessage);
+      usedTokens += wholeTokens;
+      remaining.shift();
+      continue;
+    }
+    const contentTokenCapacity = availableInputTokens
+      - usedTokens
+      - CONTEXT_ESTIMATOR_OVERHEAD.message
+      - CONTEXT_ESTIMATOR_OVERHEAD.part;
+    if (contentTokenCapacity <= 0) break;
+    const [prefix, suffix] = splitTextByTokenCapacity(next.content, contentTokenCapacity);
+    if (prefix.length === 0) break;
+    messages.push({ role: next.role, content: prefix } as ModelMessage);
+    usedTokens += estimateSummaryMessageTokens(prefix);
+    if (suffix.length === 0) remaining.shift();
+    else next.content = suffix;
+    break;
+  }
+  if (remaining.length > 0 && messages.length === 0) {
+    throw new ContextSummaryInputBudgetError(
+      fixedTokens + CONTEXT_ESTIMATOR_OVERHEAD.message + CONTEXT_ESTIMATOR_OVERHEAD.part + 1,
+      availableInputTokens,
+    );
+  }
+  return { messages, remaining };
+}
+
+async function invokeSummaryGenerator(input: RollingSummaryInput & {
+  fixedInstructions: readonly SystemModelMessage[];
+  messages: ModelMessage[];
+  maxOutputTokens: number;
+}): Promise<Awaited<ReturnType<ContextSummaryGenerator>>> {
+  input.renewPreparationClaim();
+  assertNoSystemSummaryMessages(input.messages);
+  try {
     const generated = await input.generator({
       model: input.model,
-      system: CONTEXT_SUMMARY_SYSTEM_PROMPT,
-      messages,
-      maxOutputTokens: 2_048,
+      instructions: [
+        { role: "system", content: CONTEXT_SUMMARY_SYSTEM_PROMPT },
+        ...input.fixedInstructions,
+      ],
+      messages: [
+        ...input.messages,
+        buildContextSummaryRequestMessage(),
+      ],
+      maxOutputTokens: input.maxOutputTokens,
       abortSignal: input.abortSignal,
       timeoutMs: input.timeoutMs,
     });
-    rollingSummary = validateSummary(generated, input.summaryMaxChars);
-    generatedAtLeastOnce = true;
+    input.renewPreparationClaim();
+    return generated;
+  } catch (error) {
+    try {
+      input.renewPreparationClaim();
+    } catch {
+      // The generator's exact abort/timeout/Provider failure remains authoritative.
+    }
+    throw error;
   }
-  return rollingSummary!;
 }
 
-function estimateSummaryInvocationTokens(messages: readonly ModelMessage[]): number {
+function recordSummaryInvocation(input: {
+  generated: Awaited<ReturnType<ContextSummaryGenerator>>;
+  fixedInstructions: readonly SystemModelMessage[];
+  messages: readonly ModelMessage[];
+  maxOutputTokens: number;
+  breakdown: ContextUsageBreakdown;
+  providerTotals: Omit<
+    NonNullable<ContextUsage["providerObservation"]>,
+    "source" | "observedInvocationCount"
+  >;
+  onObserved: () => void;
+}): void {
+  input.breakdown.systemPromptTokens += estimateSummaryMessageTokens(CONTEXT_SUMMARY_SYSTEM_PROMPT);
+  input.breakdown.systemPromptTokens += estimateSummaryMessageTokens(
+    CONTEXT_SUMMARY_REQUEST_PROMPT,
+  );
+  input.breakdown.checkpointTokens += input.fixedInstructions.length > 1
+    ? estimateSummaryMessageTokens(requireStringContent(input.fixedInstructions[0]!))
+    : 0;
+  input.breakdown.safetyStateTokens += estimateSummaryMessageTokens(
+    requireStringContent(input.fixedInstructions[input.fixedInstructions.length - 1]!),
+  );
+  input.breakdown.rawTokens += input.messages.reduce(
+    (total, message) => total + estimateSummaryMessageTokens(requireStringContent(message)),
+    0,
+  );
+  const usage = input.generated.usage;
+  if (!usage) return;
+  const observedScalars = [
+    accumulateProviderUsageScalar(input.providerTotals, "inputTokens", usage.inputTokens),
+    accumulateProviderUsageScalar(input.providerTotals, "outputTokens", usage.outputTokens),
+    accumulateProviderUsageScalar(
+      input.providerTotals,
+      "reasoningTokens",
+      usage.outputTokenDetails?.reasoningTokens,
+    ),
+    accumulateProviderUsageScalar(
+      input.providerTotals,
+      "cacheReadTokens",
+      usage.inputTokenDetails?.cacheReadTokens,
+    ),
+    accumulateProviderUsageScalar(
+      input.providerTotals,
+      "cacheWriteTokens",
+      usage.inputTokenDetails?.cacheWriteTokens,
+    ),
+    accumulateProviderUsageScalar(input.providerTotals, "totalTokens", usage.totalTokens),
+  ];
+  if (observedScalars.some(Boolean)) input.onObserved();
+}
+
+function isReasoningOnlyLengthExhaustion(
+  generated: Awaited<ReturnType<ContextSummaryGenerator>>,
+): boolean {
+  return typeof generated?.text === "string"
+    && generated.text.trim().length === 0
+    && generated.finishReason === "length"
+    && (generated.usage?.outputTokenDetails?.reasoningTokens ?? 0) > 0
+    && generated.usage?.outputTokenDetails?.textTokens === 0;
+}
+
+function assertNoSystemSummaryMessages(messages: readonly ModelMessage[]): void {
+  if (messages.some((message) => message.role === "system")) {
+    throw new Error(
+      "Context summary messages must not contain system instructions",
+    );
+  }
+}
+
+function accumulateProviderUsageScalar<
+  Key extends keyof Omit<
+    NonNullable<ContextUsage["providerObservation"]>,
+    "source" | "observedInvocationCount"
+  >,
+>(
+  totals: Omit<
+    NonNullable<ContextUsage["providerObservation"]>,
+    "source" | "observedInvocationCount"
+  >,
+  key: Key,
+  value: number | undefined,
+): boolean {
+  if (typeof value !== "number") return false;
+  totals[key] = (totals[key] ?? 0) + value;
+  return true;
+}
+
+function sumUsageBreakdown(breakdown: ContextUsageBreakdown): number {
+  return breakdown.rawTokens
+    + breakdown.checkpointTokens
+    + breakdown.safetyStateTokens
+    + breakdown.systemPromptTokens
+    + breakdown.toolSchemaTokens;
+}
+
+function estimateSummaryInvocationTokens(messages: readonly SystemModelMessage[]): number {
   return estimateSummaryMessageTokens(CONTEXT_SUMMARY_SYSTEM_PROMPT)
+    + estimateSummaryMessageTokens(CONTEXT_SUMMARY_REQUEST_PROMPT)
     + messages.reduce(
       (total, message) => total + estimateSummaryMessageTokens(requireStringContent(message)),
       0,
@@ -416,27 +744,73 @@ function selectParentCheckpoint(
 }
 
 function validateSummary(
-  generated: { text: string; usage?: LanguageModelUsage },
+  generated: Awaited<ReturnType<ContextSummaryGenerator>>,
   maxBytes: number,
 ): string {
+  const diagnostics = readSummaryValidationDiagnostics(generated);
   if (!generated || typeof generated.text !== "string") {
-    throw new ContextSummaryValidationError("Context summary generator returned an invalid result");
+    throw new ContextSummaryValidationError(
+      "Context summary generator returned an invalid result",
+      diagnostics,
+    );
   }
   const rawSummary = generated.text.trim();
   if (rawSummary.length === 0) {
-    throw new ContextSummaryValidationError("Context summary generator returned blank output");
+    throw new ContextSummaryValidationError(
+      "Context summary generator returned blank output",
+      diagnostics,
+    );
   }
   if (!hasValidUtf16(rawSummary)) {
-    throw new ContextSummaryValidationError("Context summary generator returned invalid Unicode");
+    throw new ContextSummaryValidationError(
+      "Context summary generator returned invalid Unicode",
+      diagnostics,
+    );
   }
   const summary = sanitizeContextSummaryText(rawSummary).trim();
   if (summary.length === 0 || !hasMeaningfulSummaryContent(summary)) {
-    throw new ContextSummaryValidationError("Context summary generator returned blank output");
+    throw new ContextSummaryValidationError(
+      "Context summary generator returned blank output",
+      diagnostics,
+    );
   }
   if (Buffer.byteLength(summary, "utf8") > maxBytes) {
-    throw new ContextSummaryValidationError("Context summary generator output exceeds the configured limit");
+    throw new ContextSummaryValidationError(
+      "Context summary generator output exceeds the configured limit",
+      diagnostics,
+    );
   }
   return summary;
+}
+
+function readSummaryValidationDiagnostics(
+  generated: Awaited<ReturnType<ContextSummaryGenerator>>,
+): ContextSummaryValidationDiagnostics {
+  if (!generated || typeof generated !== "object") return {};
+  const usage = generated.usage;
+  return {
+    ...(generated.finishReason === undefined
+      ? {}
+      : { finishReason: generated.finishReason }),
+    ...(isSafeTokenCount(usage?.inputTokens)
+      ? { inputTokens: usage.inputTokens }
+      : {}),
+    ...(isSafeTokenCount(usage?.outputTokens)
+      ? { outputTokens: usage.outputTokens }
+      : {}),
+    ...(isSafeTokenCount(usage?.outputTokenDetails?.textTokens)
+      ? { textTokens: usage.outputTokenDetails.textTokens }
+      : {}),
+    ...(isSafeTokenCount(usage?.outputTokenDetails?.reasoningTokens)
+      ? { reasoningTokens: usage.outputTokenDetails.reasoningTokens }
+      : {}),
+  };
+}
+
+function isSafeTokenCount(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= 0;
 }
 
 function hasMeaningfulSummaryContent(value: string): boolean {

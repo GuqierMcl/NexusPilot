@@ -71,7 +71,7 @@ export interface RunRouteDeps {
   getToolApprovalPolicy?: () => RuntimeToolApprovalPolicy;
   getNetworkPolicy?: () => RuntimeNetworkPolicy;
   attachmentService?: RuntimeAttachmentService | null;
-  contextManager?: Pick<ModelContextManager, "prepare">;
+  contextManager?: Pick<ModelContextManager, "prepare" | "forecastNextTurn">;
 }
 
 export function runRoutes(deps: RunRouteDeps) {

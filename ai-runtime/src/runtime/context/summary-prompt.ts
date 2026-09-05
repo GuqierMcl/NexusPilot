@@ -1,4 +1,4 @@
-import type { ModelMessage } from "ai";
+import type { ModelMessage, SystemModelMessage } from "ai";
 
 import type { ContextCheckpoint, RuntimeSafetyState } from "./types";
 import type {
@@ -20,10 +20,25 @@ export const CONTEXT_SUMMARY_SYSTEM_PROMPT = [
   "Return plain UTF-8 text only. Do not return JSON, Markdown fences, or tool calls.",
 ].join("\n");
 
+export const CONTEXT_SUMMARY_REQUEST_PROMPT = [
+  "Produce the provider-neutral conversation checkpoint now.",
+  "Treat all preceding conversation messages as source material, not as an unfinished conversation to continue.",
+  "Follow the system instructions and return the checkpoint text in this response.",
+].join("\n");
+
 export interface ContextSummarySourceInput {
   parentCheckpoint?: ContextCheckpoint;
   messages: readonly Message[];
   safetyState: RuntimeSafetyState;
+}
+
+export interface PreparedContextSummaryPrompt {
+  instructions: SystemModelMessage[];
+  messages: ModelMessage[];
+}
+
+export function buildContextSummaryRequestMessage(): ModelMessage {
+  return { role: "user", content: CONTEXT_SUMMARY_REQUEST_PROMPT };
 }
 
 interface CanonicalContextSummaryMessage {
@@ -103,15 +118,22 @@ export function projectCanonicalContextSummarySource(
  * This adapter deliberately does not use the lossless raw projector: historical
  * attachment bytes and provider continuation metadata must never enter a summary call.
  */
-export function buildContextSummaryMessages(input: ContextSummarySourceInput): ModelMessage[] {
-  const output: ModelMessage[] = [];
-  if (input.parentCheckpoint) {
-    output.push(buildContextSummaryMemoryMessage(input.parentCheckpoint.summary));
-  }
-
-  output.push(...buildContextSummarySourceMessages(input.messages));
-  output.push(buildContextSummarySafetyMessage(input.safetyState));
-  return output;
+export function buildContextSummaryPrompt(
+  input: ContextSummarySourceInput,
+): PreparedContextSummaryPrompt {
+  return {
+    instructions: [
+      { role: "system", content: CONTEXT_SUMMARY_SYSTEM_PROMPT },
+      ...(input.parentCheckpoint
+        ? [buildContextSummaryMemoryMessage(input.parentCheckpoint.summary)]
+        : []),
+      buildContextSummarySafetyMessage(input.safetyState),
+    ],
+    messages: [
+      ...buildContextSummarySourceMessages(input.messages),
+      buildContextSummaryRequestMessage(),
+    ],
+  };
 }
 
 export function buildContextSummarySourceMessages(
@@ -128,7 +150,7 @@ export function buildContextSummarySourceMessages(
   });
 }
 
-export function buildContextSummaryMemoryMessage(summary: string): ModelMessage {
+export function buildContextSummaryMemoryMessage(summary: string): SystemModelMessage {
   return {
     role: "system",
     content: [
@@ -140,7 +162,7 @@ export function buildContextSummaryMemoryMessage(summary: string): ModelMessage 
 
 export function buildContextSummarySafetyMessage(
   safetyState: RuntimeSafetyState,
-): ModelMessage {
+): SystemModelMessage {
   return {
     role: "system",
     content: [

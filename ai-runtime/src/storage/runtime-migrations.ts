@@ -813,4 +813,25 @@ export const RUNTIME_MIGRATIONS: RuntimeMigration[] = [
         ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 1;
     `,
   },
+  {
+    id: "0013_runtime_context_diagnostics",
+    description: "Persist safe context checkpoint and preparation diagnostics",
+    sql: `
+      CREATE TABLE runtime_context_diagnostics (
+        id TEXT PRIMARY KEY,
+        code TEXT NOT NULL,
+        conversation_id TEXT,
+        checkpoint_id TEXT,
+        run_id TEXT,
+        reason TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX idx_runtime_context_diagnostics_conversation
+        ON runtime_context_diagnostics(conversation_id, created_at, id);
+      CREATE INDEX idx_runtime_context_diagnostics_checkpoint
+        ON runtime_context_diagnostics(checkpoint_id, created_at, id);
+    `,
+  },
 ];

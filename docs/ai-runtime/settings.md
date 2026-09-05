@@ -6,6 +6,8 @@
 
 当前开放两类 Runtime-owned 偏好：工具自动审批阈值和 web 工具的网络访问范围。
 
+上下文压缩阈值、目标比例、估算器版本、summary 首次/重试预算与 checkpoint 格式目前不是用户设置。它们由版本化 `ContextCompactionPolicy` 集中定义，并与当前 Provider/model 的 `contextLength`、output length 共同形成每次请求的预算快照；Frontend 不保存或覆盖这些值。未来若开放用户主动压缩入口，它只选择 `trigger: "manual"`，仍调用同一个 `ContextCompactionService`，不会获得另一套阈值、prompt、Safety State 或 checkpoint schema。system prompt、agent mode/tool schema、Provider/model 或 estimator/policy 变化会使下一轮 forecast 进入新的重算域，因此主上下文值可以带原因重新计算，而不是强行沿用旧域的单调值。
+
 ```ts
 type AutoApproveMaxRisk = "none" | "low" | "medium";
 ```

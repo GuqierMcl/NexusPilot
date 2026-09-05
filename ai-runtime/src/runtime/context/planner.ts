@@ -27,6 +27,7 @@ import {
 import type {
   ContextBudgetSnapshot,
   ContextCheckpoint,
+  ContextCheckpointRejection,
   ContextPlan,
   ContextPlannerInput,
   RuntimeSafetyState,
@@ -58,6 +59,51 @@ export function computeContextLineageHash(
   return `sha256:${createHash("sha256").update(payload).digest("hex")}`;
 }
 
+export function isContextCheckpointParentChainUsable(
+  checkpoint: ContextCheckpoint,
+  checkpointsById: ReadonlyMap<string, ContextCheckpoint>,
+  lineageRuns: readonly Run[],
+): boolean {
+  const coverageIndices = new Map(
+    lineageRuns.map((run, index) => [run.id, index] as const),
+  );
+  let child = checkpoint;
+  let childCoverageIndex = coverageIndices.get(child.coverageThroughRunId);
+  const visited = new Set<string>([checkpoint.id]);
+
+  while (child.parentCheckpointId) {
+    const parent = checkpointsById.get(child.parentCheckpointId);
+    if (!parent || visited.has(parent.id)) return false;
+    visited.add(parent.id);
+
+    if (
+      parent.conversationId !== checkpoint.conversationId
+      || parent.formatVersion !== CONTEXT_CHECKPOINT_FORMAT_VERSION
+      || parent.compatibility.kind !== PROVIDER_NEUTRAL_CONTEXT_KIND
+      || parent.compatibility.version !== CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION
+      || parent.safetyStateVersion !== RUNTIME_SAFETY_STATE_VERSION
+    ) {
+      return false;
+    }
+
+    const parentCoverageIndex = coverageIndices.get(parent.coverageThroughRunId);
+    if (
+      childCoverageIndex === undefined
+      || parentCoverageIndex === undefined
+      || parentCoverageIndex >= childCoverageIndex
+      || computeContextLineageHash(lineageRuns, parent.coverageThroughRunId)
+        !== parent.lineageHash
+    ) {
+      return false;
+    }
+
+    child = parent;
+    childCoverageIndex = parentCoverageIndex;
+  }
+
+  return true;
+}
+
 interface ResolvedContextLineage {
   runs: Run[];
   messagesByRun: Map<RunId, [UserMessage, AssistantMessage]>;
@@ -72,6 +118,10 @@ interface CheckpointCandidate {
   checkpointTokens: number;
   contentTokens: number;
 }
+
+type CheckpointCandidateEvaluation =
+  | { candidate: CheckpointCandidate }
+  | { rejection: ContextCheckpointRejection };
 
 export type ContextPlanningErrorCode =
   "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY";
@@ -91,6 +141,7 @@ export function computeContextPlanRequestHash(
     | "providerId"
     | "modelId"
     | "contextWindow"
+    | "modelOutputLimit"
     | "reservedOutputTokens"
     | "systemPrompt"
     | "toolSchemas"
@@ -108,6 +159,7 @@ export function computeContextPlanRequestHash(
     providerId: input.providerId,
     modelId: input.modelId,
     contextWindow: input.contextWindow,
+    modelOutputLimit: input.modelOutputLimit,
     reservedOutputTokens: input.reservedOutputTokens,
     systemPrompt: input.systemPrompt,
     toolSchemas: input.toolSchemas,
@@ -192,20 +244,26 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
 
   const safeCoverageIndices = findSafeCoverageIndices(input, lineage.runs);
   const targetTokens = rawBudget.targetTokens ?? Number.NEGATIVE_INFINITY;
-  const candidates = input.trigger === "provider_overflow"
+  const checkpointsById = new Map(
+    input.snapshot.checkpoints.map((checkpoint) => [checkpoint.id, checkpoint] as const),
+  );
+  const evaluatedCheckpoints = input.trigger === "provider_overflow"
     ? []
-    : input.snapshot.checkpoints
-    .map((checkpoint) => createCheckpointCandidate(
+    : input.snapshot.checkpoints.map((checkpoint) => evaluateCheckpointCandidate(
       checkpoint,
+      checkpointsById,
       input,
       lineage,
       safeCoverageIndices,
       safetyStateTokens,
       retainedModelInputTokens,
-    ))
-    .filter((candidate): candidate is CheckpointCandidate =>
-      candidate !== null && candidate.contentTokens <= targetTokens,
-    )
+      targetTokens,
+    ));
+  const evaluatedRejections = evaluatedCheckpoints
+    .flatMap((evaluation) => "rejection" in evaluation ? [evaluation.rejection] : [])
+    .sort((left, right) => left.checkpointId.localeCompare(right.checkpointId));
+  const candidates = evaluatedCheckpoints
+    .flatMap((evaluation) => "candidate" in evaluation ? [evaluation.candidate] : [])
     .sort((left, right) =>
       right.coverageIndex - left.coverageIndex
       || left.contentTokens - right.contentTokens
@@ -213,6 +271,7 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
       || left.checkpoint.id.localeCompare(right.checkpoint.id),
     );
   const selected = candidates[0];
+  const checkpointRejections = evaluatedRejections;
   if (selected) {
     return createPlan(input, {
       lineageRunIds,
@@ -229,6 +288,7 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
         checkpointTokens: selected.checkpointTokens,
         safetyStateTokens,
       }),
+      checkpointRejections,
     });
   }
 
@@ -242,6 +302,7 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
         reason: "raw_compaction_blocked",
         safetyState,
         budget: rawBudget,
+        checkpointRejections,
       });
     }
     throw new ContextPlanningError(
@@ -256,6 +317,7 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
     eligibleCoverageThroughRunId: lineage.runs[eligibleCoverageIndex]!.id,
     safetyState,
     budget: rawBudget,
+    checkpointRejections,
   });
 }
 
@@ -272,6 +334,12 @@ function assertPlannerInput(input: ContextPlannerInput): void {
   }
   if (!isNonnegativeInteger(input.reservedOutputTokens)) {
     throw new Error("Context planner reservedOutputTokens must be a non-negative safe integer");
+  }
+  if (
+    input.modelOutputLimit !== undefined
+    && (!Number.isSafeInteger(input.modelOutputLimit) || input.modelOutputLimit <= 0)
+  ) {
+    throw new Error("Context planner modelOutputLimit must be a positive safe integer");
   }
   if (
     input.retainedModelInput !== undefined
@@ -302,6 +370,8 @@ function assertPlannerInput(input: ContextPlannerInput): void {
     || policy.minRawRuns < 1
     || !isNonnegativeInteger(policy.safetyMarginTokens)
     || !isNonnegativeInteger(policy.summaryMaxOutputTokens)
+    || !isNonnegativeInteger(policy.summaryRetryMaxOutputTokens)
+    || policy.summaryRetryMaxOutputTokens < policy.summaryMaxOutputTokens
     || !isNonnegativeInteger(policy.summaryMaxChars)
   ) {
     throw new Error("Context compaction policy is invalid");
@@ -398,6 +468,34 @@ function createBudget(
         softTriggerTokens: Math.floor(estimates.contextWindow * input.policy.softTriggerRatio - fixed),
         targetTokens: Math.floor(estimates.contextWindow * input.policy.targetRatio - fixed),
       };
+  const summaryMaxOutputTokens = Math.min(
+    input.policy.summaryMaxOutputTokens,
+    input.modelOutputLimit ?? input.policy.summaryMaxOutputTokens,
+  );
+  const summaryRetryMaxOutputTokens = Math.min(
+    input.policy.summaryRetryMaxOutputTokens,
+    input.modelOutputLimit ?? input.policy.summaryRetryMaxOutputTokens,
+  );
+  const summaryInputBudgets = estimates.contextWindow === undefined
+    ? {}
+    : {
+        summaryMaxInputTokens: Math.max(
+          0,
+          Math.floor(
+            estimates.contextWindow
+            - input.policy.safetyMarginTokens
+            - summaryMaxOutputTokens,
+          ),
+        ),
+        summaryRetryMaxInputTokens: Math.max(
+          0,
+          Math.floor(
+            estimates.contextWindow
+            - input.policy.safetyMarginTokens
+            - summaryRetryMaxOutputTokens,
+          ),
+        ),
+      };
   return {
     providerId: input.providerId,
     modelId: input.modelId,
@@ -416,6 +514,9 @@ function createBudget(
       + estimates.rawHistoryTokens
       + estimates.checkpointTokens
       + estimates.safetyStateTokens,
+    summaryMaxOutputTokens,
+    summaryRetryMaxOutputTokens,
+    ...summaryInputBudgets,
   };
 }
 
@@ -439,38 +540,55 @@ function findSafeCoverageIndices(input: ContextPlannerInput, runs: readonly Run[
   return safe;
 }
 
-function createCheckpointCandidate(
+function evaluateCheckpointCandidate(
   checkpoint: ContextCheckpoint,
+  checkpointsById: ReadonlyMap<string, ContextCheckpoint>,
   input: ContextPlannerInput,
   lineage: ResolvedContextLineage,
   safeCoverageIndices: readonly number[],
   safetyStateTokens: number,
   retainedModelInputTokens: number,
-): CheckpointCandidate | null {
+  targetTokens: number,
+): CheckpointCandidateEvaluation {
+  const reject = (
+    reason: ContextCheckpointRejection["reason"],
+  ): CheckpointCandidateEvaluation => ({
+    rejection: { checkpointId: checkpoint.id, reason },
+  });
+  if (checkpoint.conversationId !== input.snapshot.conversation.id) {
+    return reject("coverage_not_active_ancestor");
+  }
+  if (checkpoint.formatVersion !== CONTEXT_CHECKPOINT_FORMAT_VERSION) {
+    return reject("unsupported_format");
+  }
   if (
-    checkpoint.conversationId !== input.snapshot.conversation.id
-    || checkpoint.formatVersion !== CONTEXT_CHECKPOINT_FORMAT_VERSION
-    || checkpoint.compatibility.kind !== PROVIDER_NEUTRAL_CONTEXT_KIND
+    checkpoint.compatibility.kind !== PROVIDER_NEUTRAL_CONTEXT_KIND
     || checkpoint.compatibility.version !== CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION
     || checkpoint.safetyStateVersion !== RUNTIME_SAFETY_STATE_VERSION
   ) {
-    return null;
+    return reject("unsupported_compatibility");
   }
   const coverageIndex = lineage.runs.findIndex(
     (run) => run.id === checkpoint.coverageThroughRunId,
   );
+  if (coverageIndex < 0) {
+    return reject("coverage_not_active_ancestor");
+  }
+  const rawRuns = lineage.runs.slice(coverageIndex + 1);
+  if (rawRuns.length < input.policy.minRawRuns) {
+    return reject("raw_tail_too_short");
+  }
   if (!safeCoverageIndices.includes(coverageIndex)) {
-    return null;
+    return reject("unsafe_coverage_boundary");
   }
   if (
     computeContextLineageHash(lineage.runs, checkpoint.coverageThroughRunId)
     !== checkpoint.lineageHash
   ) {
-    return null;
+    return reject("lineage_hash_mismatch");
   }
-  const rawRuns = lineage.runs.slice(coverageIndex + 1);
-  if (rawRuns.length < input.policy.minRawRuns) {
-    return null;
+  if (!isContextCheckpointParentChainUsable(checkpoint, checkpointsById, lineage.runs)) {
+    return reject("dangling_parent");
   }
   const rawMessages = messagesForRuns(
     lineage,
@@ -481,7 +599,7 @@ function createCheckpointCandidate(
   const checkpointTokens = CONTEXT_ESTIMATOR_OVERHEAD.message
     + CONTEXT_ESTIMATOR_OVERHEAD.part
     + estimateTextTokens(checkpoint.summary);
-  return {
+  const candidate: CheckpointCandidate = {
     checkpoint,
     coverageIndex,
     rawRuns,
@@ -490,6 +608,9 @@ function createCheckpointCandidate(
     checkpointTokens,
     contentTokens: rawTokens + checkpointTokens + safetyStateTokens,
   };
+  return candidate.contentTokens <= targetTokens
+    ? { candidate }
+    : reject("target_budget_exceeded");
 }
 
 function createPlan(
@@ -503,6 +624,7 @@ function createPlan(
     eligibleCoverageThroughRunId?: RunId;
     safetyState: RuntimeSafetyState;
     budget: ContextBudgetSnapshot;
+    checkpointRejections?: ContextCheckpointRejection[];
   },
 ): ContextPlan {
   const rawRunIds = selection.rawRuns.map((run) => run.id);
@@ -530,6 +652,7 @@ function createPlan(
     safetyStateHash: selection.safetyState.hash,
     requestHash,
     budget: selection.budget,
+    checkpointRejections: selection.checkpointRejections,
   };
   return {
     id: input.planId,
@@ -549,6 +672,9 @@ function createPlan(
     ...(rawRange ? { rawRange } : {}),
     ...(selection.eligibleCoverageThroughRunId
       ? { eligibleCoverageThroughRunId: selection.eligibleCoverageThroughRunId }
+      : {}),
+    ...(selection.checkpointRejections?.length
+      ? { checkpointRejections: selection.checkpointRejections }
       : {}),
     safetyState: selection.safetyState,
     budget: selection.budget,

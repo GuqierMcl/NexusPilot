@@ -491,6 +491,10 @@ describe("pure context window planner", () => {
     expect(planned.view).toBe("raw");
     expect(planned.reason).toBe("compaction_required");
     expect(planned.checkpointId).toBeUndefined();
+    expect(planned.checkpointRejections).toEqual([{
+      checkpointId: "ckpt_future_compatibility",
+      reason: "unsupported_compatibility",
+    }]);
   });
 
   test.each([undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
@@ -585,9 +589,23 @@ describe("pure context window planner", () => {
       formatVersion: "99",
       created: 300,
     });
+    const danglingParent = {
+      ...checkpoint(fixture, {
+        id: "ckpt_dangling_parent",
+        coverageThroughRunId: "run_c",
+        created: 350,
+      }),
+      parentCheckpointId: "ckpt_missing_parent" as const,
+    };
+    const overBudget = checkpoint(fixture, {
+      id: "ckpt_over_budget",
+      coverageThroughRunId: "run_c",
+      summary: "z".repeat(20_000),
+      created: 360,
+    });
     const planned = runtime.planContextWindow(
       plannerInput(fixture, {
-        checkpoints: [badHash, unknownFormat, earlierValid, valid],
+        checkpoints: [badHash, unknownFormat, danglingParent, overBudget, earlierValid, valid],
       }),
     );
 
@@ -597,6 +615,114 @@ describe("pure context window planner", () => {
     expect(planned.rawRunIds).toEqual(["run_d", "run_e"]);
     expect(planned.budget.checkpointTokens).toBeGreaterThan(0);
     expect(planned.budget.estimatedInputTokens).toBeLessThanOrEqual(planned.budget.targetTokens!);
+    expect(planned.checkpointRejections).toEqual([
+      { checkpointId: "ckpt_bad_hash", reason: "lineage_hash_mismatch" },
+      { checkpointId: "ckpt_dangling_parent", reason: "dangling_parent" },
+      { checkpointId: "ckpt_earlier_valid", reason: "target_budget_exceeded" },
+      { checkpointId: "ckpt_over_budget", reason: "target_budget_exceeded" },
+      { checkpointId: "ckpt_unknown", reason: "unsupported_format" },
+    ]);
+  });
+
+  test("rejects a supported checkpoint whose parent chain is not usable", () => {
+    const fixture = history(["a", "b", "c", "d", "e"], { longThrough: 3 });
+    const unsupportedParent = checkpoint(fixture, {
+      id: "ckpt_unsupported_parent",
+      coverageThroughRunId: "run_b",
+      formatVersion: "future-9",
+      created: 100,
+    });
+    const child = {
+      ...checkpoint(fixture, {
+        id: "ckpt_child_of_unsupported",
+        coverageThroughRunId: "run_c",
+        created: 200,
+      }),
+      parentCheckpointId: unsupportedParent.id,
+    } satisfies ContextCheckpoint;
+
+    const planned = runtime.planContextWindow(
+      plannerInput(fixture, { checkpoints: [child, unsupportedParent] }),
+    );
+
+    expect(planned.view).toBe("raw");
+    expect(planned.reason).toBe("compaction_required");
+    expect(planned.checkpointRejections).toEqual([
+      { checkpointId: "ckpt_child_of_unsupported", reason: "dangling_parent" },
+      { checkpointId: "ckpt_unsupported_parent", reason: "unsupported_format" },
+    ]);
+  });
+
+  test("rejects later, wrong-branch, and cyclic checkpoint parent chains", () => {
+    const fixture = history(["a", "b", "c", "d", "e"], { longThrough: 3 });
+    const laterParent = checkpoint(fixture, {
+      id: "ckpt_later_parent",
+      coverageThroughRunId: "run_c",
+      created: 100,
+    });
+    const childBeforeParent = {
+      ...checkpoint(fixture, {
+        id: "ckpt_child_before_parent",
+        coverageThroughRunId: "run_b",
+        created: 200,
+      }),
+      parentCheckpointId: laterParent.id,
+    } satisfies ContextCheckpoint;
+    const laterPlan = runtime.planContextWindow(
+      plannerInput(fixture, { checkpoints: [childBeforeParent, laterParent] }),
+    );
+    expect(laterPlan.checkpointId).toBe(laterParent.id);
+    expect(laterPlan.checkpointRejections).toContainEqual({
+      checkpointId: childBeforeParent.id,
+      reason: "dangling_parent",
+    });
+
+    const wrongBranchParent = checkpoint(fixture, {
+      id: "ckpt_wrong_branch_parent",
+      coverageThroughRunId: "run_x",
+      created: 100,
+    });
+    const childOfWrongBranch = {
+      ...checkpoint(fixture, {
+        id: "ckpt_child_of_wrong_branch",
+        coverageThroughRunId: "run_c",
+        created: 200,
+      }),
+      parentCheckpointId: wrongBranchParent.id,
+    } satisfies ContextCheckpoint;
+    const wrongBranchPlan = runtime.planContextWindow(
+      plannerInput(fixture, { checkpoints: [childOfWrongBranch, wrongBranchParent] }),
+    );
+    expect(wrongBranchPlan.view).toBe("raw");
+    expect(wrongBranchPlan.checkpointRejections).toEqual([
+      { checkpointId: childOfWrongBranch.id, reason: "dangling_parent" },
+      { checkpointId: wrongBranchParent.id, reason: "coverage_not_active_ancestor" },
+    ]);
+
+    const cycleA = {
+      ...checkpoint(fixture, {
+        id: "ckpt_cycle_a",
+        coverageThroughRunId: "run_b",
+        created: 100,
+      }),
+      parentCheckpointId: "ckpt_cycle_b",
+    } satisfies ContextCheckpoint;
+    const cycleB = {
+      ...checkpoint(fixture, {
+        id: "ckpt_cycle_b",
+        coverageThroughRunId: "run_a",
+        created: 200,
+      }),
+      parentCheckpointId: "ckpt_cycle_a",
+    } satisfies ContextCheckpoint;
+    const cyclePlan = runtime.planContextWindow(
+      plannerInput(fixture, { checkpoints: [cycleB, cycleA] }),
+    );
+    expect(cyclePlan.view).toBe("raw");
+    expect(cyclePlan.checkpointRejections).toEqual([
+      { checkpointId: cycleA.id, reason: "dangling_parent" },
+      { checkpointId: cycleB.id, reason: "dangling_parent" },
+    ]);
   });
 
   test("rejects an old-branch checkpoint and rehydrates a short active branch as raw", () => {
@@ -641,6 +767,57 @@ describe("pure context window planner", () => {
     expect(planned.reason).toBe("compaction_required");
     expect(planned.eligibleCoverageThroughRunId).toBe("run_c");
     expect(planned.rawRunIds).toEqual(["run_a", "run_b", "run_c", "run_d", "run_e"]);
+  });
+
+  test("advances safe coverage across a failed Run with terminal Assistant facts and no Run output", () => {
+    const fixture = history(["a", "b", "c", "d", "e"], { longThrough: 4 });
+    const failedRun = fixture.runs.find((run) => run.id === "run_b")!;
+    const failedAssistant = fixture.messages.find(
+      (message): message is AssistantMessage =>
+        message.role === "assistant" && message.runId === failedRun.id,
+    )!;
+    const error = {
+      name: "AI_RetryError",
+      data: { message: "Failed after 3 attempts. Last error: Too Many Requests" },
+    } as const;
+    const toolPart: ToolPart = {
+      id: "part_failed_terminal_tool",
+      conversationId: fixture.conversation.id,
+      messageId: failedAssistant.id,
+      type: "tool",
+      toolCallId: "tool_failed_terminal",
+      toolName: "connection.open",
+      state: completedToolState(),
+    };
+    failedRun.status = "failed";
+    failedRun.finish = "error";
+    failedRun.error = error;
+    delete failedRun.output;
+    failedAssistant.status = { type: "error", error };
+    failedAssistant.finish = "error";
+    failedAssistant.error = error;
+    failedAssistant.parts.push(toolPart);
+
+    const input = plannerInput(fixture);
+    input.snapshot.toolCalls = [
+      {
+        id: toolPart.toolCallId,
+        conversationId: fixture.conversation.id,
+        runId: failedRun.id,
+        messageId: failedAssistant.id,
+        partId: toolPart.id,
+        toolName: toolPart.toolName,
+        input: {},
+        state: "completed",
+        result: { ok: true, summary: "Connection opened", data: {} },
+        time: { created: 10, started: 10, completed: 11 },
+      },
+    ];
+
+    const planned = runtime.planContextWindow(input);
+
+    expect(planned.reason).toBe("compaction_required");
+    expect(planned.eligibleCoverageThroughRunId).toBe("run_c");
   });
 
   test("sends soft-triggered raw context when the minimum raw tail leaves no boundary", () => {
