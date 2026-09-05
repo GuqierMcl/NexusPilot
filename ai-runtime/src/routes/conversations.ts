@@ -4,6 +4,7 @@ import {
   createRuntimeId,
   parseMessageHistoryFormat,
   parseMessageHistoryView,
+  buildActiveHistoryContextMetadata,
   projectConversationSummary,
   projectMessageHistory,
   projectRunSnapshot,
@@ -19,6 +20,10 @@ import {
   type InterruptStoredRunResult,
   type Message,
   type Run,
+  type TraceEvent,
+  type ContextCheckpoint,
+  type ContextPlan,
+  type ContextUsage,
   type RuntimeRunInterruptStore,
   type PreparedToolInvocationRegistry,
 } from "../runtime";
@@ -37,6 +42,10 @@ export interface RuntimeConversationReadStore {
   listTranscriptMessages(conversationId: ConversationId): Message[];
   listActiveLineageMessages(conversationId: ConversationId): Message[];
   listRunsByConversation(conversationId: ConversationId): Run[];
+  listContextCheckpoints(conversationId: ConversationId): ContextCheckpoint[];
+  listContextPlansByRun(runId: Run["id"]): ContextPlan[];
+  listContextUsagesByRun(runId: Run["id"]): ContextUsage[];
+  listTraces(runId: Run["id"]): TraceEvent[];
   appendEvent(event: Event): void;
 }
 
@@ -396,7 +405,13 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
         revision: conversation.revision,
         view,
         format,
-        messages: projectMessageHistory(messages, format),
+        messages: projectMessageHistory(
+          messages,
+          format,
+          view === "active" && format === "ai_sdk"
+            ? buildActiveHistoryContextMetadata(messages, store)
+            : undefined,
+        ),
         ...(view === "transcript"
           ? {
               runs: store

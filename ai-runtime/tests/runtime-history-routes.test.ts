@@ -25,8 +25,8 @@ function config() {
   };
 }
 
-async function createAppWithHistoryFixtures() {
-  const db = openRuntimeDatabase(":memory:");
+async function createAppWithHistoryFixtures(databasePath = ":memory:") {
+  const db = openRuntimeDatabase(databasePath);
   const store = new RuntimeSqliteStore(db);
 
   const conversation: Conversation = {
@@ -480,6 +480,307 @@ describe("runtime history routes", () => {
       parts: [{ type: "text", text: "Recovered answer" }],
     });
 
+    db.close();
+  });
+
+  test("restores the latest active ContextUsage on its owning Assistant without altering active history identity", async () => {
+    const { app, db, store } = await createAppWithHistoryFixtures();
+    store.saveContextUsage({
+      id: "ctxuse_history",
+      conversationId: "conv_history",
+      runId: "run_history",
+      requestIndex: 0,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      contextWindow: 1000,
+      estimatedInputTokens: 440,
+      estimateSource: "estimate",
+      reservedOutputTokens: 120,
+      view: "raw",
+      breakdown: {
+        rawTokens: 400,
+        checkpointTokens: 0,
+        safetyStateTokens: 0,
+        systemPromptTokens: 20,
+        toolSchemaTokens: 20,
+      },
+      providerObservation: { source: "provider", inputTokens: 430 },
+      estimatorVersion: "test",
+      policyVersion: "test",
+      checkpointFormatVersion: "test",
+      time: { created: 10 },
+    });
+
+    const response = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_history/messages?format=ai_sdk",
+    ));
+    const body = await response.json() as {
+      active_head_run_id?: string;
+      revision: number;
+      messages: Array<{ id: string; metadata?: Record<string, unknown> }>;
+    };
+    const assistant = body.messages.find((message) => message.id === "msg_assistant");
+
+    expect(response.status).toBe(200);
+    expect(body.active_head_run_id).toBe("run_history");
+    expect(body.revision).toBe(1);
+    expect(assistant?.metadata).toMatchObject({
+      custom: {
+        nexus: {
+          contextUsage: {
+            contextWindow: 1000,
+            estimatedInputTokens: 440,
+            providerInputTokens: 430,
+            reservedOutputTokens: 120,
+            activeTokens: 550,
+            source: "provider",
+            view: "raw",
+          },
+        },
+      },
+    });
+    expect(body.messages.find((message) => message.id === "msg_user")?.metadata)
+      .not.toMatchObject({ custom: { nexus: { contextUsage: expect.anything() } } });
+
+    db.close();
+  });
+
+  test("reopens the checkpoint-producing marker unchanged after later usage selects it", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "nexuspilot-history-context-"));
+    const databasePath = join(directory, "runtime.sqlite");
+    let db: ReturnType<typeof openRuntimeDatabase> | undefined;
+    try {
+      const first = await createAppWithHistoryFixtures(databasePath);
+      db = first.db;
+      const budget = {
+        providerId: "openai",
+        modelId: "gpt-4o",
+        contextWindow: 1000,
+        reservedOutputTokens: 120,
+        safetyMarginTokens: 20,
+        systemPromptTokens: 20,
+        toolSchemaTokens: 20,
+        hardInputBudget: 840,
+        softTriggerTokens: 700,
+        targetTokens: 500,
+        rawHistoryTokens: 820,
+        checkpointTokens: 340,
+        safetyStateTokens: 20,
+        estimatedInputTokens: 400,
+      };
+      const checkpoint = {
+        id: "ckpt_history",
+        conversationId: "conv_history",
+        coverageThroughRunId: "run_history",
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 1,
+        lineageHash: `sha256:${"1".repeat(64)}`,
+        sourceStateHash: `sha256:${"2".repeat(64)}`,
+        safetyStateHash: `sha256:${"3".repeat(64)}`,
+        trigger: "auto_pre_turn",
+        formatVersion: "1",
+        compatibility: { kind: "provider-neutral-text", version: 1 },
+        generatedBy: { providerId: "openai", modelId: "gpt-4o" },
+        summary: "MUST_NOT_APPEAR",
+        safetyStateVersion: "1",
+        budget,
+        time: { created: 100 },
+      };
+      const plan = (requestIndex: number) => ({
+        id: `ctxplan_history_${requestIndex}`,
+        conversationId: "conv_history",
+        runId: "run_history",
+        requestIndex,
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 1,
+        trigger: "auto_pre_turn",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        view: "checkpoint",
+        reason: "checkpoint_selected",
+        checkpointId: "ckpt_history",
+        lineageRunIds: ["run_history"],
+        rawRunIds: [],
+        safetyState: {
+          version: "1",
+          conversationId: "conv_history",
+          effects: [],
+          permissions: [],
+          hash: `sha256:${"4".repeat(64)}`,
+        },
+        budget: { ...budget, estimatedInputTokens: requestIndex === 1 ? 400 : 480 },
+        requestHash: `sha256:${String(requestIndex).repeat(64)}`,
+        viewHash: `sha256:${String(requestIndex + 2).repeat(64)}`,
+        time: { created: 100 + requestIndex },
+      });
+      const usage = (requestIndex: number) => ({
+        id: `ctxuse_history_${requestIndex}`,
+        conversationId: "conv_history",
+        runId: "run_history",
+        requestIndex,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        contextWindow: 1000,
+        estimatedInputTokens: requestIndex === 1 ? 400 : 480,
+        estimateSource: "estimate",
+        reservedOutputTokens: 120,
+        view: "checkpoint",
+        checkpointId: "ckpt_history",
+        breakdown: {
+          rawTokens: 0,
+          checkpointTokens: requestIndex === 1 ? 340 : 420,
+          safetyStateTokens: 20,
+          systemPromptTokens: 20,
+          toolSchemaTokens: 20,
+        },
+        estimatorVersion: "test",
+        policyVersion: "test",
+        checkpointFormatVersion: "1",
+        time: { created: 110 + requestIndex },
+      });
+      db.query(`INSERT INTO runtime_context_checkpoints (
+        id, conversation_id, coverage_through_run_id, source_head_run_id,
+        source_conversation_revision, format_version, compatibility_kind,
+        compatibility_version, payload_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(
+          checkpoint.id,
+          checkpoint.conversationId,
+          checkpoint.coverageThroughRunId,
+          checkpoint.sourceHeadRunId,
+          checkpoint.sourceConversationRevision,
+          checkpoint.formatVersion,
+          checkpoint.compatibility.kind,
+          checkpoint.compatibility.version,
+          JSON.stringify(checkpoint),
+          checkpoint.time.created,
+        );
+      for (const requestIndex of [1, 2]) {
+        const durablePlan = plan(requestIndex);
+        const durableUsage = usage(requestIndex);
+        db.query(`INSERT INTO runtime_context_plans (
+          id, conversation_id, run_id, request_index, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`)
+          .run(
+            durablePlan.id,
+            durablePlan.conversationId,
+            durablePlan.runId,
+            durablePlan.requestIndex,
+            JSON.stringify(durablePlan),
+            durablePlan.time.created,
+          );
+        db.query(`INSERT INTO runtime_context_usage (
+          id, conversation_id, run_id, request_index, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`)
+          .run(
+            durableUsage.id,
+            durableUsage.conversationId,
+            durableUsage.runId,
+            durableUsage.requestIndex,
+            JSON.stringify(durableUsage),
+            durableUsage.time.created,
+          );
+      }
+      first.store.appendTrace({
+        id: "trace_history_recovered",
+        conversationId: "conv_history",
+        runId: "run_history",
+        type: "context.overflow.recovered",
+        level: "warn",
+        time: 150,
+        payload: {
+          error: {
+            name: "ContextWindowExceededError",
+            data: { message: "context window exceeded" },
+          },
+          requestIndex: 1,
+          sourceHeadRunId: "run_history",
+          sourceConversationRevision: 1,
+          checkpointId: "ckpt_history",
+          beforeEstimatedInputTokens: 900,
+          afterEstimatedInputTokens: 400,
+        },
+      });
+      const readMarker = async (app: Awaited<ReturnType<typeof createApp>>) => {
+        const response = await app.handle(new Request(
+          "http://localhost/v1/conversations/conv_history/messages?format=ai_sdk",
+        ));
+        const body = await response.json() as {
+          messages: Array<{ id: string; metadata?: { custom?: { nexus?: { compaction?: unknown } } } }>;
+        };
+        return body.messages.find((message) => message.id === "msg_assistant")
+          ?.metadata?.custom?.nexus?.compaction;
+      };
+      const producingRequestMarker = {
+        trigger: "provider_overflow",
+        createdAt: 150,
+        coverageThroughRunId: "run_history",
+        beforeTokens: 900,
+        afterTokens: 400,
+        status: "recovered",
+      };
+      expect(await readMarker(first.app)).toEqual(producingRequestMarker);
+
+      Bun.gc(true);
+      db.close(true);
+      db = openRuntimeDatabase(databasePath);
+      const reopened = await createApp(config(), { runtimeDatabase: db });
+      expect(await readMarker(reopened)).toEqual(producingRequestMarker);
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // The successful path already closed the first database handle.
+      }
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("does not expose poisoned stored Assistant metadata from the active AI SDK route", async () => {
+    const { app, db, store } = await createAppWithHistoryFixtures();
+    const assistant = store.listActiveLineageMessages("conv_history").find(
+      (message) => message.id === "msg_assistant",
+    );
+    if (!assistant || assistant.role !== "assistant") throw new Error("missing assistant fixture");
+    store.saveMessage({
+      ...assistant,
+      status: { type: "incomplete", reason: "interrupted" },
+      finish: "interrupted",
+      metadata: {
+        interrupt: {
+          reason: "user_stop",
+          message: "safe interruption",
+          interruptedAt: "safe-time",
+          rawPayload: "NESTED_INTERRUPT_SECRET",
+        },
+        provider: { apiKey: "must-not-leak" },
+        continuation: { rawPayload: "must-not-leak" },
+        attachmentIds: ["att_must-not-leak"],
+        preparationClaim: { fencingToken: 99 },
+        secret: "must-not-leak",
+      },
+    });
+
+    const response = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_history/messages?format=ai_sdk",
+    ));
+    const body = await response.json() as {
+      messages: Array<{ id: string; metadata?: { custom?: { nexus?: Record<string, unknown> } } }>;
+    };
+    const serialized = JSON.stringify(body);
+    const nexus = body.messages.find((message) => message.id === assistant.id)
+      ?.metadata?.custom?.nexus;
+
+    expect(response.status).toBe(200);
+    expect(nexus?.status).toEqual({ type: "incomplete", reason: "interrupted" });
+    expect(nexus?.interrupt).toEqual({
+      reason: "user_stop",
+      message: "safe interruption",
+      interruptedAt: "safe-time",
+    });
+    expect(serialized).not.toContain("must-not-leak");
+    expect(serialized).not.toContain("fencingToken");
+    expect(serialized).not.toContain("NESTED_INTERRUPT_SECRET");
     db.close();
   });
 

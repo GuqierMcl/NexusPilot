@@ -10,10 +10,13 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
+  getContextDisplayUsage,
+  type RuntimeContextUsageView,
+} from "@/features/workbench/agent/state/runtime-context-view";
+import {
   createContext,
   useContext,
   useEffect,
-  useMemo,
   useState,
   type FC,
   type ReactNode,
@@ -27,15 +30,8 @@ const formatTokenCount = (tokens: number): string => {
   return `${tokens}`;
 };
 
-const getUsagePercent = (
-  totalTokens: number | undefined,
-  modelContextWindow: number,
-): number => {
-  if (!totalTokens) return 0;
-  return Math.min((totalTokens / modelContextWindow) * 100, 100);
-};
-
-export const formatContextUsagePercent = (percent: number): string => {
+export const formatContextUsagePercent = (percent: number | null): string => {
+  if (percent === null) return "—";
   if (percent > 0 && percent < 1) {
     return "<1%";
   }
@@ -68,8 +64,12 @@ const getBarColor = (percent: number): string => {
 type ContextDisplayContextValue = {
   usage: ThreadTokenUsage | undefined;
   totalTokens: number;
-  percent: number;
+  percent: number | null;
   modelContextWindow: number;
+  source: "estimate" | "provider" | "legacy" | "invalid";
+  view: "raw" | "checkpoint" | "legacy" | "unknown";
+  reservedOutputTokens?: number;
+  isLegacy: boolean;
 };
 
 const ContextDisplayContext = createContext<ContextDisplayContextValue | null>(
@@ -89,22 +89,85 @@ type PresetProps = {
   className?: string;
   side?: "top" | "bottom" | "left" | "right";
   usage?: ThreadTokenUsage | undefined;
+  runtimeUsage?: RuntimeContextUsageView | null;
+  runtimeUsageInvalid?: boolean;
 };
 
 type ContextDisplayRootProps = {
   modelContextWindow: number;
   children: ReactNode;
   usage?: ThreadTokenUsage | undefined;
+  runtimeUsage?: RuntimeContextUsageView | null;
+  runtimeUsageInvalid?: boolean;
 };
+
+export interface ContextDisplayLegacyTokenState {
+  threadId: string;
+  totalTokens: number;
+  usage: ThreadTokenUsage | undefined;
+}
+
+export function ContextDisplayRootView({
+  currentThreadId,
+  modelContextWindow,
+  children,
+  usage,
+  persistedTokenState,
+  runtimeUsage = null,
+  runtimeUsageInvalid = false,
+}: {
+  currentThreadId: string;
+  modelContextWindow: number;
+  children: ReactNode;
+  usage: ThreadTokenUsage | undefined;
+  persistedTokenState: ContextDisplayLegacyTokenState;
+  runtimeUsage?: RuntimeContextUsageView | null;
+  runtimeUsageInvalid?: boolean;
+}) {
+  const rawTokens = usage?.totalTokens ?? 0;
+  const effectiveTokenState = persistedTokenState.threadId === currentThreadId
+    ? persistedTokenState
+    : {
+        threadId: currentThreadId,
+        totalTokens: rawTokens > 0 ? rawTokens : 0,
+        usage,
+      };
+  const displayUsage = getContextDisplayUsage({
+    runtimeUsage,
+    runtimeUsageInvalid,
+    legacyTotalTokens: effectiveTokenState.totalTokens,
+    legacyContextWindow: modelContextWindow,
+  });
+  const contextValue: ContextDisplayContextValue = {
+    usage: effectiveTokenState.usage,
+    totalTokens: displayUsage.totalTokens,
+    percent: displayUsage.percent,
+    modelContextWindow: displayUsage.modelContextWindow,
+    source: displayUsage.source,
+    view: displayUsage.view,
+    reservedOutputTokens: displayUsage.reservedOutputTokens,
+    isLegacy: displayUsage.isLegacy,
+  };
+
+  return (
+    <ContextDisplayContext.Provider value={contextValue}>
+      <Tooltip>{children}</Tooltip>
+    </ContextDisplayContext.Provider>
+  );
+}
 
 function ContextDisplayRootBase({
   modelContextWindow,
   children,
   usage,
+  runtimeUsage = null,
+  runtimeUsageInvalid = false,
 }: {
   modelContextWindow: number;
   children: ReactNode;
   usage: ThreadTokenUsage | undefined;
+  runtimeUsage?: RuntimeContextUsageView | null;
+  runtimeUsageInvalid?: boolean;
 }) {
   const threadId = useAuiState((s) => s.threadListItem.id);
   const rawTokens = usage?.totalTokens ?? 0;
@@ -133,38 +196,38 @@ function ContextDisplayRootBase({
     });
   }, [threadId, rawTokens, usage]);
 
-  const totalTokens = tokenState.totalTokens;
-  const percent = getUsagePercent(totalTokens, modelContextWindow);
-
-  const contextValue = useMemo(
-    () => ({
-      usage: tokenState.usage,
-      totalTokens,
-      percent,
-      modelContextWindow,
-    }),
-    [tokenState.usage, totalTokens, percent, modelContextWindow],
-  );
-
   return (
-    <ContextDisplayContext.Provider value={contextValue}>
-      <Tooltip>{children}</Tooltip>
-    </ContextDisplayContext.Provider>
+    <ContextDisplayRootView
+      currentThreadId={threadId}
+      modelContextWindow={modelContextWindow}
+      usage={usage}
+      persistedTokenState={tokenState}
+      runtimeUsage={runtimeUsage}
+      runtimeUsageInvalid={runtimeUsageInvalid}
+    >
+      {children}
+    </ContextDisplayRootView>
   );
 }
 
 function ContextDisplayRootInternal({
   modelContextWindow,
   children,
+  runtimeUsage,
+  runtimeUsageInvalid,
 }: {
   modelContextWindow: number;
   children: ReactNode;
+  runtimeUsage?: RuntimeContextUsageView | null;
+  runtimeUsageInvalid?: boolean;
 }) {
   const usage = useThreadTokenUsage();
   return (
     <ContextDisplayRootBase
       modelContextWindow={modelContextWindow}
       usage={usage}
+      runtimeUsage={runtimeUsage}
+      runtimeUsageInvalid={runtimeUsageInvalid}
     >
       {children}
     </ContextDisplayRootBase>
@@ -177,13 +240,19 @@ function ContextDisplayRoot(props: ContextDisplayRootProps) {
       <ContextDisplayRootBase
         modelContextWindow={props.modelContextWindow}
         usage={props.usage}
+        runtimeUsage={props.runtimeUsage}
+        runtimeUsageInvalid={props.runtimeUsageInvalid}
       >
         {props.children}
       </ContextDisplayRootBase>
     );
   }
   return (
-    <ContextDisplayRootInternal modelContextWindow={props.modelContextWindow}>
+    <ContextDisplayRootInternal
+      modelContextWindow={props.modelContextWindow}
+      runtimeUsage={props.runtimeUsage}
+      runtimeUsageInvalid={props.runtimeUsageInvalid}
+    >
       {props.children}
     </ContextDisplayRootInternal>
   );
@@ -237,9 +306,17 @@ function ContextDisplayContent({
   side?: "top" | "bottom" | "left" | "right" | undefined;
   className?: string;
 }) {
-  const { usage, totalTokens, percent, modelContextWindow } =
+  const {
+    usage,
+    totalTokens,
+    percent,
+    modelContextWindow,
+    source,
+    view,
+    reservedOutputTokens,
+    isLegacy,
+  } =
     useContextDisplay();
-  const segments = getContextSegments(usage);
 
   return (
     <TooltipContent
@@ -252,12 +329,40 @@ function ContextDisplayContent({
         className,
       )}
     >
-      <div className="text-xs">
+      <ContextDisplayContentView
+        usage={usage}
+        totalTokens={totalTokens}
+        percent={percent}
+        modelContextWindow={modelContextWindow}
+        source={source}
+        view={view}
+        reservedOutputTokens={reservedOutputTokens}
+        isLegacy={isLegacy}
+      />
+    </TooltipContent>
+  );
+}
+
+export function ContextDisplayContentView({
+  usage,
+  totalTokens,
+  percent,
+  modelContextWindow,
+  source,
+  view,
+  reservedOutputTokens,
+  isLegacy,
+}: ContextDisplayContextValue) {
+  const segments = isLegacy ? getContextSegments(usage) : [];
+
+  return (
+    <div className="text-xs">
         <div className="flex items-baseline justify-between gap-6 whitespace-nowrap">
           <span className="font-medium">上下文用量</span>
           <span className="text-muted-foreground tabular-nums">
-            {formatTokenCount(Math.min(totalTokens, modelContextWindow))} /{" "}
-            {formatTokenCount(modelContextWindow)}
+            {modelContextWindow > 0
+              ? <>{formatTokenCount(totalTokens)} / {formatTokenCount(modelContextWindow)}</>
+              : "窗口未知"}
           </span>
         </div>
         <div className="bg-muted mt-2.5 h-1 overflow-hidden rounded-full">
@@ -265,9 +370,9 @@ function ContextDisplayContent({
             className={cn(
               "h-full w-(--usage-width) rounded-full transition-[width] duration-300",
               totalTokens > 0 && "min-w-1",
-              getBarColor(percent),
+              getBarColor(percent ?? 0),
             )}
-            style={{ "--usage-width": `${percent}%` } as React.CSSProperties}
+            style={{ "--usage-width": `${percent ?? 0}%` } as React.CSSProperties}
           />
         </div>
         {segments.length > 0 && (
@@ -285,8 +390,37 @@ function ContextDisplayContent({
             ))}
           </div>
         )}
-      </div>
-    </TooltipContent>
+        {!isLegacy && (
+          <div className="mt-3 grid gap-1.5 border-t pt-2 text-muted-foreground">
+            <div className="flex items-baseline justify-between gap-6">
+              <span>活动输入</span>
+              <span className="tabular-nums">
+                {formatTokenCount(Math.max(totalTokens - (reservedOutputTokens ?? 0), 0))}
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between gap-6">
+              <span>输入来源</span>
+              <span>
+                {source === "provider"
+                  ? "Provider 观测"
+                  : source === "estimate" ? "估算" : "未知"}
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between gap-6">
+              <span>上下文视图</span>
+              <span>
+                {view === "checkpoint"
+                  ? "检查点"
+                  : view === "raw" ? "原始上下文" : "未知"}
+              </span>
+            </div>
+            <div className="flex items-baseline justify-between gap-6">
+              <span>预留输出</span>
+              <span className="tabular-nums">{formatTokenCount(reservedOutputTokens ?? 0)}</span>
+            </div>
+          </div>
+        )}
+    </div>
   );
 }
 
@@ -323,11 +457,11 @@ function RingVisual() {
         strokeLinecap="round"
         strokeDasharray={RING_CIRCUMFERENCE}
         strokeDashoffset={
-          RING_CIRCUMFERENCE - (percent / 100) * RING_CIRCUMFERENCE
+          RING_CIRCUMFERENCE - ((percent ?? 0) / 100) * RING_CIRCUMFERENCE
         }
         className={cn(
           "transition-[stroke-dashoffset,stroke] duration-300",
-          getStrokeColor(percent),
+          getStrokeColor(percent ?? 0),
         )}
       />
     </svg>
@@ -343,24 +477,58 @@ function RingPercentLabel() {
   );
 }
 
+export function ContextDisplayRingBody({
+  className,
+  side,
+}: Pick<PresetProps, "className" | "side">) {
+  const {
+    percent,
+    modelContextWindow,
+    source,
+    view,
+    reservedOutputTokens,
+    isLegacy,
+  } = useContextDisplay();
+  const usageLabel = modelContextWindow > 0
+    ? formatContextUsagePercent(percent)
+    : "窗口未知";
+  const sourceLabel = source === "provider"
+    ? "Provider 观测"
+    : source === "estimate" ? "估算" : "未知";
+  const viewLabel = view === "checkpoint"
+    ? "检查点"
+    : view === "raw" ? "原始上下文" : "未知";
+  const ariaLabel = isLegacy
+    ? `上下文用量：${usageLabel}`
+    : `上下文用量：${usageLabel}；输入来源：${sourceLabel}；上下文视图：${viewLabel}；预留输出：${formatTokenCount(reservedOutputTokens ?? 0)}`;
+
+  return (
+    <>
+      <ContextDisplayTrigger
+        className={cn(
+          "text-muted-foreground hover:text-foreground gap-1.5 px-1.5 py-1 text-xs",
+          className,
+        )}
+        aria-label={ariaLabel}
+      >
+        <RingVisual />
+        <RingPercentLabel />
+      </ContextDisplayTrigger>
+      <ContextDisplayContent side={side} />
+    </>
+  );
+}
+
 const ContextDisplayRing: FC<PresetProps> = ({
   modelContextWindow,
   className,
   side,
   usage,
+  runtimeUsage,
+  runtimeUsageInvalid,
 }) => (
-  <ContextDisplayRoot modelContextWindow={modelContextWindow} usage={usage}>
-    <ContextDisplayTrigger
-      className={cn(
-        "text-muted-foreground hover:text-foreground gap-1.5 px-1.5 py-1 text-xs",
-        className,
-      )}
-      aria-label="上下文用量"
-    >
-      <RingVisual />
-      <RingPercentLabel />
-    </ContextDisplayTrigger>
-    <ContextDisplayContent side={side} />
+  <ContextDisplayRoot modelContextWindow={modelContextWindow} usage={usage} runtimeUsage={runtimeUsage} runtimeUsageInvalid={runtimeUsageInvalid}>
+    <ContextDisplayRingBody className={className} side={side} />
   </ContextDisplayRoot>
 );
 
@@ -373,13 +541,13 @@ function BarVisual() {
         <div
           className={cn(
             "h-full rounded-full transition-all duration-300",
-            getBarColor(percent),
+            getBarColor(percent ?? 0),
           )}
-          style={{ width: `${percent}%` }}
+          style={{ width: `${percent ?? 0}%` }}
         />
       </div>
       <span className="text-muted-foreground text-[10px] tabular-nums">
-        {formatTokenCount(totalTokens)} ({Math.round(percent)}%)
+        {formatTokenCount(totalTokens)} ({percent === null ? "—" : `${Math.round(percent)}%`})
       </span>
     </div>
   );
@@ -390,8 +558,10 @@ const ContextDisplayBar: FC<PresetProps> = ({
   className,
   side,
   usage,
+  runtimeUsage,
+  runtimeUsageInvalid,
 }) => (
-  <ContextDisplayRoot modelContextWindow={modelContextWindow} usage={usage}>
+  <ContextDisplayRoot modelContextWindow={modelContextWindow} usage={usage} runtimeUsage={runtimeUsage} runtimeUsageInvalid={runtimeUsageInvalid}>
     <ContextDisplayTrigger
       className={cn("px-2 py-1", className)}
       aria-label="上下文用量"
@@ -417,8 +587,10 @@ const ContextDisplayText: FC<PresetProps> = ({
   className,
   side,
   usage,
+  runtimeUsage,
+  runtimeUsageInvalid,
 }) => (
-  <ContextDisplayRoot modelContextWindow={modelContextWindow} usage={usage}>
+  <ContextDisplayRoot modelContextWindow={modelContextWindow} usage={usage} runtimeUsage={runtimeUsage} runtimeUsageInvalid={runtimeUsageInvalid}>
     <ContextDisplayTrigger
       aria-label="上下文用量"
       className={cn(

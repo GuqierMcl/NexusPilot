@@ -1,4 +1,36 @@
-import type { Message, Part, TokenUsage, ToolState } from "../core/types";
+import type {
+  InterruptReason,
+  Message,
+  Part,
+  RunInterrupt,
+  TokenUsage,
+  ToolState,
+} from "../core/types";
+
+export interface AiSdkContextUsageView {
+  contextWindow?: number;
+  estimatedInputTokens: number;
+  providerInputTokens?: number;
+  reservedOutputTokens: number;
+  activeTokens: number;
+  source: "estimate" | "provider";
+  view: "raw" | "checkpoint";
+  checkpointId?: string;
+}
+
+export interface AiSdkCompactionMarkerView {
+  trigger: "auto_pre_turn" | "auto_mid_turn" | "manual" | "provider_overflow" | "model_switch";
+  createdAt: number;
+  coverageThroughRunId: string;
+  beforeTokens: number;
+  afterTokens: number;
+  status: "created" | "recovered";
+}
+
+export interface AiSdkDerivedMessageMetadata {
+  contextUsage?: AiSdkContextUsageView;
+  compaction?: AiSdkCompactionMarkerView;
+}
 
 export interface AiSdkUIMessageLike {
   id: string;
@@ -42,12 +74,13 @@ export type AiSdkToolPartLike = {
 
 export function projectMessageToAiSdkUIMessage(
   message: Message,
+  derived?: AiSdkDerivedMessageMetadata,
 ): AiSdkUIMessageLike {
   return {
     id: message.id,
     role: message.role,
     parts: message.parts.flatMap(projectPartToAiSdkUIParts),
-    metadata: buildMessageMetadata(message),
+    metadata: buildMessageMetadata(message, derived),
   };
 }
 
@@ -159,7 +192,10 @@ function extractToolTitle(state: ToolState): string | undefined {
   return "title" in state ? state.title : undefined;
 }
 
-function buildMessageMetadata(message: Message): Record<string, unknown> {
+function buildMessageMetadata(
+  message: Message,
+  derived?: AiSdkDerivedMessageMetadata,
+): Record<string, unknown> {
   const nexus: Record<string, unknown> = {
     conversationId: message.conversationId,
   };
@@ -167,10 +203,6 @@ function buildMessageMetadata(message: Message): Record<string, unknown> {
     message.role === "assistant" && message.usage
       ? projectRuntimeUsageForAiSdk(message.usage)
       : undefined;
-
-  if (message.metadata) {
-    nexus.messageMetadata = message.metadata;
-  }
 
   if (message.role === "assistant") {
     nexus.runId = message.runId;
@@ -190,8 +222,15 @@ function buildMessageMetadata(message: Message): Record<string, unknown> {
     if (message.status.type !== "complete") {
       nexus.status = message.status;
     }
-    if (message.metadata?.interrupt) {
-      nexus.interrupt = message.metadata.interrupt;
+    const interrupt = sanitizeInterrupt(message.metadata?.interrupt);
+    if (interrupt) {
+      nexus.interrupt = interrupt;
+    }
+    if (derived?.contextUsage) {
+      nexus.contextUsage = sanitizeContextUsage(derived.contextUsage);
+    }
+    if (derived?.compaction) {
+      nexus.compaction = sanitizeCompactionMarker(derived.compaction);
     }
   }
 
@@ -202,6 +241,57 @@ function buildMessageMetadata(message: Message): Record<string, unknown> {
       ...(aiSdkUsage ? { usage: aiSdkUsage } : {}),
     },
     ...(aiSdkUsage ? { usage: aiSdkUsage } : {}),
+  };
+}
+
+function sanitizeInterrupt(value: unknown): RunInterrupt | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (!isInterruptReason(record.reason) || typeof record.interruptedAt !== "string") {
+    return undefined;
+  }
+  return {
+    reason: record.reason,
+    ...(typeof record.message === "string" ? { message: record.message } : {}),
+    interruptedAt: record.interruptedAt,
+  };
+}
+
+function isInterruptReason(value: unknown): value is InterruptReason {
+  return value === "user_stop"
+    || value === "client_disconnect"
+    || value === "runtime_shutdown"
+    || value === "runtime_recovered_stale_run"
+    || value === "tool_abort"
+    || value === "timeout"
+    || value === "unknown";
+}
+
+function sanitizeContextUsage(usage: AiSdkContextUsageView): AiSdkContextUsageView {
+  return {
+    ...(typeof usage.contextWindow === "number" ? { contextWindow: usage.contextWindow } : {}),
+    estimatedInputTokens: usage.estimatedInputTokens,
+    ...(typeof usage.providerInputTokens === "number"
+      ? { providerInputTokens: usage.providerInputTokens }
+      : {}),
+    reservedOutputTokens: usage.reservedOutputTokens,
+    activeTokens: usage.activeTokens,
+    source: usage.source,
+    view: usage.view,
+    ...(typeof usage.checkpointId === "string" ? { checkpointId: usage.checkpointId } : {}),
+  };
+}
+
+function sanitizeCompactionMarker(marker: AiSdkCompactionMarkerView): AiSdkCompactionMarkerView {
+  return {
+    trigger: marker.trigger,
+    createdAt: marker.createdAt,
+    coverageThroughRunId: marker.coverageThroughRunId,
+    beforeTokens: marker.beforeTokens,
+    afterTokens: marker.afterTokens,
+    status: marker.status,
   };
 }
 

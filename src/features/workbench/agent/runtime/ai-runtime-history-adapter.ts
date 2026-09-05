@@ -69,10 +69,11 @@ async function loadAiSdkMessages(
         return await input.loadMessages(conversationId);
     }
 
-    const { getRuntimeConversationMessages } = await import(
+    const { getRuntimeConversationMessagesSnapshot } = await import(
         "@/lib/ai-runtime/conversations"
     );
-    return await getRuntimeConversationMessages("ai_sdk", conversationId);
+    const snapshot = await getRuntimeConversationMessagesSnapshot("ai_sdk", conversationId);
+    return snapshot.view === "active" ? snapshot.messages : [];
 }
 
 function normalizeConversationId(value: string | null | undefined): string | null {

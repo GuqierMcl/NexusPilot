@@ -10,26 +10,41 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { getRuntimeMessageStatusView } from "@/features/workbench/agent/state";
+import {
+  getRuntimeCompactionMarkerLabel,
+  getRuntimeMessageStatusView,
+} from "@/features/workbench/agent/state";
 import { cn } from "@/lib/utils";
 
 export function AgentRuntimeMessageStatus() {
   const metadata = useAuiState((state) => state.message.metadata);
   const status = getRuntimeMessageStatusView(metadata);
+  const markerLabel = getRuntimeCompactionMarkerLabel(metadata);
   const [copied, setCopied] = useState(false);
 
-  if (!status) {
+  if (!status && !markerLabel) {
     return null;
   }
 
-  if (status.kind === "interrupted") {
+  const marker = markerLabel ? (
+    <div className="mt-2 inline-flex items-center rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground">
+      {markerLabel}
+    </div>
+  ) : null;
+
+  if (status?.kind === "interrupted") {
     return (
-      <div className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground">
-        <BanIcon className="size-3" />
-        <span>{status.label}</span>
-      </div>
+      <>
+        {marker}
+        <div className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground">
+          <BanIcon className="size-3" />
+          <span>{status.label}</span>
+        </div>
+      </>
     );
   }
+
+  if (!status) return marker;
 
   const copyDescription = async (): Promise<void> => {
     try {
@@ -41,7 +56,9 @@ export function AgentRuntimeMessageStatus() {
   };
 
   return (
-    <div
+    <>
+      {marker}
+      <div
       className={cn(
         "mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2",
         "text-xs text-destructive dark:bg-destructive/5 dark:text-red-200",
@@ -67,6 +84,7 @@ export function AgentRuntimeMessageStatus() {
       <div className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] opacity-90 [overflow-wrap:anywhere]">
         {status.description}
       </div>
-    </div>
+      </div>
+    </>
   );
 }

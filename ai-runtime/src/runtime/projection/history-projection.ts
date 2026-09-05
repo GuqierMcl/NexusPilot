@@ -5,8 +5,16 @@ import type {
   MessageHistoryView,
   Permission,
   Run,
+  RunId,
+  TraceEvent,
 } from "../core/types";
-import { projectMessageToAiSdkUIMessage, type AiSdkUIMessageLike } from "./ai-sdk-projection";
+import type { ContextCheckpoint, ContextPlan, ContextUsage } from "../context/types";
+import {
+  projectMessageToAiSdkUIMessage,
+  type AiSdkCompactionMarkerView,
+  type AiSdkDerivedMessageMetadata,
+  type AiSdkUIMessageLike,
+} from "./ai-sdk-projection";
 import { projectMessageToUiMessage, type UiMessageLike } from "./ui-projection";
 
 export type MessageHistoryFormat = "runtime" | "ui" | "ai_sdk";
@@ -138,6 +146,13 @@ export function projectPermissionSnapshot(permission: Permission) {
 
 export type MessageHistoryProjection = Message[] | UiMessageLike[] | AiSdkUIMessageLike[];
 
+export interface ActiveHistoryContextStore {
+  listContextCheckpoints(conversationId: Conversation["id"]): ContextCheckpoint[];
+  listContextPlansByRun(runId: RunId): ContextPlan[];
+  listContextUsagesByRun(runId: RunId): ContextUsage[];
+  listTraces(runId: RunId): TraceEvent[];
+}
+
 export interface ConversationMessagesSnapshot {
   conversation_id: string;
   active_head_run_id?: string;
@@ -203,13 +218,19 @@ export function projectTranscriptRunSnapshot(run: Run): RunSnapshot {
 export function projectMessageHistory(
   messages: Message[],
   format: MessageHistoryFormat,
+  derivedByRunId?: ReadonlyMap<RunId, AiSdkDerivedMessageMetadata>,
 ): MessageHistoryProjection {
   if (format === "ui") {
     return messages.map(projectMessageToUiMessage);
   }
 
   if (format === "ai_sdk") {
-    return messages.map(projectMessageToAiSdkUIMessage);
+    return messages.map((message) => projectMessageToAiSdkUIMessage(
+      message,
+      message.role === "assistant" && message.runId
+        ? derivedByRunId?.get(message.runId)
+        : undefined,
+    ));
   }
 
   return messages;
@@ -225,6 +246,143 @@ export function parseMessageHistoryFormat(value: unknown): MessageHistoryFormat 
   }
 
   return null;
+}
+
+/**
+ * Builds a presentation-only context view for the already selected active lineage.
+ * It deliberately reads only allowlisted scalar facts and never writes Message JSON.
+ */
+export function buildActiveHistoryContextMetadata(
+  messages: readonly Message[],
+  store: ActiveHistoryContextStore,
+): ReadonlyMap<RunId, AiSdkDerivedMessageMetadata> {
+  const checkpoints = new Map(
+    messages.length > 0
+      ? store.listContextCheckpoints(messages[0]!.conversationId).map((checkpoint) => [checkpoint.id, checkpoint])
+      : [],
+  );
+  const derived = new Map<RunId, AiSdkDerivedMessageMetadata>();
+
+  for (const message of messages) {
+    if (message.role !== "assistant" || !message.runId) continue;
+    const usages = store.listContextUsagesByRun(message.runId);
+    const usage = usages.at(-1);
+    if (!usage) continue;
+    const plans = store.listContextPlansByRun(message.runId);
+    const markerAssociation = findLatestMarkerAssociation({
+      conversationId: message.conversationId,
+      runId: message.runId,
+      plans,
+      usages,
+      checkpoints,
+    });
+    derived.set(message.runId, {
+      contextUsage: projectContextUsage(usage),
+      ...(markerAssociation
+        ? {
+            compaction: projectCompactionMarker(
+              markerAssociation.usage,
+              markerAssociation.plan,
+              markerAssociation.checkpoint,
+              store.listTraces(message.runId),
+            ),
+          }
+        : {}),
+    });
+  }
+  return derived;
+}
+
+function projectContextUsage(usage: ContextUsage): AiSdkDerivedMessageMetadata["contextUsage"] {
+  const providerInputTokens = usage.providerObservation?.inputTokens;
+  const activeInputTokens = providerInputTokens ?? usage.estimatedInputTokens;
+  return {
+    ...(usage.contextWindow === undefined ? {} : { contextWindow: usage.contextWindow }),
+    estimatedInputTokens: usage.estimatedInputTokens,
+    ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
+    reservedOutputTokens: usage.reservedOutputTokens,
+    activeTokens: activeInputTokens + usage.reservedOutputTokens,
+    source: providerInputTokens === undefined ? "estimate" : "provider",
+    view: usage.view,
+    ...(usage.checkpointId ? { checkpointId: usage.checkpointId } : {}),
+  };
+}
+
+function projectCompactionMarker(
+  usage: ContextUsage,
+  plan: ContextPlan,
+  checkpoint: ContextCheckpoint,
+  traces: readonly TraceEvent[],
+): AiSdkCompactionMarkerView {
+  const recovered = traces.find((trace) =>
+    trace.type === "context.overflow.recovered"
+    && trace.conversationId === usage.conversationId
+    && trace.runId === usage.runId
+    && trace.payload.checkpointId === checkpoint.id
+    && trace.payload.requestIndex === usage.requestIndex
+    && trace.payload.sourceHeadRunId === plan.sourceHeadRunId
+    && trace.payload.sourceConversationRevision === plan.sourceConversationRevision
+  );
+  const beforeTokens = recovered && isNonNegativeNumber(recovered.payload.beforeEstimatedInputTokens)
+    ? recovered.payload.beforeEstimatedInputTokens
+    : checkpoint.budget.estimatedInputTokens;
+  const afterTokens = recovered && isNonNegativeNumber(recovered.payload.afterEstimatedInputTokens)
+    ? recovered.payload.afterEstimatedInputTokens
+    : usage.estimatedInputTokens;
+  return {
+    trigger: recovered ? "provider_overflow" : checkpoint.trigger,
+    createdAt: recovered?.time ?? checkpoint.time.created,
+    coverageThroughRunId: checkpoint.coverageThroughRunId,
+    beforeTokens,
+    afterTokens,
+    status: recovered ? "recovered" : "created",
+  };
+}
+
+function findLatestMarkerAssociation(input: {
+  conversationId: string;
+  runId: RunId;
+  plans: readonly ContextPlan[];
+  usages: readonly ContextUsage[];
+  checkpoints: ReadonlyMap<string, ContextCheckpoint>;
+}): { usage: ContextUsage; plan: ContextPlan; checkpoint: ContextCheckpoint } | null {
+  const candidates = input.plans.flatMap((plan) => {
+    if (
+      plan.conversationId !== input.conversationId
+      || plan.runId !== input.runId
+      || plan.sourceHeadRunId !== input.runId
+      || plan.view !== "checkpoint"
+      || !plan.checkpointId
+    ) {
+      return [];
+    }
+    const checkpoint = input.checkpoints.get(plan.checkpointId);
+    const usage = input.usages.find((candidate) =>
+      candidate.conversationId === input.conversationId
+      && candidate.runId === input.runId
+      && candidate.requestIndex === plan.requestIndex
+      && candidate.view === "checkpoint"
+      && candidate.checkpointId === plan.checkpointId,
+    );
+    if (
+      !checkpoint
+      || !usage
+      || checkpoint.conversationId !== input.conversationId
+      || checkpoint.sourceHeadRunId !== plan.sourceHeadRunId
+      || checkpoint.sourceConversationRevision !== plan.sourceConversationRevision
+    ) {
+      return [];
+    }
+    return [{ usage, plan, checkpoint }];
+  });
+  return candidates.sort((left, right) =>
+    right.checkpoint.time.created - left.checkpoint.time.created
+    || left.usage.requestIndex - right.usage.requestIndex,
+  )[0] ?? null;
+}
+
+function isNonNegativeNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 export function parseMessageHistoryView(value: unknown): MessageHistoryView | null {

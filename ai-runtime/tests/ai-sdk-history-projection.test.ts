@@ -5,6 +5,7 @@ import {
   type UIMessageChunk,
 } from "ai";
 import {
+  buildActiveHistoryContextMetadata,
   parseMessageHistoryFormat,
   projectMessageHistory,
 } from "../src/runtime/projection/history-projection";
@@ -304,12 +305,6 @@ describe("AI SDK history projection", () => {
         metadata: {
           nexus: {
             conversationId: "conv_history",
-            messageMetadata: {
-              interrupt: {
-                reason: "user_stop",
-                interruptedAt: "2026-06-28T12:00:00.000Z",
-              },
-            },
             runId: "run_history",
             providerId: "openai",
             modelId: "gpt-4o",
@@ -324,12 +319,6 @@ describe("AI SDK history projection", () => {
           custom: {
             nexus: {
               conversationId: "conv_history",
-              messageMetadata: {
-                interrupt: {
-                  reason: "user_stop",
-                  interruptedAt: "2026-06-28T12:00:00.000Z",
-                },
-              },
               runId: "run_history",
               providerId: "openai",
               modelId: "gpt-4o",
@@ -387,6 +376,152 @@ describe("AI SDK history projection", () => {
         },
       },
     });
+  });
+
+  test("decorates only an owning active Assistant with sanitized derived context facts", () => {
+    const message: AssistantMessage = {
+      ...baseMessage,
+      parts: [],
+    };
+
+    const projected = projectMessageHistory([message], "ai_sdk", new Map([[
+        "run_history",
+        {
+          contextUsage: {
+            contextWindow: 1000,
+            estimatedInputTokens: 440,
+            providerInputTokens: 430,
+            reservedOutputTokens: 120,
+            activeTokens: 550,
+            source: "provider",
+            view: "checkpoint",
+            checkpointId: "ckpt_safe",
+          },
+          compaction: {
+            trigger: "auto_pre_turn",
+            createdAt: 99,
+            coverageThroughRunId: "run_previous",
+            beforeTokens: 900,
+            afterTokens: 430,
+            status: "created",
+            summary: "must-not-leak",
+            safetyState: "must-not-leak",
+          },
+          providerMetadata: { apiKey: "must-not-leak" },
+        },
+      ]]))[0];
+
+    expect(projected?.metadata).toMatchObject({
+      custom: {
+        nexus: {
+          contextUsage: {
+            contextWindow: 1000,
+            estimatedInputTokens: 440,
+            providerInputTokens: 430,
+            reservedOutputTokens: 120,
+            activeTokens: 550,
+            source: "provider",
+            view: "checkpoint",
+            checkpointId: "ckpt_safe",
+          },
+          compaction: {
+            trigger: "auto_pre_turn",
+            createdAt: 99,
+            coverageThroughRunId: "run_previous",
+            beforeTokens: 900,
+            afterTokens: 430,
+            status: "created",
+          },
+        },
+      },
+    });
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain("must-not-leak");
+    expect(serialized).not.toContain("summary");
+    expect(serialized).not.toContain("safetyState");
+  });
+
+  test("keeps the checkpoint-producing marker stable when a later request selects the same checkpoint", () => {
+    const messages: AssistantMessage[] = [{ ...baseMessage, parts: [] }];
+    const derived = buildActiveHistoryContextMetadata(messages, {
+      listContextCheckpoints: () => [{
+        id: "ckpt_active",
+        conversationId: "conv_history",
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 7,
+        coverageThroughRunId: "run_previous",
+        trigger: "auto_pre_turn",
+        budget: { estimatedInputTokens: 900 },
+        time: { created: 5 },
+        summary: "must-not-leak",
+      }],
+      listContextPlansByRun: (runId: string) => runId === "run_history" ? [{
+        conversationId: "conv_history",
+        runId: "run_history",
+        requestIndex: 1,
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 7,
+        checkpointId: "ckpt_active",
+        view: "checkpoint",
+        reason: "checkpoint_selected",
+      }, {
+        conversationId: "conv_history",
+        runId: "run_history",
+        requestIndex: 2,
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 7,
+        checkpointId: "ckpt_active",
+        view: "checkpoint",
+        reason: "checkpoint_selected",
+      }] : [],
+      listContextUsagesByRun: (runId: string) => runId === "run_history" ? [{
+        conversationId: "conv_history",
+        runId: "run_history",
+        requestIndex: 1,
+        contextWindow: 1000,
+        estimatedInputTokens: 400,
+        reservedOutputTokens: 120,
+        view: "checkpoint",
+        checkpointId: "ckpt_active",
+      }, {
+        conversationId: "conv_history",
+        runId: "run_history",
+        requestIndex: 2,
+        contextWindow: 1000,
+        estimatedInputTokens: 480,
+        reservedOutputTokens: 120,
+        view: "checkpoint",
+        checkpointId: "ckpt_active",
+      }] : [],
+      listTraces: (runId: string) => runId === "run_history" ? [{
+        id: "trace_recovered",
+        conversationId: "conv_history",
+        runId: "run_history",
+        type: "context.overflow.recovered",
+        time: 10,
+        payload: {
+          checkpointId: "ckpt_active",
+          requestIndex: 1,
+          sourceHeadRunId: "run_history",
+          sourceConversationRevision: 7,
+          beforeEstimatedInputTokens: 900,
+          afterEstimatedInputTokens: 400,
+        },
+      }] : [],
+    } as never);
+
+    const projected = projectMessageHistory(messages, "ai_sdk", derived)[0];
+    expect(projected?.metadata).toMatchObject({
+      custom: { nexus: { compaction: {
+        trigger: "provider_overflow",
+        createdAt: 10,
+        coverageThroughRunId: "run_previous",
+        beforeTokens: 900,
+        afterTokens: 400,
+        status: "recovered",
+      } } },
+    });
+    expect(JSON.stringify(projected).includes("must-not-leak")).toBe(false);
   });
 
   test("projects multiple reasoning parts with text order so restored UI can render every reasoning block", () => {

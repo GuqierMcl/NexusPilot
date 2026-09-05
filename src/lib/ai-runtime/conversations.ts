@@ -190,6 +190,21 @@ export async function getRuntimeConversationMessages(
     signal?: AbortSignal,
     options: RuntimeConversationReadOptions = {},
 ): Promise<UIMessage[]> {
+    const snapshot = await getRuntimeConversationMessagesSnapshot(
+        format,
+        conversationId,
+        signal,
+        options,
+    );
+    return snapshot.messages;
+}
+
+export async function getRuntimeConversationMessagesSnapshot(
+    format: "ai_sdk",
+    conversationId: string,
+    signal?: AbortSignal,
+    options: RuntimeConversationReadOptions = {},
+): Promise<AiRuntimeConversationMessagesSnapshot<typeof format>> {
     const encodedConversationId = encodeURIComponent(conversationId);
     const encodedFormat = encodeURIComponent(format);
     const response = await aiRuntimeRequest<AiRuntimeConversationMessagesSnapshot<typeof format>>(
@@ -197,7 +212,7 @@ export async function getRuntimeConversationMessages(
         { signal, silent: options.silent },
     );
 
-    return response.messages;
+    return response;
 }
 
 async function mutateRuntimeConversation(
