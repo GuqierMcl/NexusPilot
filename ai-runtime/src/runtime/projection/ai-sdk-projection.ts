@@ -6,7 +6,7 @@ import type {
   TokenUsage,
   ToolState,
 } from "../core/types";
-import type { ContextCompactionActivity } from "../context/types";
+import type { ContextCompactionActivity, ContextUsage } from "../context/types";
 
 export interface AiSdkContextUsageView {
   contextWindow?: number;
@@ -33,6 +33,31 @@ export interface AiSdkDerivedMessageMetadata {
   contextUsage?: AiSdkContextUsageView;
   compaction?: AiSdkCompactionMarkerView;
   compactionActivities?: readonly ContextCompactionActivity[];
+}
+
+export function projectContextUsageToAiSdkView(
+  usage: ContextUsage,
+): AiSdkContextUsageView {
+  const providerInputTokens = usage.providerObservation?.inputTokens;
+  const forecast = usage.nextTurnForecast;
+  const contextWindow = forecast ? forecast.contextWindow : usage.contextWindow;
+  const estimatedInputTokens = forecast
+    ? forecast.estimatedInputTokens
+    : usage.estimatedInputTokens;
+  const view = forecast ? forecast.view : usage.view;
+  const checkpointId = forecast ? forecast.checkpointId : usage.checkpointId;
+
+  return {
+    ...(contextWindow === undefined ? {} : { contextWindow }),
+    estimatedInputTokens,
+    ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
+    reservedOutputTokens: usage.reservedOutputTokens,
+    activeTokens: estimatedInputTokens,
+    source: "estimate",
+    view,
+    ...(checkpointId ? { checkpointId } : {}),
+    ...(forecast ? { forecastReason: forecast.reason } : {}),
+  };
 }
 
 export interface AiSdkUIMessageLike {

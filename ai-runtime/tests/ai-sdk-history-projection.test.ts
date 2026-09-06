@@ -9,7 +9,9 @@ import {
   parseMessageHistoryFormat,
   projectMessageHistory,
 } from "../src/runtime/projection/history-projection";
+import { projectContextUsageToAiSdkView } from "../src/runtime/projection/ai-sdk-projection";
 import type { AssistantMessage } from "../src/runtime/core/types";
+import type { ContextUsage } from "../src/runtime/context/types";
 
 const baseMessage = {
   id: "msg_assistant",
@@ -27,6 +29,70 @@ const baseMessage = {
 describe("AI SDK history projection", () => {
   test("parses ai_sdk as a message history format", () => {
     expect(parseMessageHistoryFormat("ai_sdk")).toBe("ai_sdk");
+  });
+
+  test("does not leak a checkpoint identity into a raw next-turn forecast", () => {
+    const usage: ContextUsage = {
+      id: "ctxuse_projection",
+      conversationId: "conv_history",
+      runId: "run_history",
+      requestIndex: 1,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      contextWindow: 33_000,
+      estimatedInputTokens: 5_769,
+      estimateSource: "estimate",
+      reservedOutputTokens: 4_000,
+      view: "checkpoint",
+      checkpointId: "ckpt_previous_request",
+      breakdown: {
+        rawTokens: 4_000,
+        checkpointTokens: 1_000,
+        safetyStateTokens: 269,
+        systemPromptTokens: 300,
+        toolSchemaTokens: 200,
+      },
+      providerObservation: { source: "provider", inputTokens: 5_700 },
+      nextTurnForecast: {
+        conversationId: "conv_history",
+        sourceHeadRunId: "run_history",
+        sourceConversationRevision: 47,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        contextWindow: 33_000,
+        estimatedInputTokens: 29_054,
+        view: "raw",
+        breakdown: {
+          rawTokens: 28_285,
+          checkpointTokens: 0,
+          safetyStateTokens: 269,
+          systemPromptTokens: 300,
+          toolSchemaTokens: 200,
+        },
+        estimatorVersion: "test",
+        policyVersion: "test",
+        checkpointFormatVersion: "test",
+        reason: "checkpoint_created",
+      },
+      estimatorVersion: "test",
+      policyVersion: "test",
+      checkpointFormatVersion: "test",
+      time: { created: 10 },
+    };
+
+    const projected = projectContextUsageToAiSdkView(usage);
+
+    expect(projected).toMatchObject({
+      contextWindow: 33_000,
+      estimatedInputTokens: 29_054,
+      providerInputTokens: 5_700,
+      reservedOutputTokens: 4_000,
+      activeTokens: 29_054,
+      source: "estimate",
+      view: "raw",
+      forecastReason: "checkpoint_created",
+    });
+    expect(projected).not.toHaveProperty("checkpointId");
   });
 
   test("projects Runtime messages to AI SDK 7 UIMessage parts", () => {

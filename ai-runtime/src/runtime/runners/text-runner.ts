@@ -73,6 +73,7 @@ import type { RuntimeAttachmentService } from "../attachments";
 import { mapAiSdkUsage } from "../core/usage";
 import { projectModelHistory } from "../projection/model-history-projection";
 import {
+  projectContextUsageToAiSdkView,
   projectContextCompactionActivityToAiSdkDataPart,
 } from "../projection/ai-sdk-projection";
 import {
@@ -3129,21 +3130,7 @@ function projectSafeContextMetadata(
   if (!usage && !marker) return undefined;
   const nexus: Record<string, unknown> = {};
   if (usage) {
-    const providerInputTokens = usage.providerObservation?.inputTokens;
-    const forecast = usage.nextTurnForecast;
-    const contextWindow = forecast?.contextWindow ?? usage.contextWindow;
-    const checkpointId = forecast?.checkpointId ?? usage.checkpointId;
-    nexus.contextUsage = {
-      ...(contextWindow ? { contextWindow } : {}),
-      estimatedInputTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
-      ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
-      reservedOutputTokens: usage.reservedOutputTokens,
-      activeTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
-      source: "estimate",
-      view: forecast?.view ?? usage.view,
-      ...(checkpointId ? { checkpointId } : {}),
-      ...(forecast ? { forecastReason: forecast.reason } : {}),
-    };
+    nexus.contextUsage = projectContextUsageToAiSdkView(usage);
   }
   if (marker) {
     nexus.compaction = {

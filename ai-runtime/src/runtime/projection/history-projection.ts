@@ -15,6 +15,7 @@ import type {
   ContextUsage,
 } from "../context/types";
 import {
+  projectContextUsageToAiSdkView,
   projectMessageToAiSdkUIMessage,
   type AiSdkCompactionMarkerView,
   type AiSdkDerivedMessageMetadata,
@@ -302,7 +303,7 @@ export function buildActiveHistoryContextMetadata(
       : lifecycleMarker;
     if (!usage && !compaction && compactionActivities.length === 0) continue;
     derived.set(message.runId, {
-      ...(usage ? { contextUsage: projectContextUsage(usage) } : {}),
+      ...(usage ? { contextUsage: projectContextUsageToAiSdkView(usage) } : {}),
       ...(markerAssociation
         ? { compaction }
         : compaction ? { compaction } : {}),
@@ -344,24 +345,6 @@ function isCompactionTrigger(value: unknown): boolean {
     || value === "manual"
     || value === "provider_overflow"
     || value === "model_switch";
-}
-
-function projectContextUsage(usage: ContextUsage): AiSdkDerivedMessageMetadata["contextUsage"] {
-  const providerInputTokens = usage.providerObservation?.inputTokens;
-  const forecast = usage.nextTurnForecast;
-  const contextWindow = forecast?.contextWindow ?? usage.contextWindow;
-  const checkpointId = forecast?.checkpointId ?? usage.checkpointId;
-  return {
-    ...(contextWindow === undefined ? {} : { contextWindow }),
-    estimatedInputTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
-    ...(providerInputTokens === undefined ? {} : { providerInputTokens }),
-    reservedOutputTokens: usage.reservedOutputTokens,
-    activeTokens: forecast?.estimatedInputTokens ?? usage.estimatedInputTokens,
-    source: "estimate",
-    view: forecast?.view ?? usage.view,
-    ...(checkpointId ? { checkpointId } : {}),
-    ...(forecast ? { forecastReason: forecast.reason } : {}),
-  };
 }
 
 function projectCompactionMarker(
