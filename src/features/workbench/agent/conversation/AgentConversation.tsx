@@ -11,6 +11,7 @@ import { useAgentMessageEditController } from "@/features/workbench/agent/runtim
 import { useSettingsStore } from "@/store/slices/settings-slice";
 
 import { AgentComposerControls } from "./AgentComposerControls";
+import { AgentContextCompactionActivity } from "./AgentContextCompactionActivity";
 import { AgentRuntimeMessageStatus } from "./AgentRuntimeMessageStatus";
 
 interface AgentConversationProps {
@@ -49,6 +50,7 @@ export function AgentConversation({
           onUserMessageEditCancel={messageEditController?.cancelEdit}
           components={{
             AssistantMessageStatus: AgentRuntimeMessageStatus,
+            DataPart: AgentContextCompactionActivity,
             ComposerFooterStart: AgentComposerControlsWithSettings,
             ComposerCancelAction: AgentRuntimeComposerCancelAction,
           }}

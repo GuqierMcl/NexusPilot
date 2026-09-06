@@ -81,6 +81,12 @@ reason = user_stop
 
 这些机制最终应收敛为 Runtime 的 `interrupted` 事实，而不是让前端或工具各自维护一套取消状态。
 
+### 终止来源保真
+
+Runtime 必须保留最先确定且具有领域意义的终态来源。AI SDK `abort` part 携带的 `reason` 应原样进入 Runtime 的中断分类与 message；不得丢弃后统一写成 `stream aborted`。如果 Provider/AI SDK failure 已先确定为 `failed`，随后发生的 HTTP/WebSocket transport abort 不能把它覆盖成 `client_disconnect`。反之，用户停止、业务 timeout、Runtime shutdown 和真实客户端断开仍分别映射到各自的 interrupt reason。
+
+核心 HTTP 和 WebSocket transport 不设置短 idle timeout 或累计连接寿命。长时间模型生成、上下文压缩、工具执行与审批等待由各自的业务 timeout、显式 interrupt 和 shutdown 控制；Backend Bridge heartbeat 只判断 peer 是否存活，不限制健康连接可以持续多久。
+
 ## 状态模型
 
 ### Run

@@ -54,6 +54,12 @@ Rust / Tauri Host
 
 聊天附件同样走受认证的 Frontend ↔ AI Runtime HTTP 通道，但上传与 Run 是两个明确阶段：`/v1/attachment-uploads` 获取原始 bytes 并在 Runtime `dataDir` 建立最终 `att_*`；`/v1/runs` 只接收该 ID。附件内容端点仅供 NexusPilot UI 预览或下载，loopback URL 与 Bearer token 都不能进入 Provider 请求；AI Runtime 从本地 Blob Store 读取 bytes 后构造 AI SDK 标准 `file` part。
 
+### 核心长连接生命周期
+
+AI Runtime 的 HTTP server 与 WebSocket transport 不为核心长连接设置 idle timeout。`POST /v1/runs`、Permission continuation、EventBus/SSE 和 Backend Bridge 可以跨越长时间的模型生成、上下文压缩、工具执行或审批等待；传输层不能仅因一段时间没有响应字节或业务 Frame 就主动终止它们，也不设置累计连接寿命上限。
+
+禁用 transport idle timeout 不等于取消业务生命周期控制：用户停止、Run/工具/Provider 请求自身的业务 timeout、Runtime shutdown，以及 Backend Bridge 的应用层 heartbeat/liveness 检测仍然独立生效。SSE keepalive 和 Bridge ping/pong 只用于维持或判断连接活性，不构成连接总时长限制。若未来运行平台无法禁用 transport timeout，只能采用集中配置、明确文档化且不短于任何合法业务生命周期的宽裕值。
+
 ## 相邻通道：Workbench Domain Event
 
 AI Runtime 通过 Bridge 发起数据库操作后，Rust 仍在同一个 `ConnectionRuntimeManager` 中提交状态。若连接被打开、断开或 health/capability 变化，Rust 通过 Tauri Workbench Domain Event 主动通知 React；Frontend 再更新 `connectionSessionStore`、相关 Query cache 和 Explorer 投影。
@@ -173,6 +179,7 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 - Backend Bridge 断线不会把 AI Runtime 进程标记为 unhealthy，也不会阻止 Runtime-local Tool；
 - Frontend `/health` 请求失败不会成为 Rust 重连信号；
 - AI SDK stream 断线不会把 EventBus 或 WebSocket Bridge 变成消息历史恢复通道。
+- 已经确定的 Provider/AI SDK failure 不会被稍后到达的 transport abort 覆盖；AI SDK `abort` part 提供的 reason 必须保留并映射到对应的结构化 interrupt reason。
 
 ## 实现状态
 
@@ -185,7 +192,7 @@ Backend Bridge 使用自己的 endpoint 信息、ready、heartbeat 和重连状�
 - live-only Global EventBus 与 `GET /v1/events`；
 - Frontend EventBus 订阅和 Snapshot invalidation。
 
-默认 message Snapshot 读取 active lineage，并返回 active head/revision；`view=transcript` 是完整 append-only 审计 history 的显式读取方式。Context Window Manager 与 `ContextCompactionService` 在主模型调用前建立 request-scoped context plan；自动压缩和唯一安全 overflow recovery 仍通过主 stream/Store 事实收敛，既不借用 EventBus 承载 summary，也不通过 SSE 重放历史。active Assistant metadata 只投影安全的 compaction lifecycle marker、next-turn forecast 和辅助 usage 标量；`failed` marker 不携带 diagnostics，summary、reasoning 与 Safety State 均不进入前端消息 metadata。
+默认 message Snapshot 读取 active lineage，并返回 active head/revision；`view=transcript` 是完整 append-only 审计 history 的显式读取方式。响应顶层 `context_compaction_activities` 返回对应视图内的 durable lifecycle facts。Activity 的 `requestIndex` 是实际 Provider/model request identity；可选 `boundaryStepIndex` 是独立的 UI timeline insertion identity，表示 Activity 插在目标可见 Assistant semantic step 之前。普通 `auto_mid_turn` 在 sealed step 0 与下一 step 1 之间压缩时会返回 `boundaryStepIndex: 1`；overflow replacement、Permission continuation 等路径的 request index 与 semantic step index 可以分离，投影不能相互推断，旧记录缺少该字段时才按 `requestIndex` 兼容定位。Context Window Manager 与 `ContextCompactionService` 在首次模型请求及每个安全 model-step continuation 前建立 request-scoped context plan；达到 soft 或 hard budget 但不存在安全 coverage cursor 时也经同一 service 写入 `preparing → failed` lifecycle，不调用 summarizer、不写 checkpoint/ContextPlan，也不发起主模型请求。自动压缩和唯一安全 overflow recovery 仍通过主 stream/Store 事实收敛，既不借用 EventBus 承载 summary，也不通过 SSE 重放历史。EventBus 只发布 durable `context.compaction.updated` invalidation，Frontend 即使在 Run 中也重新读取 Snapshot，可在主响应静默时显示 `preparing`。由于 AI SDK 自己持有当前消息的 streaming state，`/v1/runs` response 还会从 Store 将同一 `cmp_*` identity 的 durable 终态作为 `data-context-compaction` part 插在下一输出前，使 live Snapshot 导入不会被后续 token 覆盖；AI SDK 按 identity 原位更新，Run 终态与刷新后的 `format=ai_sdk` Snapshot 继续恢复同一项。next-turn forecast 和辅助 usage 标量仍位于筛选后的 metadata。summary、reasoning、Safety State 与失败诊断均不进入前端 Activity 或消息 metadata。
 
 当前仓库已经实现 `/v1/internal/backend-bridge`、Rust Backend Bridge client、ready、heartbeat、request/response transport、断线收敛、主动重连、静态 Gateway dispatcher，以及 Runtime Tool Core 到 Bridge 的 Backend Executor Adapter。生产 Registry 已接入七个只读 Backend Tool、可逆的 `connection.open`、内部 `sql.analyze`、受控 `sql.execute`、五组 Redis prepare/execute operation 与 prepared-plan cleanup；它们只通过该通道交换 AI Runtime 意图与响应，不改变 EventBus/SSE 或 `/health` 的职责。`connection.open` 引起的共享数据库 runtime 变化仍通过相邻的 Workbench Domain Event 通知 React。
 

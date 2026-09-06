@@ -5,6 +5,8 @@ import {
   getLatestAssistantMessageMetadata,
   getRuntimeContextUsageState,
   getRuntimeCompactionMarkerLabel,
+  getRuntimeCompactionActivityLabel,
+  getRuntimeCompactionActivityView,
   getRuntimeContextUsageView,
 } from "./runtime-context-view";
 
@@ -208,5 +210,58 @@ describe("runtime context view", () => {
     expect(label).toBe("上下文压缩失败");
     expect(label?.includes("ContextSummaryValidationError")).toBe(false);
     expect(label?.includes("must-not-render")).toBe(false);
+  });
+
+  test("reads only durable compaction Activity scalars", () => {
+    const activity = getRuntimeCompactionActivityView({
+      id: "cmp_1",
+      conversationId: "conv_1",
+      runId: "run_1",
+      requestIndex: 2,
+      boundaryStepIndex: 1,
+      attemptIndex: 0,
+      trigger: "auto_mid_turn",
+      status: "created",
+      sourceHeadRunId: "run_1",
+      sourceConversationRevision: 2,
+      checkpointId: "ckpt_1",
+      beforeEstimatedInputTokens: 900,
+      afterEstimatedInputTokens: 400,
+      startedAt: 10,
+      completedAt: 11,
+      summary: "must-not-render",
+      reasoning: "must-not-render",
+      safetyState: "must-not-render",
+    });
+
+    expect(activity).toEqual({
+      id: "cmp_1",
+      runId: "run_1",
+      requestIndex: 2,
+      boundaryStepIndex: 1,
+      attemptIndex: 0,
+      trigger: "auto_mid_turn",
+      status: "created",
+      checkpointId: "ckpt_1",
+      beforeEstimatedInputTokens: 900,
+      afterEstimatedInputTokens: 400,
+      startedAt: 10,
+      completedAt: 11,
+    });
+    expect(getRuntimeCompactionActivityLabel(activity!)).toBe("上下文已压缩");
+    expect(JSON.stringify(activity).includes("must-not-render")).toBe(false);
+  });
+
+  test("rejects a malformed compaction Activity", () => {
+    expect(getRuntimeCompactionActivityView({
+      id: "cmp_1",
+      runId: "run_1",
+      requestIndex: 0,
+      attemptIndex: 0,
+      trigger: "auto_mid_turn",
+      status: "failed",
+      beforeEstimatedInputTokens: 900,
+      startedAt: 10,
+    })).toBe(null);
   });
 });

@@ -60,6 +60,12 @@ import {
 } from "./agent-message-edit-context";
 import { AgentToolPermissionProvider } from "./tool-permission-context";
 import { RuntimeAttachmentAdapter } from "./runtime-attachment-adapter";
+import {
+    createEmptyPendingRuntimeHistoryScope,
+    markPendingRuntimeHistoryScope,
+    shouldReloadRuntimeHistory,
+    type PendingRuntimeHistoryScope,
+} from "./runtime-history-reload-policy";
 
 interface AgentAssistantRuntimeProviderProps {
     children: ReactNode;
@@ -363,7 +369,7 @@ function AgentRuntimeEventInvalidator({
 }) {
     const aui = useAui();
     const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const pendingHistoryScopeRef = useRef(createEmptyPendingHistoryScope());
+    const pendingHistoryScopeRef = useRef(createEmptyPendingRuntimeHistoryScope());
     const handledRunNotificationKeysRef = useRef(new Set<string>());
 
     useEffect(() => {
@@ -376,7 +382,7 @@ function AgentRuntimeEventInvalidator({
             });
             clearTerminalActiveRun(activeRunStateRef.current, event);
             clearTerminalAgentRunCloseSnapshot(event);
-            markPendingHistoryScope(pendingHistoryScopeRef.current, event);
+            markPendingRuntimeHistoryScope(pendingHistoryScopeRef.current, event);
 
             if (reloadTimerRef.current) {
                 return;
@@ -385,7 +391,7 @@ function AgentRuntimeEventInvalidator({
             reloadTimerRef.current = setTimeout(() => {
                 reloadTimerRef.current = null;
                 const pendingHistoryScope = pendingHistoryScopeRef.current;
-                pendingHistoryScopeRef.current = createEmptyPendingHistoryScope();
+                pendingHistoryScopeRef.current = createEmptyPendingRuntimeHistoryScope();
 
                 void reloadRuntimeSnapshots(
                     aui,
@@ -419,7 +425,7 @@ function AgentRuntimeEventInvalidator({
                 clearTimeout(reloadTimerRef.current);
                 reloadTimerRef.current = null;
             }
-            pendingHistoryScopeRef.current = createEmptyPendingHistoryScope();
+            pendingHistoryScopeRef.current = createEmptyPendingRuntimeHistoryScope();
         };
     }, [
         accessToken,
@@ -519,52 +525,9 @@ function readRecord(value: unknown): Record<string, unknown> | null {
         : null;
 }
 
-interface PendingHistoryScope {
-    global: boolean;
-    conversationIds: Set<string>;
-    titleConversationIds: Set<string>;
-}
-
-function createEmptyPendingHistoryScope(): PendingHistoryScope {
-    return {
-        global: false,
-        conversationIds: new Set<string>(),
-        titleConversationIds: new Set<string>(),
-    };
-}
-
-function markPendingHistoryScope(
-    pending: PendingHistoryScope,
-    event: AiRuntimeEventEnvelope,
-): void {
-    if (
-        event.type === "conversation.updated" &&
-        event.scope.kind === "conversation"
-    ) {
-        pending.titleConversationIds.add(event.scope.conversation_id);
-    }
-
-    if (event.scope.kind === "global") {
-        pending.global = true;
-        return;
-    }
-
-    if (event.scope.kind === "conversation") {
-        pending.conversationIds.add(event.scope.conversation_id);
-        return;
-    }
-
-    if (event.scope.conversation_id) {
-        pending.conversationIds.add(event.scope.conversation_id);
-        return;
-    }
-
-    pending.global = true;
-}
-
 async function reloadRuntimeSnapshots(
     aui: ReturnType<typeof useAui>,
-    pendingHistoryScope: PendingHistoryScope,
+    pendingHistoryScope: PendingRuntimeHistoryScope,
     resolveRuntimeConversationId: RuntimeConversationIdResolver,
 ): Promise<void> {
     await aui.threads().reload();
@@ -581,15 +544,12 @@ async function reloadRuntimeSnapshots(
         await aui.threadListItem().generateTitle();
     }
 
-    if (
-        !pendingHistoryScope.global &&
-        !pendingHistoryScope.conversationIds.has(conversationId)
-    ) {
-        return;
-    }
-
     const thread = aui.thread();
-    if (thread.getState().isRunning) {
+    if (!shouldReloadRuntimeHistory({
+        conversationId,
+        isRunning: thread.getState().isRunning,
+        pending: pendingHistoryScope,
+    })) {
         return;
     }
 

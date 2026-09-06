@@ -28,11 +28,16 @@ import type {
   ContextBudgetSnapshot,
   ContextCheckpoint,
   ContextCheckpointRejection,
+  ContextCoverageCursor,
   ContextPlan,
   ContextPlannerInput,
   RuntimeSafetyState,
 } from "./types";
-import { isContextCoverageBoundarySafe } from "./boundary-validation";
+import {
+  findLatestSafeSealedStepCursor,
+  isContextCoverageBoundarySafe,
+  isContextCoverageCursorSafe,
+} from "./boundary-validation";
 
 export function computeContextLineageHash(
   runs: readonly Run[],
@@ -59,6 +64,76 @@ export function computeContextLineageHash(
   return `sha256:${createHash("sha256").update(payload).digest("hex")}`;
 }
 
+export function resolveContextCoverageCursor(
+  checkpoint: Pick<ContextCheckpoint, "coverageCursor" | "coverageThroughRunId">,
+): ContextCoverageCursor {
+  return checkpoint.coverageCursor ?? {
+    kind: "run",
+    throughRunId: checkpoint.coverageThroughRunId,
+  };
+}
+
+export function contextCoverageRunId(cursor: ContextCoverageCursor): RunId {
+  return cursor.kind === "run" ? cursor.throughRunId : cursor.runId;
+}
+
+export function computeContextCoverageHash(
+  runs: readonly Run[],
+  messages: readonly Message[],
+  cursor: ContextCoverageCursor,
+): string {
+  if (cursor.kind === "run") {
+    return computeContextLineageHash(runs, cursor.throughRunId);
+  }
+  const coverageIndex = runs.findIndex((run) => run.id === cursor.runId);
+  if (coverageIndex < 0) {
+    throw new Error(`Context lineage coverage Run was not found: ${cursor.runId}`);
+  }
+  const run = runs[coverageIndex]!;
+  if (!run.parentMessageId || !run.assistantMessageId) {
+    throw new Error(`Context lineage Run is missing stable Message identities: ${run.id}`);
+  }
+  const assistant = messages.find(
+    (message): message is AssistantMessage =>
+      message.role === "assistant" && message.id === run.assistantMessageId,
+  );
+  const partIndex = assistant?.parts.findIndex(
+    (part) => part.id === cursor.throughPartId,
+  ) ?? -1;
+  const boundary = assistant?.parts[partIndex];
+  if (
+    !assistant
+    || partIndex < 0
+    || boundary?.type !== "step-finish"
+    || boundary.stepIndex !== cursor.throughRequestIndex
+  ) {
+    throw new Error(`Context sealed-step cursor is invalid: ${cursor.runId}/${cursor.throughPartId}`);
+  }
+  const lineage = runs.slice(0, coverageIndex).map((candidate) => {
+    if (!candidate.parentMessageId || !candidate.assistantMessageId) {
+      throw new Error(`Context lineage Run is missing stable Message identities: ${candidate.id}`);
+    }
+    return {
+      runId: candidate.id,
+      userMessageId: candidate.parentMessageId,
+      assistantMessageId: candidate.assistantMessageId,
+    };
+  });
+  const payload = stableStringifyJson({
+    version: "2",
+    lineage,
+    sealedStep: {
+      runId: run.id,
+      userMessageId: run.parentMessageId,
+      assistantMessageId: run.assistantMessageId,
+      throughRequestIndex: cursor.throughRequestIndex,
+      throughPartId: cursor.throughPartId,
+      parts: assistant.parts.slice(0, partIndex + 1),
+    },
+  });
+  return `sha256:${createHash("sha256").update(payload).digest("hex")}`;
+}
+
 export function isContextCheckpointParentChainUsable(
   checkpoint: ContextCheckpoint,
   checkpointsById: ReadonlyMap<string, ContextCheckpoint>,
@@ -68,7 +143,10 @@ export function isContextCheckpointParentChainUsable(
     lineageRuns.map((run, index) => [run.id, index] as const),
   );
   let child = checkpoint;
-  let childCoverageIndex = coverageIndices.get(child.coverageThroughRunId);
+  let childPosition = contextCoveragePosition(
+    resolveContextCoverageCursor(child),
+    coverageIndices,
+  );
   const visited = new Set<string>([checkpoint.id]);
 
   while (child.parentCheckpointId) {
@@ -86,22 +164,40 @@ export function isContextCheckpointParentChainUsable(
       return false;
     }
 
-    const parentCoverageIndex = coverageIndices.get(parent.coverageThroughRunId);
+    const parentCursor = resolveContextCoverageCursor(parent);
+    const parentPosition = contextCoveragePosition(parentCursor, coverageIndices);
     if (
-      childCoverageIndex === undefined
-      || parentCoverageIndex === undefined
-      || parentCoverageIndex >= childCoverageIndex
-      || computeContextLineageHash(lineageRuns, parent.coverageThroughRunId)
-        !== parent.lineageHash
+      !childPosition
+      || !parentPosition
+      || compareContextCoveragePositions(parentPosition, childPosition) >= 0
+      || (parentCursor.kind === "run"
+        && computeContextLineageHash(lineageRuns, parentCursor.throughRunId)
+          !== parent.lineageHash)
     ) {
       return false;
     }
 
     child = parent;
-    childCoverageIndex = parentCoverageIndex;
+    childPosition = parentPosition;
   }
 
   return true;
+}
+
+function contextCoveragePosition(
+  cursor: ContextCoverageCursor,
+  coverageIndices: ReadonlyMap<RunId, number>,
+): readonly [number, number] | undefined {
+  const runIndex = coverageIndices.get(contextCoverageRunId(cursor));
+  if (runIndex === undefined) return undefined;
+  return [runIndex, cursor.kind === "run" ? Number.MAX_SAFE_INTEGER : cursor.throughRequestIndex];
+}
+
+function compareContextCoveragePositions(
+  left: readonly [number, number],
+  right: readonly [number, number],
+): number {
+  return left[0] - right[0] || left[1] - right[1];
 }
 
 interface ResolvedContextLineage {
@@ -112,6 +208,7 @@ interface ResolvedContextLineage {
 interface CheckpointCandidate {
   checkpoint: ContextCheckpoint;
   coverageIndex: number;
+  coverageStepIndex: number;
   rawRuns: Run[];
   rawMessages: Message[];
   rawTokens: number;
@@ -124,11 +221,16 @@ type CheckpointCandidateEvaluation =
   | { rejection: ContextCheckpointRejection };
 
 export type ContextPlanningErrorCode =
-  "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY";
+  | "CONTEXT_SOFT_TRIGGER_REACHED_WITHOUT_SAFE_BOUNDARY"
+  | "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY";
 
 export class ContextPlanningError extends Error {
   constructor(readonly code: ContextPlanningErrorCode) {
-    super("Context exceeds the hard input budget and has no safe compaction boundary");
+    super(
+      code === "CONTEXT_SOFT_TRIGGER_REACHED_WITHOUT_SAFE_BOUNDARY"
+        ? "Context reached the compaction threshold but has no safe compaction boundary"
+        : "Context exceeds the hard input budget and has no safe compaction boundary",
+    );
     this.name = "ContextPlanningError";
   }
 }
@@ -226,8 +328,16 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
     safetyStateTokens,
   });
   const rawContentTokens = fullRawTokens + safetyStateTokens;
+  const hasCurrentRunSealedCheckpoint = input.trigger === "auto_mid_turn"
+    && input.snapshot.checkpoints.some((checkpoint) => {
+      const cursor = resolveContextCoverageCursor(checkpoint);
+      return cursor.kind === "sealed_step"
+        && cursor.runId === input.runId
+        && cursor.throughRequestIndex < input.requestIndex;
+    });
   if (
     input.trigger !== "provider_overflow"
+    && !hasCurrentRunSealedCheckpoint
     &&
     rawContentTokens <= (rawBudget.hardInputBudget ?? Number.NEGATIVE_INFINITY)
     && rawContentTokens < (rawBudget.softTriggerTokens ?? Number.NEGATIVE_INFINITY)
@@ -243,18 +353,33 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
   }
 
   const safeCoverageIndices = findSafeCoverageIndices(input, lineage.runs);
+  const safeSealedStepCursor = input.trigger === "auto_mid_turn"
+    || input.trigger === "provider_overflow"
+    ? findLatestSafeSealedStepCursor({
+        snapshot: input.snapshot,
+        lineageRuns: lineage.runs,
+        beforeRequestIndex: input.requestIndex,
+      })
+    : undefined;
   const targetTokens = rawBudget.targetTokens ?? Number.NEGATIVE_INFINITY;
   const checkpointsById = new Map(
     input.snapshot.checkpoints.map((checkpoint) => [checkpoint.id, checkpoint] as const),
   );
   const evaluatedCheckpoints = input.trigger === "provider_overflow"
+    && input.providerOverflowCheckpointId === undefined
     ? []
-    : input.snapshot.checkpoints.map((checkpoint) => evaluateCheckpointCandidate(
+    : input.snapshot.checkpoints
+      .filter((checkpoint) =>
+        input.providerOverflowCheckpointId === undefined
+        || checkpoint.id === input.providerOverflowCheckpointId
+      )
+      .map((checkpoint) => evaluateCheckpointCandidate(
       checkpoint,
       checkpointsById,
       input,
       lineage,
       safeCoverageIndices,
+      safeSealedStepCursor,
       safetyStateTokens,
       retainedModelInputTokens,
       targetTokens,
@@ -266,6 +391,7 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
     .flatMap((evaluation) => "candidate" in evaluation ? [evaluation.candidate] : [])
     .sort((left, right) =>
       right.coverageIndex - left.coverageIndex
+      || right.coverageStepIndex - left.coverageStepIndex
       || left.contentTokens - right.contentTokens
       || right.checkpoint.time.created - left.checkpoint.time.created
       || left.checkpoint.id.localeCompare(right.checkpoint.id),
@@ -293,28 +419,32 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
   }
 
   const eligibleCoverageIndex = safeCoverageIndices.at(-1);
-  if (eligibleCoverageIndex === undefined) {
-    if (rawContentTokens <= rawBudget.hardInputBudget!) {
-      return createPlan(input, {
-        lineageRunIds,
-        rawRuns: lineage.runs,
-        view: "raw",
-        reason: "raw_compaction_blocked",
-        safetyState,
-        budget: rawBudget,
-        checkpointRejections,
-      });
-    }
-    throw new ContextPlanningError(
-      "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY",
-    );
+  const eligibleCoverageCursor: ContextCoverageCursor | undefined =
+    safeSealedStepCursor
+    ?? (eligibleCoverageIndex === undefined
+      ? undefined
+      : {
+          kind: "run",
+          throughRunId: lineage.runs[eligibleCoverageIndex]!.id,
+        });
+  if (eligibleCoverageCursor === undefined) {
+    return createPlan(input, {
+      lineageRunIds,
+      rawRuns: lineage.runs,
+      view: "raw",
+      reason: "raw_compaction_blocked",
+      safetyState,
+      budget: rawBudget,
+      checkpointRejections,
+    });
   }
   return createPlan(input, {
     lineageRunIds,
     rawRuns: lineage.runs,
     view: "raw",
     reason: "compaction_required",
-    eligibleCoverageThroughRunId: lineage.runs[eligibleCoverageIndex]!.id,
+    eligibleCoverageCursor,
+    eligibleCoverageThroughRunId: contextCoverageRunId(eligibleCoverageCursor),
     safetyState,
     budget: rawBudget,
     checkpointRejections,
@@ -346,9 +476,19 @@ function assertPlannerInput(input: ContextPlannerInput): void {
     && (
       !isNonnegativeInteger(input.retainedModelInput.estimatedTokens)
       || input.retainedModelInput.contentHash.length === 0
+      || (input.retainedModelInput.fromRequestIndex !== undefined
+        && !isNonnegativeInteger(input.retainedModelInput.fromRequestIndex))
     )
   ) {
     throw new Error("Context planner retained model input is invalid");
+  }
+  if (
+    input.providerOverflowCheckpointId !== undefined
+    && input.trigger !== "provider_overflow"
+  ) {
+    throw new Error(
+      "Context planner overflow checkpoint selection requires a Provider overflow trigger",
+    );
   }
   const policy = input.policy;
   if (
@@ -546,6 +686,7 @@ function evaluateCheckpointCandidate(
   input: ContextPlannerInput,
   lineage: ResolvedContextLineage,
   safeCoverageIndices: readonly number[],
+  safeSealedStepCursor: ContextCoverageCursor | undefined,
   safetyStateTokens: number,
   retainedModelInputTokens: number,
   targetTokens: number,
@@ -568,21 +709,33 @@ function evaluateCheckpointCandidate(
   ) {
     return reject("unsupported_compatibility");
   }
-  const coverageIndex = lineage.runs.findIndex(
-    (run) => run.id === checkpoint.coverageThroughRunId,
-  );
+  const coverageCursor = resolveContextCoverageCursor(checkpoint);
+  const coverageRunId = contextCoverageRunId(coverageCursor);
+  const coverageIndex = lineage.runs.findIndex((run) => run.id === coverageRunId);
   if (coverageIndex < 0) {
     return reject("coverage_not_active_ancestor");
   }
-  const rawRuns = lineage.runs.slice(coverageIndex + 1);
-  if (rawRuns.length < input.policy.minRawRuns) {
+  const sealedCurrentRun = coverageCursor.kind === "sealed_step";
+  const rawRuns = sealedCurrentRun
+    ? [lineage.runs[coverageIndex]!]
+    : lineage.runs.slice(coverageIndex + 1);
+  if (!sealedCurrentRun && rawRuns.length < input.policy.minRawRuns) {
     return reject("raw_tail_too_short");
   }
-  if (!safeCoverageIndices.includes(coverageIndex)) {
+  if (
+    sealedCurrentRun
+      ? coverageCursor.throughRequestIndex >= input.requestIndex
+        || !isContextCoverageCursorSafe({
+          snapshot: input.snapshot,
+          lineageRuns: lineage.runs,
+          cursor: coverageCursor,
+        })
+      : !safeCoverageIndices.includes(coverageIndex)
+  ) {
     return reject("unsafe_coverage_boundary");
   }
   if (
-    computeContextLineageHash(lineage.runs, checkpoint.coverageThroughRunId)
+    computeContextCoverageHash(lineage.runs, input.snapshot.messages, coverageCursor)
     !== checkpoint.lineageHash
   ) {
     return reject("lineage_hash_mismatch");
@@ -595,13 +748,20 @@ function evaluateCheckpointCandidate(
     rawRuns,
     input.excludeAssistantMessageId,
   );
-  const rawTokens = estimateMessagesTokens(rawMessages) + retainedModelInputTokens;
+  const retainedTokensAreAfterCursor = coverageCursor.kind !== "sealed_step"
+    || (input.retainedModelInput?.fromRequestIndex ?? 0)
+      > coverageCursor.throughRequestIndex;
+  const rawTokens = estimateMessagesTokens(rawMessages)
+    + (retainedTokensAreAfterCursor ? retainedModelInputTokens : 0);
   const checkpointTokens = CONTEXT_ESTIMATOR_OVERHEAD.message
     + CONTEXT_ESTIMATOR_OVERHEAD.part
     + estimateTextTokens(checkpoint.summary);
   const candidate: CheckpointCandidate = {
     checkpoint,
     coverageIndex,
+    coverageStepIndex: coverageCursor.kind === "sealed_step"
+      ? coverageCursor.throughRequestIndex
+      : Number.MAX_SAFE_INTEGER,
     rawRuns,
     rawMessages,
     rawTokens,
@@ -622,6 +782,7 @@ function createPlan(
     reason: ContextPlan["reason"];
     checkpoint?: ContextCheckpoint;
     eligibleCoverageThroughRunId?: RunId;
+    eligibleCoverageCursor?: ContextCoverageCursor;
     safetyState: RuntimeSafetyState;
     budget: ContextBudgetSnapshot;
     checkpointRejections?: ContextCheckpointRejection[];
@@ -649,6 +810,7 @@ function createPlan(
     rawRunIds,
     rawRange,
     eligibleCoverageThroughRunId: selection.eligibleCoverageThroughRunId,
+    eligibleCoverageCursor: selection.eligibleCoverageCursor,
     safetyStateHash: selection.safetyState.hash,
     requestHash,
     budget: selection.budget,
@@ -672,6 +834,9 @@ function createPlan(
     ...(rawRange ? { rawRange } : {}),
     ...(selection.eligibleCoverageThroughRunId
       ? { eligibleCoverageThroughRunId: selection.eligibleCoverageThroughRunId }
+      : {}),
+    ...(selection.eligibleCoverageCursor
+      ? { eligibleCoverageCursor: selection.eligibleCoverageCursor }
       : {}),
     ...(selection.checkpointRejections?.length
       ? { checkpointRejections: selection.checkpointRejections }

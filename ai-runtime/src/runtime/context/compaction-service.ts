@@ -11,9 +11,13 @@ import { createRuntimeId, type RuntimeId, type RuntimeIdPrefix } from "../core/i
 import type { ConversationId, MessageId, Run, RunId } from "../core/types";
 import type { RuntimeRunnerStore } from "../runners/runner-types";
 import {
+  computeContextCoverageHash,
   computeContextLineageHash,
   computeContextPlanRequestHash,
+  ContextPlanningError,
+  contextCoverageRunId,
   planContextWindow,
+  resolveContextCoverageCursor,
 } from "./planner";
 import {
   CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION,
@@ -32,8 +36,11 @@ import {
 import { CONTEXT_ESTIMATOR_OVERHEAD, estimateTextTokens } from "./token-estimator";
 import type {
   ContextCheckpoint,
+  ContextCompactionActivity,
   ContextCompactionPolicy,
   ContextCompactionTrigger,
+  ContextCoverageCursor,
+  ContextPlan,
   ContextPreparationClaim,
   ContextPlannerSnapshot,
   ContextUsage,
@@ -66,6 +73,9 @@ export interface ContextCompactionRequest {
   expectedConversationRevision: number;
   runId: RunId;
   requestIndex: number;
+  /** Visible Assistant step boundary; durable plan identity remains requestIndex. */
+  activityBoundaryStepIndex?: number;
+  attemptIndex?: number;
   preparationClaim: ContextPreparationClaim;
   providerId: string;
   modelId: string;
@@ -77,19 +87,21 @@ export interface ContextCompactionRequest {
   toolSchemas: unknown;
   trigger: ContextCompactionTrigger;
   candidateCoverageThroughRunId?: RunId;
+  candidateCoverageCursor?: ContextCoverageCursor;
   policy: ContextCompactionPolicy;
   safetyStateMaxTokens?: number;
   excludeAssistantMessageId?: MessageId;
-  retainedModelInput?: {
-    estimatedTokens: number;
-    contentHash: string;
-  };
+  retainedModelInput?: import("./types").ContextPlannerInput["retainedModelInput"];
   abortSignal?: AbortSignal;
   timeoutMs?: number;
 }
 
 export type ContextCompactionResult =
-  | { status: "created"; checkpoint: ContextCheckpoint }
+  | {
+      status: "created";
+      checkpoint: ContextCheckpoint;
+      activityId: ContextCompactionActivity["id"];
+    }
   | { status: "stale" }
   | { status: "not_needed" };
 
@@ -181,32 +193,64 @@ export class ContextCompactionService {
       excludeAssistantMessageId: input.excludeAssistantMessageId,
       retainedModelInput: input.retainedModelInput,
     });
+    if (plan.reason === "raw_compaction_blocked") {
+      const activity = this.startContextCompactionActivity(input, plan);
+      const error = new ContextPlanningError(
+        isContextPlanAboveHardInputBudget(plan)
+          ? "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY"
+          : "CONTEXT_SOFT_TRIGGER_REACHED_WITHOUT_SAFE_BOUNDARY",
+      );
+      this.finishContextCompactionActivity(activity, input, "failed");
+      throw error;
+    }
     if (
       input.trigger === "provider_overflow"
       && plan.reason !== "compaction_required"
     ) {
       throw new Error("Provider context overflow has no safe compaction boundary");
     }
-    if (plan.reason !== "compaction_required" || !plan.eligibleCoverageThroughRunId) {
+    if (
+      plan.reason !== "compaction_required"
+      || (!plan.eligibleCoverageCursor && !plan.eligibleCoverageThroughRunId)
+    ) {
       return { status: "not_needed" };
     }
+    const coverageCursor = plan.eligibleCoverageCursor ?? {
+      kind: "run" as const,
+      throughRunId: plan.eligibleCoverageThroughRunId!,
+    };
     if (
       input.candidateCoverageThroughRunId !== undefined
-      && input.candidateCoverageThroughRunId !== plan.eligibleCoverageThroughRunId
+      && input.candidateCoverageThroughRunId !== contextCoverageRunId(coverageCursor)
+    ) {
+      throw new Error("Context compaction candidate boundary is stale or unsafe");
+    }
+    if (
+      input.candidateCoverageCursor !== undefined
+      && stableCursor(input.candidateCoverageCursor) !== stableCursor(coverageCursor)
     ) {
       throw new Error("Context compaction candidate boundary is stale or unsafe");
     }
     const lineage = resolveSnapshotLineage(snapshot, input.expectedHeadRunId);
-    const coverageThroughRunId = plan.eligibleCoverageThroughRunId;
+    const coverageThroughRunId = contextCoverageRunId(coverageCursor);
     const coverageIndex = lineage.findIndex((run) => run.id === coverageThroughRunId);
-    if (coverageIndex < 0 || coverageIndex >= lineage.length - 1) {
-      throw new Error("Context compaction boundary is not a non-current ancestor");
+    if (
+      coverageIndex < 0
+      || (coverageCursor.kind === "run" && coverageIndex >= lineage.length - 1)
+      || (coverageCursor.kind === "sealed_step" && coverageIndex !== lineage.length - 1)
+    ) {
+      throw new Error("Context compaction boundary is not a safe Run or sealed-step prefix");
     }
-    const parentCheckpoint = selectParentCheckpoint(snapshot, lineage, coverageIndex);
+    const parentCheckpoint = selectParentCheckpoint(
+      snapshot,
+      lineage,
+      coverageCursor,
+    );
     const sourceState = computeContextCoverageSourceState({
       snapshot,
       lineageRuns: lineage,
       coverageIndex,
+      coverageCursor,
       safetyStateHash: plan.safetyState.hash,
       parentCheckpoint,
     });
@@ -221,7 +265,9 @@ export class ContextCompactionService {
       input.policy.summaryRetryMaxOutputTokens,
       input.modelOutputLimit,
     );
-    const generatedSummary = await generateRollingSummary({
+    const activity = this.startContextCompactionActivity(input, plan, coverageCursor);
+    try {
+      const generatedSummary = await generateRollingSummary({
       generator: this.generator,
       model: input.model,
       contextWindow: input.contextWindow!,
@@ -236,8 +282,8 @@ export class ContextCompactionService {
       timeoutMs: input.timeoutMs,
       renewPreparationClaim: () => this.renewPreparationClaim(input.preparationClaim),
     });
-    const checkpointCreatedAt = this.now();
-    const checkpointUsage = {
+      const checkpointCreatedAt = this.now();
+      const checkpointUsage = {
       id: this.createId("ctxuse"),
       conversationId: input.conversationId,
       runId: input.runId,
@@ -261,13 +307,18 @@ export class ContextCompactionService {
       checkpointFormatVersion: input.policy.checkpointFormatVersion,
       time: { created: checkpointCreatedAt },
     } satisfies ContextUsage;
-    const checkpoint: ContextCheckpoint = {
+      const checkpoint: ContextCheckpoint = {
       id: this.createId("ckpt"),
       conversationId: input.conversationId,
       coverageThroughRunId,
+      coverageCursor,
       sourceHeadRunId: input.expectedHeadRunId,
       sourceConversationRevision: input.expectedConversationRevision,
-      lineageHash: computeContextLineageHash(lineage, coverageThroughRunId),
+      lineageHash: computeContextCoverageHash(
+        lineage,
+        snapshot.messages,
+        coverageCursor,
+      ),
       sourceStateHash: sourceState.sourceStateHash,
       safetyStateHash: sourceState.safetyStateHash,
       ...(parentCheckpoint ? { parentCheckpointId: parentCheckpoint.id } : {}),
@@ -284,15 +335,83 @@ export class ContextCompactionService {
       usage: checkpointUsage,
       time: { created: checkpointCreatedAt },
     };
-    this.renewPreparationClaim(input.preparationClaim);
-    const committed = this.store.commitContextCheckpoint({
-      checkpoint,
+      this.renewPreparationClaim(input.preparationClaim);
+      const committed = this.store.commitContextCheckpoint({
+        checkpoint,
+        eventId: this.createId("evt"),
+        preparationClaim: input.preparationClaim,
+        activityCompletion: {
+          activityId: activity.id,
+          status: "created",
+          checkpointId: checkpoint.id,
+          coverageCursor,
+          completedAt: checkpointCreatedAt,
+          eventId: this.createId("evt"),
+        },
+      });
+      if (committed === "committed") {
+        return { status: "created", checkpoint, activityId: activity.id };
+      }
+      this.finishContextCompactionActivity(activity, input, "interrupted");
+      return { status: "stale" };
+    } catch (error) {
+      this.finishContextCompactionActivity(
+        activity,
+        input,
+        isContextCompactionInterruption(error, input.abortSignal)
+          ? "interrupted"
+          : "failed",
+      );
+      throw error;
+    }
+  }
+
+  private startContextCompactionActivity(
+    input: ContextCompactionRequest,
+    plan: ContextPlan,
+    coverageCursor?: ContextCoverageCursor,
+  ): ContextCompactionActivity {
+    return this.store.startContextCompactionActivity({
+      activity: {
+        id: this.createId("cmp"),
+        conversationId: input.conversationId,
+        runId: input.runId,
+        requestIndex: input.requestIndex,
+        ...(input.activityBoundaryStepIndex === undefined
+          ? {}
+          : { boundaryStepIndex: input.activityBoundaryStepIndex }),
+        attemptIndex: input.attemptIndex ?? 0,
+        trigger: input.trigger,
+        status: "preparing",
+        sourceHeadRunId: plan.sourceHeadRunId,
+        sourceConversationRevision: plan.sourceConversationRevision,
+        ...(coverageCursor ? { coverageCursor } : {}),
+        beforeEstimatedInputTokens: plan.budget.estimatedInputTokens,
+        startedAt: this.now(),
+      } satisfies ContextCompactionActivity & { status: "preparing" },
       eventId: this.createId("evt"),
-      preparationClaim: input.preparationClaim,
     });
-    return committed === "committed"
-      ? { status: "created", checkpoint }
-      : { status: "stale" };
+  }
+
+  private finishContextCompactionActivity(
+    activity: ContextCompactionActivity,
+    input: ContextCompactionRequest,
+    status: "failed" | "interrupted",
+  ): void {
+    try {
+      this.store.finishContextCompactionActivity({
+        activityId: activity.id,
+        status,
+        completedAt: this.now(),
+        eventId: this.createId("evt"),
+      });
+    } catch (activityError) {
+      console.error(
+        `Failed to persist Context compaction ${status} Activity for ` +
+        `${input.runId}/${input.requestIndex}`,
+        activityError,
+      );
+    }
   }
 
   private renewPreparationClaim(preparationClaim: ContextPreparationClaim): void {
@@ -308,6 +427,23 @@ export class ContextCompactionService {
       );
     }
   }
+}
+
+function isContextPlanAboveHardInputBudget(plan: ContextPlan): boolean {
+  const hardInputBudget = plan.budget.hardInputBudget;
+  if (hardInputBudget === undefined) return false;
+  const contentTokens = plan.budget.rawHistoryTokens
+    + plan.budget.checkpointTokens
+    + plan.budget.safetyStateTokens;
+  return contentTokens > hardInputBudget;
+}
+
+function isContextCompactionInterruption(
+  error: unknown,
+  abortSignal: AbortSignal | undefined,
+): boolean {
+  if (abortSignal?.aborted || error instanceof ContextPreparationLeaseLostError) return true;
+  return error instanceof Error && error.name === "AbortError";
 }
 
 interface RollingSummaryInput {
@@ -718,29 +854,57 @@ function resolveSnapshotLineage(
 function selectParentCheckpoint(
   snapshot: ContextPlannerSnapshot,
   lineage: readonly Run[],
-  coverageIndex: number,
+  coverageCursor: ContextCoverageCursor,
 ): ContextCheckpoint | undefined {
+  const targetPosition = cursorPosition(coverageCursor, lineage);
   return snapshot.checkpoints
-    .map((checkpoint) => ({
-      checkpoint,
-      coverageIndex: lineage.findIndex((run) => run.id === checkpoint.coverageThroughRunId),
-    }))
-    .filter(({ checkpoint, coverageIndex: parentIndex }) =>
+    .map((checkpoint) => {
+      const cursor = resolveContextCoverageCursor(checkpoint);
+      return {
+        checkpoint,
+        cursor,
+        position: cursorPosition(cursor, lineage),
+      };
+    })
+    .filter(({ checkpoint, cursor, position }) =>
       checkpoint.conversationId === snapshot.conversation.id
       && checkpoint.formatVersion === CONTEXT_CHECKPOINT_FORMAT_VERSION
       && checkpoint.compatibility.kind === PROVIDER_NEUTRAL_CONTEXT_KIND
       && checkpoint.compatibility.version === CONTEXT_CHECKPOINT_COMPATIBILITY_VERSION
       && checkpoint.safetyStateVersion === RUNTIME_SAFETY_STATE_VERSION
-      && parentIndex >= 0
-      && parentIndex < coverageIndex
+      && position !== undefined
+      && targetPosition !== undefined
+      && compareCursorPositions(position, targetPosition) < 0
       && checkpoint.lineageHash
-        === computeContextLineageHash(lineage, checkpoint.coverageThroughRunId),
+        === (cursor.kind === "run"
+          ? computeContextLineageHash(lineage, cursor.throughRunId)
+          : computeContextCoverageHash(lineage, snapshot.messages, cursor)),
     )
     .sort((left, right) =>
-      right.coverageIndex - left.coverageIndex
+      compareCursorPositions(right.position!, left.position!)
       || right.checkpoint.time.created - left.checkpoint.time.created
       || left.checkpoint.id.localeCompare(right.checkpoint.id),
     )[0]?.checkpoint;
+}
+
+function cursorPosition(
+  cursor: ContextCoverageCursor,
+  lineage: readonly Run[],
+): readonly [number, number] | undefined {
+  const runIndex = lineage.findIndex((run) => run.id === contextCoverageRunId(cursor));
+  if (runIndex < 0) return undefined;
+  return [runIndex, cursor.kind === "run" ? Number.MAX_SAFE_INTEGER : cursor.throughRequestIndex];
+}
+
+function compareCursorPositions(
+  left: readonly [number, number],
+  right: readonly [number, number],
+): number {
+  return left[0] - right[0] || left[1] - right[1];
+}
+
+function stableCursor(cursor: ContextCoverageCursor): string {
+  return JSON.stringify(cursor);
 }
 
 function validateSummary(

@@ -30,6 +30,9 @@ import type { RunToolSnapshot } from "../tools/resolution";
 import type { RuntimeAttachmentService } from "../attachments";
 import type {
   ContextCheckpoint,
+  ContextCompactionActivity,
+  ContextCompactionActivityFinish,
+  ContextCompactionActivityStart,
   ContextCheckpointCommit,
   ContextPlan,
   ContextPreparationClaim,
@@ -178,6 +181,14 @@ export interface RuntimeRunnerStore {
   appendTrace(trace: TraceEvent): void;
   listTraces(runId: RunId): TraceEvent[];
   listContextCheckpoints(conversationId: ConversationId): ContextCheckpoint[];
+  startContextCompactionActivity(
+    input: ContextCompactionActivityStart,
+  ): ContextCompactionActivity;
+  finishContextCompactionActivity(
+    input: ContextCompactionActivityFinish,
+  ): ContextCompactionActivity;
+  listContextCompactionActivities(conversationId: ConversationId): ContextCompactionActivity[];
+  listContextCompactionActivitiesByRun(runId: RunId): ContextCompactionActivity[];
   getContextPlan(id: ContextPlan["id"]): ContextPlan | null;
   getContextPlanByRunRequest(runId: RunId, requestIndex: number): ContextPlan | null;
   getContextPreparationBrokerKey(): object;

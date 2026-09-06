@@ -9,6 +9,7 @@ import { generateRuntimeContextSummary } from "../src/app";
 
 import {
   ContextCompactionService,
+  ContextPlanningError,
   ContextPreparationLeaseLostError,
   ContextPreparationStaleError,
   ContextSummaryValidationError,
@@ -160,6 +161,45 @@ function createHistory(
   return { db, store, conversation };
 }
 
+function expectCompactionAttempts(
+  store: RuntimeSqliteStore,
+  expected: readonly {
+    attemptIndex: number;
+    status: "created" | "failed" | "recovered" | "interrupted";
+  }[],
+): void {
+  const activities = store
+    .listContextCompactionActivities("conv_compaction")
+    .toSorted((left, right) => left.attemptIndex - right.attemptIndex);
+  expect(activities.map((activity) => ({
+    attemptIndex: activity.attemptIndex,
+    status: activity.status,
+  }))).toEqual([...expected]);
+
+  const activityEvents = store
+    .listEvents("conv_compaction")
+    .filter((event) => event.type === "context.compaction.updated");
+  for (const activity of activities) {
+    const statuses = activityEvents.flatMap((event) =>
+      event.properties.info.id === activity.id
+        ? [event.properties.info.status]
+        : []
+    ).sort();
+    const expectedStatuses: Array<typeof activity.status> = ["preparing", activity.status];
+    expect(statuses).toEqual(expectedStatuses.sort());
+  }
+}
+
+function expectEventTypeCount(
+  store: RuntimeSqliteStore,
+  type: ReturnType<RuntimeSqliteStore["listEvents"]>[number]["type"],
+  count: number,
+): void {
+  expect(store.listEvents("conv_compaction").filter((event) => event.type === type)).toHaveLength(
+    count,
+  );
+}
+
 function persistCompletedToolPair(store: RuntimeSqliteStore): ToolCall {
   const run = store.getRun("run_a");
   const assistant = store.getMessage("msg_assistant_a");
@@ -294,7 +334,7 @@ async function compactClaimed(
 }
 
 function preparation(
-  trigger: "manual" | "auto_pre_turn" = "auto_pre_turn",
+  trigger: "manual" | "auto_pre_turn" | "auto_mid_turn" = "auto_pre_turn",
   overrides: Partial<ModelContextPreparationInput> = {},
 ): ModelContextPreparationInput {
   return {
@@ -995,7 +1035,7 @@ describe("ContextCompactionService", () => {
       ContextSummaryValidationError,
     );
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "failed" }]);
     db.close();
   });
 
@@ -1017,7 +1057,7 @@ describe("ContextCompactionService", () => {
 
     expect(await compactClaimed(store, service, request("auto_pre_turn"))).toEqual({ status: "stale" });
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "interrupted" }]);
     db.close();
   });
 
@@ -1084,7 +1124,8 @@ describe("ContextCompactionService", () => {
 
     expect(result.status).toBe("created");
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(1);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
     db.close();
   });
 
@@ -1278,7 +1319,7 @@ describe("ContextCompactionService", () => {
       });
       expect(fixture.store.getConversation("conv_compaction")?.revision).toBe(3);
       expect(fixture.store.listContextCheckpoints("conv_compaction")).toEqual([]);
-      expect(fixture.store.listEvents("conv_compaction")).toEqual([]);
+      expectCompactionAttempts(fixture.store, [{ attemptIndex: 0, status: "interrupted" }]);
       fixture.db.close();
     },
   );
@@ -1341,7 +1382,7 @@ describe("ContextCompactionService", () => {
       status: "stale",
     });
     expect(fixture.store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(fixture.store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(fixture.store, [{ attemptIndex: 0, status: "interrupted" }]);
     fixture.db.close();
   });
 
@@ -1446,7 +1487,7 @@ describe("ContextCompactionService", () => {
     expect(await compactClaimed(store, service, request("auto_pre_turn"))).toEqual({ status: "stale" });
     expect(store.getConversation("conv_compaction")?.revision).toBe(3);
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "interrupted" }]);
     db.close();
   });
 
@@ -1543,7 +1584,7 @@ describe("ContextCompactionService", () => {
     }
     expect(generatorCalls).toBe(0);
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "failed" }]);
     db.close();
   });
 
@@ -1726,7 +1767,7 @@ describe("ContextCompactionService", () => {
       ContextSummaryValidationError,
     );
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "failed" }]);
     db.close();
   });
 
@@ -2010,7 +2051,7 @@ describe("ModelContextManager", () => {
     }
     expect(store.listContextPlansByRun("run_c")).toEqual([]);
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "interrupted" }]);
     db.close();
   });
 
@@ -2078,7 +2119,9 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toEqual([first.plan]);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     db.close();
   });
 
@@ -2108,7 +2151,9 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     db.close();
   });
 
@@ -2157,7 +2202,9 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     expect(store.getContextPreparationClaim("run_c", 0)).toBeNull();
     db.close();
   });
@@ -2202,7 +2249,9 @@ describe("ModelContextManager", () => {
     );
     expect(generatorCalls).toBe(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     db.close();
   });
 
@@ -2243,7 +2292,12 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(2);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [
+      { attemptIndex: 0, status: "failed" },
+      { attemptIndex: 1, status: "created" },
+    ]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     expect(store.getContextPreparationClaim("run_c", 0)).toBeNull();
     db.close();
   });
@@ -2399,7 +2453,7 @@ describe("ModelContextManager", () => {
     );
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
     expect(store.listContextPlansByRun("run_c")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "interrupted" }]);
     expect(store.getContextPreparationClaim("run_c", 0)).toBeNull();
     db.close();
   });
@@ -2427,7 +2481,7 @@ describe("ModelContextManager", () => {
     await expect(manager.prepare(preparation("manual"))).rejects.toBe(providerError);
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
     expect(store.listContextPlansByRun("run_c")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "failed" }]);
     db.close();
   });
 
@@ -2507,7 +2561,12 @@ describe("ModelContextManager", () => {
       const checkpoints = secondStore.listContextCheckpoints("conv_compaction");
       expect(checkpoints).toHaveLength(1);
       expect(checkpoints[0]?.summary).toBe("WINNING_OWNER_SUMMARY");
-      expect(secondStore.listEvents("conv_compaction")).toHaveLength(2);
+      expectCompactionAttempts(secondStore, [
+        { attemptIndex: 0, status: "interrupted" },
+        { attemptIndex: 1, status: "created" },
+      ]);
+      expectEventTypeCount(secondStore, "context.checkpoint.created", 1);
+      expectEventTypeCount(secondStore, "context.plan.created", 1);
       expect(secondStore.listContextPlansByRun("run_c")).toHaveLength(1);
       expect(winner.marker?.checkpointId).toBe(checkpoints[0]?.id);
       expect(secondStore.getContextPreparationClaim("run_c", 0)).toBeNull();
@@ -2578,7 +2637,9 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toEqual([first.plan]);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     db.close();
   });
 
@@ -2656,7 +2717,9 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toEqual([first.plan]);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     db.close();
   });
 
@@ -2783,7 +2846,9 @@ describe("ModelContextManager", () => {
     expect(attachmentReads).toBe(2);
     expect(store.listContextPlansByRun("run_c")).toHaveLength(1);
     expect(store.listContextCheckpoints("conv_compaction")).toHaveLength(1);
-    expect(store.listEvents("conv_compaction")).toHaveLength(2);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "created" }]);
+    expectEventTypeCount(store, "context.checkpoint.created", 1);
+    expectEventTypeCount(store, "context.plan.created", 1);
     db.close();
   });
 
@@ -2826,7 +2891,7 @@ describe("ModelContextManager", () => {
     expect(store.getContextPlanByRunRequest("run_c", 0)).toBeNull();
     expect(store.getContextPlanByRunRequest("run_e", 0)).toBeNull();
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "interrupted" }]);
     db.close();
   });
 
@@ -2852,7 +2917,7 @@ describe("ModelContextManager", () => {
     expect(generatorCalls).toBe(1);
     expect(store.listContextPlansByRun("run_c")).toEqual([]);
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
-    expect(store.listEvents("conv_compaction")).toEqual([]);
+    expectCompactionAttempts(store, [{ attemptIndex: 0, status: "interrupted" }]);
     db.close();
   });
 
@@ -2977,6 +3042,108 @@ describe("ModelContextManager", () => {
     expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
     db.close();
   });
+
+  test.each([
+    [
+      "soft-triggered pre-turn",
+      "auto_pre_turn" as const,
+      0,
+      undefined,
+      4_096,
+      "CONTEXT_SOFT_TRIGGER_REACHED_WITHOUT_SAFE_BOUNDARY" as const,
+    ],
+    [
+      "soft-triggered mid-turn",
+      "auto_mid_turn" as const,
+      1,
+      1,
+      4_096,
+      "CONTEXT_SOFT_TRIGGER_REACHED_WITHOUT_SAFE_BOUNDARY" as const,
+    ],
+    [
+      "hard-budget pre-turn",
+      "auto_pre_turn" as const,
+      0,
+      undefined,
+      500,
+      "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY" as const,
+    ],
+    [
+      "hard-budget mid-turn",
+      "auto_mid_turn" as const,
+      1,
+      1,
+      500,
+      "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY" as const,
+    ],
+  ])(
+    "fails a %s gate with a durable Activity when no safe boundary exists",
+    async (
+      _name,
+      trigger,
+      requestIndex,
+      activityBoundaryStepIndex,
+      contextWindow,
+      expectedCode,
+    ) => {
+      const { db, store } = createHistory();
+      const ids = deterministicIds();
+      let summaryCalls = 0;
+      const service = new ContextCompactionService({
+        store,
+        generator: async () => {
+          summaryCalls += 1;
+          return { text: "must not run" };
+        },
+        now: () => 100,
+        createId: ids,
+      });
+      const manager = new ModelContextManager({
+        store,
+        compactionService: service,
+        now: () => 100,
+        createId: ids,
+      });
+      const input = preparation(trigger, {
+        requestIndex,
+        activityBoundaryStepIndex,
+        contextWindow,
+      });
+
+      try {
+        await manager.prepare({
+          ...input,
+          policy: { ...input.policy, minRawRuns: 3 },
+        });
+        throw new Error("Expected the mandatory compaction gate to fail closed");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ContextPlanningError);
+        expect((error as ContextPlanningError).code).toBe(expectedCode);
+      }
+
+      expect(summaryCalls).toBe(0);
+      expect(store.listContextPlansByRun("run_c")).toEqual([]);
+      expect(store.listContextCheckpoints("conv_compaction")).toEqual([]);
+      expectCompactionAttempts(store, [{ attemptIndex: 0, status: "failed" }]);
+      const activity = store.listContextCompactionActivities("conv_compaction")[0];
+      expect(activity).toMatchObject({
+        runId: "run_c",
+        requestIndex,
+        trigger,
+        status: "failed",
+      });
+      expect(activity?.boundaryStepIndex).toBe(activityBoundaryStepIndex);
+      expect(activity?.coverageCursor).toBeUndefined();
+      expect(store.listTraces("run_c").filter((trace) =>
+        trace.type === "context.compaction.preparing"
+        || trace.type === "context.compaction.failed"
+      ).map((trace) => trace.type)).toEqual([
+        "context.compaction.preparing",
+        "context.compaction.failed",
+      ]);
+      db.close();
+    },
+  );
 
   test("persists safe preparing and failed lifecycle facts for invalid summary output", async () => {
     const { db, store } = createHistory();

@@ -6,6 +6,7 @@ import type {
   ConversationId,
   Message,
   MessageId,
+  PartId,
   Permission,
   Run,
   RunId,
@@ -18,6 +19,60 @@ export type ContextCompactionTrigger =
   | "manual"
   | "provider_overflow"
   | "model_switch";
+
+export type ContextCompactionStatus =
+  | "preparing"
+  | "created"
+  | "failed"
+  | "recovered"
+  | "interrupted";
+
+export type ContextCoverageCursor =
+  | {
+      kind: "run";
+      throughRunId: RunId;
+    }
+  | {
+      kind: "sealed_step";
+      runId: RunId;
+      throughRequestIndex: number;
+      throughPartId: PartId;
+    };
+
+export interface ContextCompactionActivity {
+  id: `cmp_${string}`;
+  conversationId: ConversationId;
+  runId: RunId;
+  requestIndex: number;
+  /** UI insertion boundary before a visible Assistant semantic step; independent of requestIndex. */
+  boundaryStepIndex?: number;
+  attemptIndex: number;
+  trigger: ContextCompactionTrigger;
+  status: ContextCompactionStatus;
+  sourceHeadRunId: RunId;
+  sourceConversationRevision: number;
+  coverageCursor?: ContextCoverageCursor;
+  checkpointId?: ContextCheckpointId;
+  beforeEstimatedInputTokens: number;
+  afterEstimatedInputTokens?: number;
+  startedAt: number;
+  completedAt?: number;
+}
+
+export interface ContextCompactionActivityStart {
+  activity: ContextCompactionActivity & { status: "preparing" };
+  eventId: `evt_${string}`;
+}
+
+export interface ContextCompactionActivityFinish {
+  activityId: ContextCompactionActivity["id"];
+  status: Exclude<ContextCompactionStatus, "preparing">;
+  checkpointId?: ContextCheckpointId;
+  coverageCursor?: ContextCoverageCursor;
+  afterEstimatedInputTokens?: number;
+  completedAt: number;
+  eventId: `evt_${string}`;
+}
 
 export interface ContextCompactionPolicy {
   version: string;
@@ -246,6 +301,8 @@ export interface ContextCheckpoint {
   id: ContextCheckpointId;
   conversationId: ConversationId;
   coverageThroughRunId: RunId;
+  /** Absent only on checkpoints written before sealed-step coverage existed. */
+  coverageCursor?: ContextCoverageCursor;
   sourceHeadRunId: RunId;
   sourceConversationRevision: number;
   lineageHash: string;
@@ -295,6 +352,7 @@ export interface ContextPlan {
   rawRunIds: RunId[];
   rawRange?: ContextRawRange;
   eligibleCoverageThroughRunId?: RunId;
+  eligibleCoverageCursor?: ContextCoverageCursor;
   checkpointRejections?: ContextCheckpointRejection[];
   safetyState: RuntimeSafetyState;
   budget: ContextBudgetSnapshot;
@@ -322,6 +380,9 @@ export interface ContextCheckpointCommit {
   checkpoint: ContextCheckpoint;
   eventId: `evt_${string}`;
   preparationClaim: ContextPreparationClaim;
+  activityCompletion?: ContextCompactionActivityFinish & {
+    status: "created";
+  };
 }
 
 export interface ContextPlanCommit {
@@ -379,5 +440,8 @@ export interface ContextPlannerInput {
   retainedModelInput?: {
     estimatedTokens: number;
     contentHash: string;
+    fromRequestIndex?: number;
   };
+  /** The checkpoint created by this exact overflow preparation, never an older fallback. */
+  providerOverflowCheckpointId?: ContextCheckpointId;
 }

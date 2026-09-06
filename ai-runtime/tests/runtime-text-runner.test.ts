@@ -456,6 +456,108 @@ describe("RuntimeTextRunner", () => {
     db.close();
   });
 
+  test.each([
+    [
+      "soft-triggered",
+      32_000,
+      "Context reached the compaction threshold but has no safe compaction boundary",
+    ],
+    [
+      "hard-budget",
+      64_000,
+      "Context exceeds the hard input budget and has no safe compaction boundary",
+    ],
+  ])(
+    "fails a %s pre-turn without a safe boundary before the model starts",
+    async (_kind, inputSize, expectedMessage) => {
+      const db = openRuntimeDatabase(":memory:");
+      const store = new RuntimeSqliteStore(db);
+      let idSequence = 0;
+      let timeSequence = 0;
+      let modelCalls = 0;
+      let summaryCalls = 0;
+      const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+      const model = new MockLanguageModelV3({
+        doStream: async () => {
+          modelCalls += 1;
+          return {
+            stream: simulateReadableStream({
+              chunks: [{
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: undefined },
+                logprobs: undefined,
+                usage: sdkModelUsage(1),
+              }],
+            }),
+          };
+        },
+      });
+      const compactionService = new ContextCompactionService({
+        store,
+        createId,
+        now: () => 1_000 + timeSequence++,
+        generator: async () => {
+          summaryCalls += 1;
+          return { text: "must not run" };
+        },
+      });
+      const contextManager = new ModelContextManager({
+        store,
+        compactionService,
+        createId,
+        now: () => 1_000 + timeSequence++,
+      });
+      const runner = new RuntimeTextRunner({
+        store,
+        createId,
+        now: () => 1_000 + timeSequence++,
+        contextManager,
+        resolveLanguageModel: () => ({
+          languageModel: model,
+          runtimeContext: {
+            provider: {
+              providerId: "openai",
+              modelId: "gpt-4o",
+              contextLength: 20_000,
+              outputLength: 2_048,
+            },
+          },
+        }),
+      });
+
+      const result = await runner.streamText({
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: `CURRENT_RAW_USER_${"x".repeat(inputSize)}`,
+      });
+      const body = await result.response.text();
+
+      expect(modelCalls).toBe(0);
+      expect(summaryCalls).toBe(0);
+      expect(body).toContain(expectedMessage);
+      expect(store.listContextPlansByRun(result.started.run.id)).toEqual([]);
+      expect(store.listContextCheckpoints(result.started.conversation.id)).toEqual([]);
+      expect(store.listContextCompactionActivitiesByRun(result.started.run.id)).toEqual([
+        expect.objectContaining({
+          requestIndex: 0,
+          trigger: "auto_pre_turn",
+          status: "failed",
+        }),
+      ]);
+      expect(store.getRun(result.started.run.id)).toMatchObject({
+        status: "failed",
+        error: {
+          name: "ContextPlanningError",
+          data: { message: expectedMessage },
+        },
+      });
+      expect(store.listEvents(result.started.conversation.id).filter(
+        (event) => event.type === "runtime.error",
+      )).toHaveLength(1);
+      db.close();
+    },
+  );
+
   test("retries one pre-output context overflow with the same selected model", async () => {
     let requests = 0;
     const preparations: Array<{ requestIndex: number; trigger: string }> = [];
@@ -506,6 +608,145 @@ describe("RuntimeTextRunner", () => {
     );
     expect(store.listEvents(result.started.conversation.id).filter((event) => event.type === "runtime.error"))
       .toHaveLength(0);
+    db.close();
+  });
+
+  test("promotes one durable overflow Activity to recovered after replacement succeeds", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const seedRunner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      resolveLanguageModel: () => ({
+        languageModel: new MockLanguageModelV3(),
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+          },
+        },
+      }),
+      streamText: streamFromText("seed answer"),
+    });
+    let conversationId: string | undefined;
+    for (let index = 0; index < 3; index += 1) {
+      const seeded = await seedRunner.streamText({
+        conversationId: conversationId as never,
+        providerId: "openai",
+        modelId: "gpt-4o",
+        text: `seed ${index}`,
+      });
+      await seeded.response.text();
+      conversationId = seeded.started.conversation.id;
+    }
+    const overflow = Object.assign(new Error("maximum context length exceeded"), {
+      name: "ContextLengthError",
+      statusCode: 400,
+    });
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [{ type: "error" as const, error: overflow }],
+            }),
+          };
+        }
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "overflow-recovered" },
+              {
+                type: "text-delta" as const,
+                id: "overflow-recovered",
+                delta: "recovered answer",
+              },
+              { type: "text-end" as const, id: "overflow-recovered" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: undefined },
+                logprobs: undefined,
+                usage: sdkModelUsage(30),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => ({ text: "OVERFLOW_CHECKPOINT" }),
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 128_000,
+            outputLength: 4_096,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      conversationId: conversationId as never,
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "recover this overflow",
+    });
+    const body = await result.response.text();
+
+    expect(modelCalls).toBe(2);
+    expect(body).toContain("recovered answer");
+    const activities = store.listContextCompactionActivitiesByRun(result.started.run.id);
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      requestIndex: 1,
+      attemptIndex: 0,
+      trigger: "provider_overflow",
+      status: "recovered",
+    });
+    const activityEvents = store.listEvents(result.started.conversation.id).filter(
+      (event) => {
+        if (event.type !== "context.compaction.updated") return false;
+        const info = (event.properties as {
+          info: { id: string };
+        }).info;
+        return info.id === activities[0]?.id;
+      },
+    );
+    expect(activityEvents.map((event) => (event.properties as {
+      info: { status: string };
+    }).info.status)).toEqual([
+      "preparing",
+      "created",
+      "recovered",
+    ]);
+    expect(store.listTraces(result.started.run.id).filter(
+      (trace) => trace.type === "context.overflow.recovered",
+    )).toHaveLength(1);
+    expect(store.getRun(result.started.run.id)?.status).toBe("completed");
     db.close();
   });
 
@@ -980,6 +1221,44 @@ describe("RuntimeTextRunner", () => {
     expect(store.getRun(result.started.run.id)).toMatchObject({
       status: "failed",
       error: { name: "UiOnlyContextError", data: { message: providerError.message } },
+    });
+    expect(store.listEventsByRun(result.started.run.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    db.close();
+  });
+
+  test("terminalizes a UI-only error even when an adapter exposes responseReady", async () => {
+    const providerError = Object.assign(
+      new Error("UI conversion failed without a matching full-stream error"),
+      { name: "UiOnlyReadyError" },
+    );
+    const streamText: RuntimeStreamText = () => ({
+      responseReady: Promise.resolve(),
+      toUIMessageStreamResponse: (options) => new Response(
+        `data: ${JSON.stringify({
+          type: "error",
+          errorText: options?.onError?.(providerError) ?? providerError.message,
+        })}\r\n\r\ndata: ${JSON.stringify({
+          type: "finish",
+          finishReason: "error",
+        })}\r\n\r\ndata: [DONE]\r\n\r\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    });
+    const { db, store, runner } = createRunner(streamText);
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Do not leave this Run active.",
+    });
+    const body = await result.response.text();
+
+    expect(body).toContain(JSON.stringify(providerError.message));
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: { name: "UiOnlyReadyError", data: { message: providerError.message } },
     });
     expect(store.listEventsByRun(result.started.run.id).filter(
       (event) => event.type === "runtime.error",
@@ -2367,6 +2646,1476 @@ describe("RuntimeTextRunner", () => {
     db.close();
   });
 
+  test("compacts a sealed tool step mid-turn and continues the same Run without replay", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    let toolExecutions = 0;
+    let summaryCalls = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const largeToolResult = `TOOL_RESULT_${"x".repeat(30_000)}`;
+    const providerPrompts: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: async (options) => {
+        modelCalls += 1;
+        providerPrompts.push(structuredClone(options.prompt));
+        const content = modelCalls === 1
+          ? [{
+              type: "tool-call" as const,
+              toolCallId: "call_mid_turn_compaction",
+              toolName: "np__web__fetch",
+              input: JSON.stringify({ value: "run once" }),
+            }]
+          : [
+              { type: "text-start" as const, id: "mid-turn-final" },
+              {
+                type: "text-delta" as const,
+                id: "mid-turn-final",
+                delta: "continued after compaction",
+              },
+              { type: "text-end" as const, id: "mid-turn-final" },
+            ];
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              ...content,
+              {
+                type: "finish" as const,
+                finishReason: {
+                  unified: modelCalls === 1 ? "tool-calls" as const : "stop" as const,
+                  raw: undefined,
+                },
+                logprobs: undefined,
+                usage: sdkModelUsage(modelCalls === 1 ? 80 : 40),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Test",
+      description: "Mid-turn compaction test tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Large Result",
+        description: "Returns a large deterministic result.",
+        inputSchema: z.object({ value: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "low",
+          reversible: true,
+          sideEffect: "none",
+        },
+        execute: async () => {
+          toolExecutions += 1;
+          return {
+            summary: "Large deterministic result",
+            data: { value: largeToolResult },
+          };
+        },
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => {
+        summaryCalls += 1;
+        return { text: "MID_TURN_CHECKPOINT" };
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 20_000,
+            outputLength: 2_048,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Use the large result once and then answer.",
+      agentMode: "agent",
+    });
+    const body = await result.response.text();
+
+    expect(body).toContain("continued after compaction");
+    expect(modelCalls).toBe(2);
+    expect(store.listToolCallsByRun(result.started.run.id)).toEqual([
+      expect.objectContaining({ state: "completed" }),
+    ]);
+    expect(toolExecutions).toBe(1);
+    expect(summaryCalls).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(providerPrompts[0])).not.toContain("MID_TURN_CHECKPOINT");
+    expect(JSON.stringify(providerPrompts[1])).toContain("MID_TURN_CHECKPOINT");
+    expect(JSON.stringify(providerPrompts[1])).not.toContain(largeToolResult);
+    expect(JSON.stringify(providerPrompts)).not.toContain("data-context-compaction");
+
+    const checkpoint = store.listContextCheckpoints(result.started.conversation.id)[0]!;
+    expect(checkpoint.coverageCursor).toMatchObject({
+      kind: "sealed_step",
+      runId: result.started.run.id,
+      throughRequestIndex: 0,
+    });
+    const activities = store.listContextCompactionActivitiesByRun(result.started.run.id);
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      requestIndex: 1,
+      boundaryStepIndex: 1,
+      attemptIndex: 0,
+      trigger: "auto_mid_turn",
+      status: "created",
+      checkpointId: checkpoint.id,
+    });
+    const storedAssistant = store.getMessage(result.started.assistantMessage.id);
+    expect(storedAssistant?.role).toBe("assistant");
+    if (storedAssistant?.role !== "assistant") {
+      throw new Error("expected stored Assistant Message");
+    }
+    expect(storedAssistant.parts.filter((part) => part.type === "tool")).toHaveLength(1);
+    expect(storedAssistant.parts.filter((part) => part.type === "step-finish")).toHaveLength(2);
+    const projected = projectMessageToAiSdkUIMessage(storedAssistant, {
+      compactionActivities: activities,
+    });
+    const toolIndex = projected.parts.findIndex((part) => part.type.startsWith("tool-"));
+    const activityIndex = projected.parts.findIndex(
+      (part) => part.type === "data-context-compaction",
+    );
+    const finalTextIndex = projected.parts.findIndex(
+      (part) => part.type === "text" && part.text === "continued after compaction",
+    );
+    expect(toolIndex).toBeGreaterThanOrEqual(0);
+    expect(activityIndex).toBeGreaterThan(toolIndex);
+    expect(finalTextIndex).toBeGreaterThan(activityIndex);
+    expect(store.getRun(result.started.run.id)?.status).toBe("completed");
+    db.close();
+  });
+
+  test("streams a completed mid-turn compaction divider before the next output while the Run is active", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    const releaseSecondStep = createDeferred<void>();
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const largeToolResult = `LIVE_TOOL_RESULT_${"x".repeat(30_000)}`;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                {
+                  type: "tool-call" as const,
+                  toolCallId: "call_live_mid_turn_compaction",
+                  toolName: "np__web__fetch",
+                  input: JSON.stringify({ value: "run once" }),
+                },
+                {
+                  type: "finish" as const,
+                  finishReason: { unified: "tool-calls" as const, raw: undefined },
+                  logprobs: undefined,
+                  usage: sdkModelUsage(80),
+                },
+              ],
+            }),
+          };
+        }
+
+        return {
+          stream: new ReadableStream({
+            async start(controller) {
+              controller.enqueue({
+                type: "text-start" as const,
+                id: "live-mid-turn-final",
+              });
+              controller.enqueue({
+                type: "text-delta" as const,
+                id: "live-mid-turn-final",
+                delta: "post-compaction output",
+              });
+              await releaseSecondStep.promise;
+              controller.enqueue({
+                type: "text-end" as const,
+                id: "live-mid-turn-final",
+              });
+              controller.enqueue({
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: undefined },
+                usage: sdkModelUsage(40),
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Test",
+      description: "Live mid-turn compaction test tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Large Result",
+        description: "Returns a large deterministic result.",
+        inputSchema: z.object({ value: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "low",
+          reversible: true,
+          sideEffect: "none",
+        },
+        execute: async () => ({
+          summary: "Large deterministic result",
+          data: { value: largeToolResult },
+        }),
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => ({ text: "LIVE_MID_TURN_CHECKPOINT" }),
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 20_000,
+            outputLength: 2_048,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Use the large result once and then answer.",
+      agentMode: "agent",
+    });
+    const reader = result.response.body?.getReader();
+    if (!reader) throw new Error("expected a streaming response body");
+    const decoder = new TextDecoder();
+    let observed = "";
+
+    try {
+      while (!observed.includes("post-compaction output")) {
+        const next = await reader.read();
+        if (next.done) break;
+        observed += decoder.decode(next.value, { stream: true });
+      }
+
+      const activity = store.listContextCompactionActivitiesByRun(
+        result.started.run.id,
+      )[0];
+      expect(store.getRun(result.started.run.id)?.status).toBe("running");
+      expect(activity).toMatchObject({
+        boundaryStepIndex: 1,
+        status: "created",
+      });
+      const dividerIndex = observed.indexOf('"type":"data-context-compaction"');
+      const nextOutputIndex = observed.indexOf("post-compaction output");
+      expect(dividerIndex).toBeGreaterThanOrEqual(0);
+      expect(dividerIndex).toBeLessThan(nextOutputIndex);
+      expect(observed).toContain(`"id":"${activity?.id}"`);
+
+      releaseSecondStep.resolve();
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        observed += decoder.decode(next.value, { stream: true });
+      }
+      observed += decoder.decode();
+      expect(store.getRun(result.started.run.id)?.status).toBe("completed");
+      expect(observed.match(/"type":"data-context-compaction"/g)).toHaveLength(1);
+    } finally {
+      releaseSecondStep.resolve();
+      while (!(await reader.read()).done) {
+        // Drain the response so the Run can commit before closing the database.
+      }
+      reader.releaseLock();
+      db.close();
+    }
+  });
+
+  test("recovers a clean later-request overflow after a sealed tool step without replay", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    let toolExecutions = 0;
+    let summaryCalls = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const overflow = Object.assign(new Error("maximum context length exceeded"), {
+      name: "ContextLengthError",
+      statusCode: 400,
+    });
+    const providerPrompts: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: async (options) => {
+        modelCalls += 1;
+        providerPrompts.push(structuredClone(options.prompt));
+        if (modelCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                {
+                  type: "tool-call" as const,
+                  toolCallId: "call_before_later_overflow",
+                  toolName: "np__web__fetch",
+                  input: JSON.stringify({ value: "execute once" }),
+                },
+                {
+                  type: "finish" as const,
+                  finishReason: { unified: "tool-calls" as const, raw: undefined },
+                  logprobs: undefined,
+                  usage: sdkModelUsage(30),
+                },
+              ],
+            }),
+          };
+        }
+        if (modelCalls === 2) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [{ type: "error" as const, error: overflow }],
+            }),
+          };
+        }
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "later-overflow-recovered" },
+              {
+                type: "text-delta" as const,
+                id: "later-overflow-recovered",
+                delta: "recovered after the sealed tool step",
+              },
+              { type: "text-end" as const, id: "later-overflow-recovered" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: undefined },
+                logprobs: undefined,
+                usage: sdkModelUsage(20),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Test",
+      description: "Later request overflow recovery tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Execute Once",
+        description: "Returns a deterministic result once.",
+        inputSchema: z.object({ value: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "low",
+          reversible: true,
+          sideEffect: "external_network",
+        },
+        execute: async () => {
+          toolExecutions += 1;
+          return {
+            summary: "Executed once",
+            data: { value: "SEALED_TOOL_RESULT" },
+          };
+        },
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => {
+        summaryCalls += 1;
+        return { text: "LATER_REQUEST_OVERFLOW_CHECKPOINT" };
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 128_000,
+            outputLength: 4_096,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Use the tool, then recover the next request if it overflows.",
+      agentMode: "agent",
+    });
+    const body = await result.response.text();
+
+    expect(modelCalls).toBe(3);
+    expect(toolExecutions).toBe(1);
+    expect(summaryCalls).toBe(1);
+    expect(body).toContain("recovered after the sealed tool step");
+    expect(store.listToolCallsByRun(result.started.run.id)).toEqual([
+      expect.objectContaining({ state: "completed" }),
+    ]);
+    const checkpoints = store.listContextCheckpoints(result.started.conversation.id);
+    expect(checkpoints).toHaveLength(1);
+    expect(checkpoints[0]?.coverageCursor).toMatchObject({
+      kind: "sealed_step",
+      runId: result.started.run.id,
+      throughRequestIndex: 0,
+    });
+    expect(JSON.stringify(providerPrompts[2])).toContain(
+      "LATER_REQUEST_OVERFLOW_CHECKPOINT",
+    );
+    const assistant = store.getMessage(result.started.assistantMessage.id);
+    expect(assistant?.parts.filter((part) => part.type === "step-start")).toHaveLength(2);
+    expect(assistant?.parts.filter((part) => part.type === "step-finish")).toHaveLength(2);
+    const activities = store.listContextCompactionActivitiesByRun(result.started.run.id);
+    expect(activities).toEqual([
+      expect.objectContaining({
+        requestIndex: 2,
+        boundaryStepIndex: 1,
+        attemptIndex: 0,
+        trigger: "provider_overflow",
+        status: "recovered",
+        checkpointId: checkpoints[0]?.id,
+      }),
+    ]);
+    const projected = projectMessageToAiSdkUIMessage(assistant!, {
+      compactionActivities: activities,
+    });
+    const activityPosition = projected.parts.findIndex(
+      (part) => part.type === "data-context-compaction",
+    );
+    const sealedToolPosition = projected.parts.findIndex(
+      (part) => part.type.startsWith("tool-"),
+    );
+    const recoveredTextPosition = projected.parts.findIndex(
+      (part) => part.type === "text" && part.text.includes("recovered after"),
+    );
+    expect(activityPosition).toBeGreaterThan(-1);
+    expect(sealedToolPosition).toBeLessThan(activityPosition);
+    expect(activityPosition).toBeLessThan(recoveredTextPosition);
+    expect(store.listEvents(result.started.conversation.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(0);
+    expect(store.getRun(result.started.run.id)?.status).toBe("completed");
+    db.close();
+  });
+
+  test("preserves a late-request Provider error when overflow compaction cannot replace it", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    let toolExecutions = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const providerMessage = "  maximum context length exceeded\n\nrequest id:\tlate-1  ";
+    const overflow = Object.assign(new Error(providerMessage), {
+      name: "LateContextLengthError",
+      statusCode: 400,
+      isRetryable: false,
+    });
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                {
+                  type: "tool-call" as const,
+                  toolCallId: "call_before_failed_late_recovery",
+                  toolName: "np__web__fetch",
+                  input: JSON.stringify({ value: "execute once" }),
+                },
+                {
+                  type: "finish" as const,
+                  finishReason: { unified: "tool-calls" as const, raw: undefined },
+                  logprobs: undefined,
+                  usage: sdkModelUsage(30),
+                },
+              ],
+            }),
+          };
+        }
+        return {
+          stream: simulateReadableStream({
+            chunks: [{ type: "error" as const, error: overflow }],
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Test",
+      description: "Late request failed recovery tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Execute Once",
+        description: "Returns a deterministic result once.",
+        inputSchema: z.object({ value: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "low",
+          reversible: true,
+          sideEffect: "none",
+        },
+        execute: async () => {
+          toolExecutions += 1;
+          return {
+            summary: "Executed once",
+            data: { value: "SEALED_TOOL_RESULT" },
+          };
+        },
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => ({ text: "" }),
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 128_000,
+            outputLength: 4_096,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Keep the original late overflow if compaction fails.",
+      agentMode: "agent",
+    });
+    const body = await result.response.text();
+
+    expect(modelCalls).toBe(2);
+    expect(toolExecutions).toBe(1);
+    expect(body).toContain(JSON.stringify(providerMessage));
+    const assistant = store.getMessage(result.started.assistantMessage.id);
+    expect(assistant?.role).toBe("assistant");
+    expect(assistant?.role === "assistant" ? assistant.status : undefined).toMatchObject({
+      type: "error",
+      error: {
+        name: "LateContextLengthError",
+        data: { message: providerMessage },
+      },
+    });
+    expect(store.listEvents(result.started.conversation.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    expect(store.listContextCompactionActivitiesByRun(result.started.run.id)).toEqual([
+      expect.objectContaining({ trigger: "provider_overflow", status: "failed" }),
+    ]);
+    expect(store.getRun(result.started.run.id)?.status).toBe("failed");
+    db.close();
+  });
+
+  test("continues after an overflow replacement Permission without reusing its request identity", async () => {
+    const overflow = Object.assign(new Error("maximum context length exceeded"), {
+      name: "ContextLengthError",
+      statusCode: 400,
+    });
+    let streamCalls = 0;
+    let toolExecutions = 0;
+    const preparedRequestIndices: number[] = [];
+    const contextManager = {
+      prepare: async (input: Parameters<typeof managedPreparedTestContext>[0]) => {
+        preparedRequestIndices.push(input.requestIndex);
+        return managedPreparedTestContext(input);
+      },
+    };
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Web",
+      description: "Overflow replacement approval tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Approval Fetch",
+        description: "Approval-gated operation after overflow recovery.",
+        inputSchema: z.object({ url: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "critical",
+          reversible: true,
+          sideEffect: "external_network",
+        },
+        execute: async () => {
+          toolExecutions += 1;
+          return { summary: "executed", data: { value: "ok" } };
+        },
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const toolCall = {
+      type: "tool-call" as const,
+      toolCallId: "call_after_overflow_replacement",
+      toolName: "np__web__fetch",
+      input: { url: "https://example.com" },
+    };
+    const streamText: RuntimeStreamText = async (input) => {
+      streamCalls += 1;
+      if (streamCalls === 1) {
+        void input.onError?.({ error: overflow });
+        return {
+          responseReady: Promise.resolve(),
+          toUIMessageStreamResponse: (options) => new Response(
+            `data: ${JSON.stringify({
+              type: "error",
+              errorText: options?.onError?.(overflow) ?? overflow.message,
+            })}\r\n\r\ndata: ${JSON.stringify({ type: "finish" })}\r\n\r\ndata: [DONE]\r\n\r\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        };
+      }
+      if (streamCalls === 2) {
+        await input.onChunk?.({ chunk: toolCall });
+        const approve = input.toolApproval as unknown as (approvalInput: {
+          toolCall: typeof toolCall;
+          tools: unknown;
+          toolsContext: Record<string, never>;
+          runtimeContext: undefined;
+          messages: [];
+        }) => Promise<unknown>;
+        expect(await approve({
+          toolCall,
+          tools: input.tools,
+          toolsContext: {},
+          runtimeContext: undefined,
+          messages: [],
+        })).toBe("user-approval");
+        await input.onChunk?.({
+          chunk: {
+            type: "tool-approval-request",
+            approvalId: "approval_after_overflow",
+            toolCallId: toolCall.toolCallId,
+            toolName: toolCall.toolName,
+            input: toolCall.input,
+          },
+        });
+        await input.onFinish?.({
+          finishReason: "tool-calls",
+          stepCount: 1,
+          responseMessages: [{
+            role: "assistant",
+            content: [
+              toolCall,
+              {
+                type: "tool-approval-request",
+                approvalId: "approval_after_overflow",
+                toolCallId: toolCall.toolCallId,
+              },
+            ],
+          }],
+        });
+        return {
+          toUIMessageStreamResponse: () => new Response(
+            `data: ${JSON.stringify({ type: "start" })}\n\n`
+              + `data: ${JSON.stringify({ type: "finish" })}\n\n`
+              + "data: [DONE]\n\n",
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        };
+      }
+
+      const execute = input.tools?.np__web__fetch?.execute as unknown as (
+        toolInput: { url: string },
+        options: {
+          toolCallId: string;
+          messages: [];
+          abortSignal: AbortSignal;
+        },
+      ) => Promise<unknown>;
+      const output = await execute(toolCall.input, {
+        toolCallId: toolCall.toolCallId,
+        messages: [],
+        abortSignal: new AbortController().signal,
+      });
+      await input.onChunk?.({
+        chunk: {
+          type: "tool-result",
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.toolName,
+          input: toolCall.input,
+          output,
+        },
+      });
+      await input.onChunk?.({ chunk: { type: "text-delta", text: "continued" } });
+      await input.onFinish?.({ finishReason: "stop", stepCount: 1 });
+      return {
+        toUIMessageStreamResponse: () => new Response(
+          `data: ${JSON.stringify({ type: "text-delta", text: "continued" })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      };
+    };
+    const { db, store, runner } = createRunner(
+      streamText,
+      new RuntimeToolRegistry([namespace]),
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      contextManager,
+    );
+
+    const initial = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Recover, then ask for approval.",
+      agentMode: "agent",
+    });
+    await initial.response.text();
+    const waitingRun = store.getRun(initial.started.run.id)!;
+    const permission = store.listPendingPermissionsByRun(waitingRun.id)[0]!;
+    expect(waitingRun.status).toBe("waiting_for_permission");
+
+    const continued = await runner.continueText(waitingRun.id, [{
+      permissionId: permission.id,
+      approved: true,
+      confirmationText: permission.confirmation.prompt,
+    }]);
+    await continued.response.text();
+
+    expect(preparedRequestIndices).toEqual([0, 1, 2]);
+    expect(store.listContextUsagesByRun(waitingRun.id).map(
+      (usage) => usage.requestIndex,
+    )).toEqual([0, 1, 2]);
+    expect(store.getRun(waitingRun.id)?.status).toBe("completed");
+    expect(toolExecutions).toBe(1);
+    db.close();
+  });
+
+  test("recovers a clean overflow after an earlier resolved Permission and side effect", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    let toolExecutions = 0;
+    let summaryCalls = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const overflow = Object.assign(new Error("maximum context length exceeded"), {
+      name: "PermissionContinuationContextError",
+      statusCode: 400,
+    });
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        const content = modelCalls === 1
+          ? [{
+              type: "tool-call" as const,
+              toolCallId: "call_before_permission_overflow",
+              toolName: "np__web__fetch",
+              input: JSON.stringify({ url: "https://example.com" }),
+            }]
+          : modelCalls === 2
+          ? [{ type: "error" as const, error: overflow }]
+          : [
+              { type: "text-start" as const, id: "permission-overflow-recovered" },
+              {
+                type: "text-delta" as const,
+                id: "permission-overflow-recovered",
+                delta: "recovered after approved execution",
+              },
+              { type: "text-end" as const, id: "permission-overflow-recovered" },
+            ];
+        return {
+          stream: simulateReadableStream({
+            chunks: modelCalls === 2
+              ? content
+              : [
+                  ...content,
+                  {
+                    type: "finish" as const,
+                    finishReason: {
+                      unified: modelCalls === 1 ? "tool-calls" as const : "stop" as const,
+                      raw: undefined,
+                    },
+                    logprobs: undefined,
+                    usage: sdkModelUsage(modelCalls === 1 ? 30 : 20),
+                  },
+                ],
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Web",
+      description: "Permission overflow recovery tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Approval Fetch",
+        description: "Approval-gated external operation.",
+        inputSchema: z.object({ url: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "medium",
+          reversible: true,
+          sideEffect: "external_network",
+        },
+        execute: async () => {
+          toolExecutions += 1;
+          return { summary: "executed", data: { value: "APPROVED_TOOL_RESULT" } };
+        },
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => {
+        summaryCalls += 1;
+        return { text: "PERMISSION_OVERFLOW_CHECKPOINT" };
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 128_000,
+            outputLength: 4_096,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const initial = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Ask permission, execute once, then recover the next clean request.",
+      agentMode: "agent",
+    });
+    await initial.response.text();
+    const permission = store.listPendingPermissionsByRun(initial.started.run.id)[0]!;
+    expect(store.getRun(initial.started.run.id)?.status).toBe("waiting_for_permission");
+    expect(toolExecutions).toBe(0);
+
+    const continued = await runner.continueText(initial.started.run.id, [{
+      permissionId: permission.id,
+      approved: true,
+    }]);
+    const body = await continued.response.text();
+
+    expect(modelCalls).toBe(3);
+    expect(toolExecutions).toBe(1);
+    expect(summaryCalls).toBe(1);
+    expect(body).toContain("recovered after approved execution");
+    expect(store.getPermission(permission.id)?.status).toBe("approved");
+    expect(store.listToolCallsByRun(initial.started.run.id)).toEqual([
+      expect.objectContaining({ state: "completed" }),
+    ]);
+    expect(store.listContextPlansByRun(initial.started.run.id).map(
+      (plan) => plan.requestIndex,
+    )).toEqual([0, 1, 2]);
+    expect(store.listContextCompactionActivitiesByRun(initial.started.run.id)).toEqual([
+      expect.objectContaining({
+        requestIndex: 2,
+        boundaryStepIndex: 1,
+        trigger: "provider_overflow",
+        status: "recovered",
+      }),
+    ]);
+    expect(store.getRun(initial.started.run.id)?.status).toBe("completed");
+    db.close();
+  });
+
+  test("advances two rolling sealed-step checkpoints within one ToolLoop Run", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    let toolExecutions = 0;
+    let summaryCalls = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const summaryInputs: Array<{
+      instructions: unknown;
+      messages: ModelMessage[];
+    }> = [];
+    const providerPrompts: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: async (options) => {
+        modelCalls += 1;
+        providerPrompts.push(structuredClone(options.prompt));
+        if (modelCalls <= 2) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                {
+                  type: "tool-call" as const,
+                  toolCallId: `call_rolling_${modelCalls}`,
+                  toolName: modelCalls === 1
+                    ? "np__web__first"
+                    : "np__web__second",
+                  input: JSON.stringify({ value: `step ${modelCalls}` }),
+                },
+                {
+                  type: "finish" as const,
+                  finishReason: { unified: "tool-calls" as const, raw: undefined },
+                  logprobs: undefined,
+                  usage: sdkModelUsage(80),
+                },
+              ],
+            }),
+          };
+        }
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "rolling-final" },
+              {
+                type: "text-delta" as const,
+                id: "rolling-final",
+                delta: "two checkpoints complete",
+              },
+              { type: "text-end" as const, id: "rolling-final" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: undefined },
+                logprobs: undefined,
+                usage: sdkModelUsage(40),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Web",
+      description: "Rolling mid-turn compaction test tools",
+      tools: [
+        {
+          id: "web.first",
+          title: "First Large Result",
+          description: "Returns the first large deterministic result.",
+          inputSchema: z.object({ value: z.string() }).strict(),
+          outputSchema: z.object({ value: z.string() }).strict(),
+          executionTarget: "runtime",
+          risk: {
+            mode: "static",
+            level: "low",
+            reversible: true,
+            sideEffect: "none",
+          },
+          execute: async () => {
+            toolExecutions += 1;
+            return {
+              summary: "First large deterministic result",
+              data: { value: `TOOL_RESULT_1_${"x".repeat(24_000)}` },
+            };
+          },
+        },
+        {
+          id: "web.second",
+          title: "Second Large Result",
+          description: "Returns the second large deterministic result.",
+          inputSchema: z.object({ value: z.string() }).strict(),
+          outputSchema: z.object({ value: z.string() }).strict(),
+          executionTarget: "runtime",
+          risk: {
+            mode: "static",
+            level: "low",
+            reversible: true,
+            sideEffect: "none",
+          },
+          execute: async () => {
+            toolExecutions += 1;
+            return {
+              summary: "Second large deterministic result",
+              data: { value: `TOOL_RESULT_2_${"x".repeat(24_000)}` },
+            };
+          },
+        },
+      ],
+      resolveForRun: () => ({ candidateToolIds: ["web.first", "web.second"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async (input) => {
+        summaryCalls += 1;
+        summaryInputs.push({
+          instructions: structuredClone(input.instructions),
+          messages: structuredClone(input.messages),
+        });
+        return { text: `ROLLING_SUMMARY_${summaryCalls}` };
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 20_000,
+            outputLength: 2_048,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Run two large tools and then answer.",
+      agentMode: "agent",
+    });
+    const body = await result.response.text();
+
+    expect(body).toContain("two checkpoints complete");
+    expect(modelCalls).toBe(3);
+    expect(toolExecutions).toBe(2);
+    expect(summaryCalls).toBe(2);
+    const checkpoints = store.listContextCheckpoints(result.started.conversation.id);
+    expect(checkpoints).toHaveLength(2);
+    expect(checkpoints.map((checkpoint) => checkpoint.coverageCursor)).toEqual([
+      expect.objectContaining({ kind: "sealed_step", throughRequestIndex: 0 }),
+      expect.objectContaining({ kind: "sealed_step", throughRequestIndex: 1 }),
+    ]);
+    expect(checkpoints[1]?.parentCheckpointId).toBe(checkpoints[0]?.id);
+    expect(JSON.stringify(summaryInputs[0]?.messages)).toContain("web.first");
+    expect(JSON.stringify(summaryInputs[1]?.instructions)).toContain("ROLLING_SUMMARY_1");
+    expect(JSON.stringify(summaryInputs[1]?.messages)).toContain("web.second");
+    expect(JSON.stringify(summaryInputs[1]?.messages)).not.toContain("web.first");
+    expect(JSON.stringify(providerPrompts[1])).not.toContain("TOOL_RESULT_1_");
+    expect(JSON.stringify(providerPrompts[2])).not.toContain("TOOL_RESULT_2_");
+    expect(store.listContextCompactionActivitiesByRun(result.started.run.id).map(
+      (activity) => ({ requestIndex: activity.requestIndex, status: activity.status }),
+    )).toEqual([
+      { requestIndex: 1, status: "created" },
+      { requestIndex: 2, status: "created" },
+    ]);
+    expect(body.match(/"type":"data-context-compaction"/g)).toHaveLength(2);
+    const firstActivityIndex = body.indexOf('"requestIndex":1');
+    const secondActivityIndex = body.indexOf('"requestIndex":2');
+    const finalOutputIndex = body.indexOf("two checkpoints complete");
+    expect(firstActivityIndex).toBeGreaterThanOrEqual(0);
+    expect(secondActivityIndex).toBeGreaterThan(firstActivityIndex);
+    expect(finalOutputIndex).toBeGreaterThan(secondActivityIndex);
+    expect(store.getMessage(result.started.assistantMessage.id)?.parts.filter(
+      (part) => part.type === "tool",
+    )).toHaveLength(2);
+    db.close();
+  });
+
+  test("fails a mid-turn blank summary gate before the next model request", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    let toolExecutions = 0;
+    let summaryCalls = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                {
+                  type: "tool-call" as const,
+                  toolCallId: "call_blank_mid_turn",
+                  toolName: "np__web__fetch",
+                  input: JSON.stringify({ value: "run once" }),
+                },
+                {
+                  type: "finish" as const,
+                  finishReason: { unified: "tool-calls" as const, raw: undefined },
+                  logprobs: undefined,
+                  usage: sdkModelUsage(80),
+                },
+              ],
+            }),
+          };
+        }
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "must-not-run" },
+              {
+                type: "text-delta" as const,
+                id: "must-not-run",
+                delta: "NEXT_MODEL_REQUEST_MUST_NOT_RUN",
+              },
+              { type: "text-end" as const, id: "must-not-run" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: undefined },
+                logprobs: undefined,
+                usage: sdkModelUsage(40),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Web",
+      description: "Mid-turn compaction failure tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Large Result",
+        description: "Returns a large deterministic result.",
+        inputSchema: z.object({ value: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "low",
+          reversible: true,
+          sideEffect: "none",
+        },
+        execute: async () => {
+          toolExecutions += 1;
+          return {
+            summary: "Large deterministic result",
+            data: { value: `TOOL_RESULT_${"x".repeat(30_000)}` },
+          };
+        },
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async () => {
+        summaryCalls += 1;
+        return { text: "   " };
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 20_000,
+            outputLength: 2_048,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Use the large result once and then answer.",
+      agentMode: "agent",
+    });
+    const body = await result.response.text();
+
+    expect(modelCalls).toBe(1);
+    expect(toolExecutions).toBe(1);
+    expect(summaryCalls).toBe(1);
+    expect(store.listContextCheckpoints(result.started.conversation.id)).toEqual([]);
+    expect(store.listContextCompactionActivitiesByRun(result.started.run.id)).toEqual([
+      expect.objectContaining({
+        requestIndex: 1,
+        boundaryStepIndex: 1,
+        attemptIndex: 0,
+        trigger: "auto_mid_turn",
+        status: "failed",
+      }),
+    ]);
+    expect(body.match(/"type":"data-context-compaction"/g)).toHaveLength(1);
+    expect(body).toContain('"status":"failed"');
+    expect(body.indexOf('"status":"failed"')).toBeLessThan(
+      body.indexOf('"type":"error"'),
+    );
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      error: {
+        name: "ContextSummaryValidationError",
+        data: { message: "Context summary generator returned blank output" },
+      },
+    });
+    const assistant = store.getMessage(result.started.assistantMessage.id);
+    expect(assistant?.role).toBe("assistant");
+    if (assistant?.role !== "assistant") {
+      throw new Error("expected stored Assistant Message");
+    }
+    expect(assistant.parts.filter((part) => part.type === "tool")).toHaveLength(1);
+    expect(assistant.parts.filter((part) => part.type === "step-finish")).toHaveLength(1);
+    expect(store.listEvents(result.started.conversation.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(1);
+    db.close();
+  });
+
+  test("interrupts a mid-turn compaction on abort without fabricating a Provider error", async () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    const controller = new AbortController();
+    let idSequence = 0;
+    let timeSequence = 0;
+    let modelCalls = 0;
+    let toolExecutions = 0;
+    const createId = (prefix: string) => `${prefix}_${++idSequence}` as never;
+    const model = new MockLanguageModelV3({
+      doStream: async () => {
+        modelCalls += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call" as const,
+                toolCallId: "call_abort_mid_turn",
+                toolName: "np__web__fetch",
+                input: JSON.stringify({ value: "run once" }),
+              },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "tool-calls" as const, raw: undefined },
+                logprobs: undefined,
+                usage: sdkModelUsage(80),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const namespace: RuntimeToolNamespace = {
+      id: "web",
+      title: "Web",
+      description: "Mid-turn abort test tools",
+      tools: [{
+        id: "web.fetch",
+        title: "Large Result",
+        description: "Returns a large deterministic result.",
+        inputSchema: z.object({ value: z.string() }).strict(),
+        outputSchema: z.object({ value: z.string() }).strict(),
+        executionTarget: "runtime",
+        risk: {
+          mode: "static",
+          level: "low",
+          reversible: true,
+          sideEffect: "none",
+        },
+        execute: async () => {
+          toolExecutions += 1;
+          return {
+            summary: "Large deterministic result",
+            data: { value: `TOOL_RESULT_${"x".repeat(30_000)}` },
+          };
+        },
+      }],
+      resolveForRun: () => ({ candidateToolIds: ["web.fetch"] }),
+    };
+    const compactionService = new ContextCompactionService({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      generator: async (input) => {
+        controller.abort("client canceled during context compaction");
+        input.abortSignal?.throwIfAborted();
+        return { text: "MUST_NOT_COMMIT" };
+      },
+    });
+    const contextManager = new ModelContextManager({
+      store,
+      compactionService,
+      createId,
+      now: () => 1_000 + timeSequence++,
+    });
+    const runner = new RuntimeTextRunner({
+      store,
+      createId,
+      now: () => 1_000 + timeSequence++,
+      contextManager,
+      toolRegistry: new RuntimeToolRegistry([namespace]),
+      resolveLanguageModel: () => ({
+        languageModel: model,
+        runtimeContext: {
+          provider: {
+            providerId: "openai",
+            modelId: "gpt-4o",
+            contextLength: 20_000,
+            outputLength: 2_048,
+            supportsTools: true,
+          },
+        },
+      }),
+    });
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Use the large result once and then answer.",
+      agentMode: "agent",
+    }, controller.signal);
+    await result.response.text();
+
+    expect(modelCalls).toBe(1);
+    expect(toolExecutions).toBe(1);
+    expect(store.listContextCheckpoints(result.started.conversation.id)).toEqual([]);
+    expect(store.listContextCompactionActivitiesByRun(result.started.run.id)).toEqual([
+      expect.objectContaining({
+        requestIndex: 1,
+        trigger: "auto_mid_turn",
+        status: "interrupted",
+      }),
+    ]);
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "interrupted",
+      finish: "interrupted",
+    });
+    expect(store.listEvents(result.started.conversation.id).filter(
+      (event) => event.type === "runtime.error",
+    )).toHaveLength(0);
+    db.close();
+  });
+
   test("runs the context manager after durable Run start before the main model request", async () => {
     let prepareCalls = 0;
     let observedRunStatus: string | undefined;
@@ -2487,15 +4236,20 @@ describe("RuntimeTextRunner", () => {
     let segment = 0;
     const preparationTriggers: string[] = [];
     const retainedModelInputs: ModelMessage[][] = [];
+    const retainedStartRequestIndices: Array<number | undefined> = [];
     const contextManager = {
       prepare: async (input: {
         trigger: string;
         requestIndex: number;
         retainedMessages?: ModelMessage[];
+        retainedMessagesStartRequestIndex?: number;
       }) => {
         preparationTriggers.push(input.trigger);
         if (input.trigger === "auto_mid_turn") {
           retainedModelInputs.push(structuredClone(input.retainedMessages ?? []));
+          retainedStartRequestIndices.push(
+            input.retainedMessagesStartRequestIndex,
+          );
         }
         return {
           plan: {
@@ -2748,6 +4502,7 @@ describe("RuntimeTextRunner", () => {
       },
     ];
     expect(retainedModelInputs).toEqual([expectedContinuationPrefix]);
+    expect(retainedStartRequestIndices).toEqual([0]);
     expect(JSON.stringify(continuationRequest?.instructions)).toContain(
       "managed context",
     );
@@ -3990,6 +5745,48 @@ describe("RuntimeTextRunner", () => {
     db.close();
   });
 
+  test("does not overwrite a Provider failure with a later transport abort", async () => {
+    const providerError = new Error("provider request failed\nrequest id: provider_1");
+    providerError.name = "ProviderRequestError";
+    const streamText: RuntimeStreamText = (input) => {
+      const responseReady = (async () => {
+        await input.onError?.({ error: providerError });
+        await input.onAbort?.({ reason: "client disconnected after provider failure" });
+      })();
+      return {
+        responseReady,
+        toUIMessageStreamResponse: () => new Response(
+          `data: ${JSON.stringify({
+            type: "error",
+            errorText: providerError.message,
+          })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      };
+    };
+    const { db, store, runner } = createRunner(streamText);
+
+    const result = await runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Trigger a Provider failure",
+    });
+    await result.response.text();
+
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "failed",
+      finish: "error",
+      error: {
+        name: "ProviderRequestError",
+        data: {
+          message: "provider request failed\nrequest id: provider_1",
+        },
+      },
+    });
+
+    db.close();
+  });
+
   test("records interrupted run state with partial text when streamText reports an abort", async () => {
     const { db, store, runner } = createRunner(abortedStream("client disconnected"));
 
@@ -4019,6 +5816,47 @@ describe("RuntimeTextRunner", () => {
         text: "Partial",
       }),
     ]);
+
+    db.close();
+  });
+
+  test("preserves the AI SDK abort reason emitted by a real model stream", async () => {
+    const controller = new AbortController();
+    const timeoutMessage = "Total timeout of 120000ms exceeded";
+    const model = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          initialDelayInMs: 20,
+          chunks: [{
+            type: "finish" as const,
+            finishReason: { unified: "stop" as const, raw: undefined },
+            logprobs: undefined,
+            usage: sdkModelUsage(1),
+          }],
+        }),
+      }),
+    });
+    const { db, store, runner } = createRunnerWithModel(model);
+
+    const resultPromise = runner.streamText({
+      providerId: "openai",
+      modelId: "gpt-4o",
+      text: "Wait for the timeout",
+    }, controller.signal);
+    controller.abort(timeoutMessage);
+    const result = await resultPromise;
+    await result.response.text();
+
+    expect(store.getRun(result.started.run.id)).toMatchObject({
+      status: "interrupted",
+      finish: "interrupted",
+      metadata: {
+        interrupt: {
+          reason: "timeout",
+          message: timeoutMessage,
+        },
+      },
+    });
 
     db.close();
   });

@@ -14,7 +14,8 @@ Status: **Current**
 - Chat attachments are uploaded through dedicated authenticated endpoints, persisted under Runtime `dataDir`, and referenced by final `att_*` IDs. `/v1/runs` never uploads files or accepts file bytes, paths, URLs, or upload-session IDs.
 - Runtime projects persisted attachment bytes to AI SDK standard `file` parts without using provider/model catalog capabilities as an attachment gate.
 - Conversation history is append-only: the Audit Transcript retains every branch, while the default UI and model history use the Conversation's active Run lineage.
-- Context planning is a derived, request-scoped view: deterministic Safety State plus either full raw active history or a compatible checkpoint and raw tail. Checkpoints never replace audit history.
+- Context planning is a derived, request-scoped view evaluated before every model request: deterministic Safety State plus either full raw active history or a compatible Run/sealed-step checkpoint and exact raw suffix. Checkpoints never replace audit history.
+- Compaction lifecycle is a durable, independently ordered `ContextCompactionActivity`; `preparing/created/failed/recovered/interrupted` appears at the real request boundary and never enters the Provider prompt.
 - `Run.usage` is cumulative billing usage. Request-scoped `ContextUsage` retains each request estimate and Provider observation, while its durable `nextTurnForecast` powers the primary context-window display after a run finishes.
 
 ## Documentation map

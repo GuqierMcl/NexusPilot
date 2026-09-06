@@ -422,6 +422,14 @@ describe("pure context window planner", () => {
         contentHash: `sha256:${"b".repeat(64)}`,
       },
     } as ContextPlannerInput);
+    const rangeChanged = runtime.planContextWindow({
+      ...input,
+      planId: "ctxplan_range_changed",
+      retainedModelInput: {
+        ...retainedModelInput,
+        fromRequestIndex: 1,
+      },
+    } as ContextPlannerInput);
 
     // Six two-byte text messages cost 7 tokens each. The current Assistant
     // is excluded (42 - 7), and the exact retained suffix costs 2,000.
@@ -430,6 +438,8 @@ describe("pure context window planner", () => {
     expect(planned.view).toBe("raw");
     expect(contentChanged.requestHash).not.toBe(planned.requestHash);
     expect(contentChanged.viewHash).not.toBe(planned.viewHash);
+    expect(rangeChanged.requestHash).not.toBe(planned.requestHash);
+    expect(rangeChanged.viewHash).not.toBe(planned.viewHash);
   });
 
   test.each([
@@ -769,6 +779,94 @@ describe("pure context window planner", () => {
     expect(planned.rawRunIds).toEqual(["run_a", "run_b", "run_c", "run_d", "run_e"]);
   });
 
+  test("selects the latest sealed step in the current Run when the next request needs compaction", () => {
+    const fixture = history(["a"], { longThrough: 1 });
+    const run = fixture.runs[0]!;
+    const assistant = fixture.messages.find(
+      (message): message is AssistantMessage =>
+        message.role === "assistant" && message.runId === run.id,
+    )!;
+    assistant.parts = [
+      {
+        id: "part_step_start_0",
+        conversationId: fixture.conversation.id,
+        messageId: assistant.id,
+        type: "step-start",
+        stepIndex: 0,
+      },
+      {
+        id: "part_step_text_0",
+        conversationId: fixture.conversation.id,
+        messageId: assistant.id,
+        type: "text",
+        text: "tool analysis ".repeat(800),
+      },
+      {
+        id: "part_step_finish_0",
+        conversationId: fixture.conversation.id,
+        messageId: assistant.id,
+        type: "step-finish",
+        stepIndex: 0,
+        reason: "tool-calls",
+      },
+    ];
+    run.output = {
+      messageId: assistant.id,
+      partIds: assistant.parts.map((part) => part.id),
+    };
+
+    const planned = runtime.planContextWindow(plannerInput(fixture, {
+      requestIndex: 1,
+      trigger: "auto_mid_turn",
+      contextWindow: 1_000,
+      retainedModelInput: {
+        estimatedTokens: 4_000,
+        contentHash: `sha256:${"4".repeat(64)}`,
+      },
+    }));
+
+    expect(planned.reason).toBe("compaction_required");
+    expect(planned.eligibleCoverageCursor).toEqual({
+      kind: "sealed_step",
+      runId: "run_a",
+      throughRequestIndex: 0,
+      throughPartId: "part_step_finish_0",
+    });
+    expect(planned.eligibleCoverageThroughRunId).toBe("run_a");
+  });
+
+  test("does not treat an open current-Run step as a compaction boundary", () => {
+    const fixture = history(["a"], { longThrough: 1 });
+    const assistant = fixture.messages.find(
+      (message): message is AssistantMessage => message.role === "assistant",
+    )!;
+    assistant.parts.push({
+      id: "part_open_step",
+      conversationId: fixture.conversation.id,
+      messageId: assistant.id,
+      type: "step-start",
+      stepIndex: 0,
+    });
+
+    const planned = runtime.planContextWindow(plannerInput(fixture, {
+      requestIndex: 1,
+      trigger: "auto_mid_turn",
+      contextWindow: 1_000,
+      retainedModelInput: {
+        estimatedTokens: 4_000,
+        contentHash: `sha256:${"5".repeat(64)}`,
+      },
+    }));
+
+    expect(planned.reason).toBe("raw_compaction_blocked");
+    expect(planned.eligibleCoverageCursor).toBeUndefined();
+    expect(
+      planned.budget.rawHistoryTokens
+        + planned.budget.checkpointTokens
+        + planned.budget.safetyStateTokens,
+    ).toBeGreaterThan(planned.budget.hardInputBudget!);
+  });
+
   test("advances safe coverage across a failed Run with terminal Assistant facts and no Run output", () => {
     const fixture = history(["a", "b", "c", "d", "e"], { longThrough: 4 });
     const failedRun = fixture.runs.find((run) => run.id === "run_b")!;
@@ -820,7 +918,7 @@ describe("pure context window planner", () => {
     expect(planned.eligibleCoverageThroughRunId).toBe("run_c");
   });
 
-  test("sends soft-triggered raw context when the minimum raw tail leaves no boundary", () => {
+  test("reports blocked soft-triggered compaction when the minimum raw tail leaves no boundary", () => {
     const fixture = history(["a", "b"], { longThrough: 2 });
     const planned = runtime.planContextWindow(
       plannerInput(fixture, { contextWindow: 1_900 }),
@@ -837,22 +935,22 @@ describe("pure context window planner", () => {
     expect(planned.eligibleCoverageThroughRunId).toBeUndefined();
   });
 
-  test("fails closed above the hard budget when the minimum raw tail leaves no boundary", () => {
+  test("reports blocked hard-budget compaction when the minimum raw tail leaves no boundary", () => {
     const fixture = history(["a", "b"], { longThrough: 2 });
+    const planned = runtime.planContextWindow(
+      plannerInput(fixture, { contextWindow: 1_000 }),
+    );
 
-    try {
-      runtime.planContextWindow(plannerInput(fixture, { contextWindow: 1_000 }));
-      throw new Error("Expected context planning to fail closed");
-    } catch (error) {
-      expect(error).toBeInstanceOf(runtime.ContextPlanningError);
-      expect((error as runtime.ContextPlanningError).code).toBe(
-        "CONTEXT_HARD_BUDGET_EXCEEDED_WITHOUT_SAFE_BOUNDARY",
-      );
-    }
+    expect(
+      planned.budget.rawHistoryTokens + planned.budget.safetyStateTokens,
+    ).toBeGreaterThan(planned.budget.hardInputBudget!);
+    expect(planned.view).toBe("raw");
+    expect(planned.reason).toBe("raw_compaction_blocked");
+    expect(planned.eligibleCoverageCursor).toBeUndefined();
   });
 
   test.each(["run", "tool", "permission"] as const)(
-    "keeps raw context when every coverage boundary is blocked by a non-terminal %s",
+    "reports blocked compaction when every coverage boundary has a non-terminal %s",
     (blocker) => {
       const fixture = history(["a", "b", "c", "d"], {
         longThrough: 2,

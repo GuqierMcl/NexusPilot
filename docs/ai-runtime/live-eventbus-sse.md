@@ -160,6 +160,8 @@ text/event-stream
 
 SSE 连接可以发送 keepalive comment 或轻量 ping event，帮助客户端和代理判断连接仍然存活。
 
+AI Runtime server 不为 SSE 设置 transport idle timeout 或累计连接寿命。keepalive 是 live-only 的活性信号，不是业务 timeout，也不能成为运行时主动关闭健康订阅的时长上限。
+
 推荐 keepalive comment：
 
 ```text
@@ -225,6 +227,7 @@ run.updated
 tool.updated
 permission.updated
 permission.replied
+context.compaction.updated
 runtime.error
 ```
 
@@ -239,7 +242,11 @@ thread_list.refresh_requested
 
 这些只是示例，不是 Phase 5 的封闭枚举。测试应验证 EventBus 能承载 typed string 与 payload，而不是预先穷举所有未来事件。
 
-当用户改写某条历史用户消息并从该处继续时，Runtime 在 SQLite 裁剪事务成功后，为每一条被移除的消息发布 `message.removed`，并发布新 Run 的 `run.updated`；如果首条消息改写导致自动标题回退，也会发布 `conversation.updated`。这些 envelope 只用于让前端失效和协调，不能按 SSE payload 直接重建消息树；当前会话在非运行态通过 Snapshot API 对账。
+当用户改写某条历史用户消息并从该处继续时，Runtime 在同一个 SQLite 事务中追加 replacement User/Assistant Message 与 Run，切换 active head 并递增 revision；旧分支不删除，新 edit 不发布 `message.removed`。Runtime 会发布新 Run 的 `run.updated`，首条消息改写导致自动标题回退时还会发布 `conversation.updated`。`message.removed` 仅作为旧数据库中历史事件的兼容读取事实。
+
+`context.compaction.updated` 是 durable `ContextCompactionActivity` 提交后的 invalidation envelope。Frontend 收到它时，即使当前 thread 仍在运行，也可以在安全 request boundary 重新读取 active Snapshot，尤其可在 summarizer 尚无主响应字节时及时显示 `preparing`。其他普通消息事件在 Run 期间仍延迟到终态后对账。这些 envelope 都只用于失效和协调，不能按 SSE payload 直接重建消息树；Activity 内容和时间线位置来自 Runtime Store 的同一 durable fact。
+
+运行中的 AI SDK `useChat` 还拥有当前 assistant message 的独立 streaming state；只导入 Snapshot 会在下一颗 token 到达时被该 state 覆盖。因此前台 `/v1/runs` response 会从 Store 把已经提交的同一 `ContextCompactionActivity` 以稳定 `cmp_*` id 投影为 `data-context-compaction` part：普通 mid-turn 压缩在下一 `start-step` 前发送，overflow replacement 在替代输出前发送，失败终态最迟在 stream terminal 前发送。AI SDK 按 `type + id` 原位 upsert，所以 EventBus/Snapshot 先显示的 `preparing` 与主 stream 后续发送的 `created/failed/recovered/interrupted` 不会形成两个 divider；刷新后仍由 Snapshot 恢复同一 identity 和位置。
 
 当前阶段不把事件拆成 `domain`、`ui`、`control`、`invalidation` 等公开或内部强分类。只有当前端消费者出现明确需求时，再讨论是否引入分类；Rust/Tauri 后端能力通信已经明确使用独立 Backend WebSocket Bridge，不作为 EventBus 的消费者扩展方向。
 
@@ -330,7 +337,7 @@ Workbench Agent 面板可以把当前前端会话已经创建的 Run 的 live ev
 
 ## 与 AI SDK-compatible Stream 的关系
 
-AI SDK-compatible stream 仍然是前台 assistant message 渲染通道。
+AI SDK-compatible stream 仍然是前台 assistant message 渲染通道。除模型、工具和错误 part 外，它也承载已由 Runtime Store 提交、且必须与当前 streaming message 原子排序的轻量 UI data part，例如 `data-context-compaction`；这不是从 EventBus payload 重建历史，也不改变 Snapshot 的恢复职责。
 
 EventBus / SSE 不承载：
 
@@ -340,7 +347,7 @@ EventBus / SSE 不承载：
 - stdout / stderr chunk
 - streaming assistant text
 
-前台 `POST /v1/runs` response 可以同时触发 Runtime Store 更新和低频事件发布，但 assistant 文本实时渲染仍属于 AI SDK-compatible stream。
+前台 `POST /v1/runs` response 可以同时触发 Runtime Store 更新和低频事件发布，但 assistant 文本及与其 request boundary 强排序的轻量 Activity 实时渲染仍属于 AI SDK-compatible stream。
 
 ## 与 App Command 的关系
 

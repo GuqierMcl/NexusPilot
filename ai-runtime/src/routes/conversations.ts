@@ -22,6 +22,7 @@ import {
   type Run,
   type TraceEvent,
   type ContextCheckpoint,
+  type ContextCompactionActivity,
   type ContextPlan,
   type ContextUsage,
   type RuntimeRunInterruptStore,
@@ -43,6 +44,8 @@ export interface RuntimeConversationReadStore {
   listActiveLineageMessages(conversationId: ConversationId): Message[];
   listRunsByConversation(conversationId: ConversationId): Run[];
   listContextCheckpoints(conversationId: ConversationId): ContextCheckpoint[];
+  listContextCompactionActivities(conversationId: ConversationId): ContextCompactionActivity[];
+  listContextCompactionActivitiesByRun(runId: Run["id"]): ContextCompactionActivity[];
   listContextPlansByRun(runId: Run["id"]): ContextPlan[];
   listContextUsagesByRun(runId: Run["id"]): ContextUsage[];
   listTraces(runId: Run["id"]): TraceEvent[];
@@ -397,6 +400,12 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
       const messages = view === "transcript"
         ? store.listTranscriptMessages(conversation.id)
         : store.listActiveLineageMessages(conversation.id);
+      const activeRunIds = new Set(messages.flatMap((message) =>
+        message.role === "assistant" && message.runId ? [message.runId] : []
+      ));
+      const contextCompactionActivities = store
+        .listContextCompactionActivities(conversation.id)
+        .filter((activity) => view === "transcript" || activeRunIds.has(activity.runId));
       return {
         conversation_id: conversation.id,
         ...(conversation.activeHeadRunId
@@ -405,6 +414,7 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
         revision: conversation.revision,
         view,
         format,
+        context_compaction_activities: contextCompactionActivities,
         messages: projectMessageHistory(
           messages,
           format,
@@ -425,7 +435,7 @@ export function conversationRoutes(deps: ConversationRouteDeps) {
         tags: ["对话与历史"],
         summary: "获取 Runtime 对话消息历史",
         description:
-          "默认从 Runtime Store 读取 active lineage；view=transcript 显式读取 append-only 审计历史并附带脱敏 Run DAG 关系。format=runtime 返回内部 Message；format=ui 返回 assistant-ui friendly message shape；format=ai_sdk 返回 AI SDK 7 UIMessage shape。",
+          "默认从 Runtime Store 读取 active lineage；view=transcript 显式读取 append-only 审计历史并附带脱敏 Run DAG 关系。响应顶层 context_compaction_activities 返回该视图的独立压缩生命周期：requestIndex 保留实际 Provider/model request identity；可选 boundaryStepIndex 是独立的 UI timeline insertion identity，普通 auto_mid_turn 也会记录它，且不能与 requestIndex 相互推断。format=ai_sdk 还会将 Activity 投影为真实 semantic-step boundary 上的 data-context-compaction part。format=runtime 返回内部 Message；format=ui 返回 assistant-ui friendly message shape；format=ai_sdk 返回 AI SDK 7 UIMessage shape。",
         parameters: [
           conversationIdParameter,
           {

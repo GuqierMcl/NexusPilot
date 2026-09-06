@@ -232,7 +232,7 @@ describe("runtime migration manager", () => {
     });
 
     expect(RUNTIME_MIGRATIONS.at(-1)?.id).toBe(
-      "0013_runtime_context_diagnostics",
+      "0014_runtime_context_compaction_activities",
     );
     expect(() => runRuntimeMigrations(db, RUNTIME_MIGRATIONS)).not.toThrow();
 

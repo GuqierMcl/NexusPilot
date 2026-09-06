@@ -5,6 +5,7 @@ import { runtimeEventToEnvelope } from "../events/event-envelope";
 import type { RuntimeEventBus } from "../events/event-bus";
 import {
   conversationSchema,
+  contextCompactionActivitySchema,
   contextCheckpointSchema,
   contextPlanSchema,
   contextUsageSchema,
@@ -38,6 +39,9 @@ import type {
 import type {
   ContextCheckpoint,
   ContextCheckpointCommit,
+  ContextCompactionActivity,
+  ContextCompactionActivityFinish,
+  ContextCompactionActivityStart,
   ContextPlan,
   ContextPlanCommit,
   ContextPreparationClaim,
@@ -48,10 +52,16 @@ import type {
   RuntimeContextDiagnostic,
 } from "../context/types";
 import { ContextPreparationLeaseLostError } from "../context/types";
-import { computeContextCoverageSourceState } from "../context/boundary-validation";
 import {
+  computeContextCoverageSourceState,
+  isContextCoverageCursorSafe,
+} from "../context/boundary-validation";
+import {
+  computeContextCoverageHash,
   computeContextLineageHash,
+  contextCoverageRunId,
   isContextCheckpointParentChainUsable,
+  resolveContextCoverageCursor,
 } from "../context/planner";
 import { buildRuntimeSafetyState } from "../context/safety-state";
 import {
@@ -187,6 +197,17 @@ interface RuntimeHistoryDiagnosticRow {
 
 interface ContextPayloadRow {
   payload_json: string;
+}
+
+interface ContextCompactionActivityRow extends ContextPayloadRow {
+  id: string;
+  conversation_id: string;
+  run_id: string;
+  request_index: number;
+  attempt_index: number;
+  status: ContextCompactionActivity["status"];
+  started_at: number;
+  completed_at: number | null;
 }
 
 interface ContextCheckpointRow extends ContextPayloadRow {
@@ -783,6 +804,170 @@ export class RuntimeSqliteStore {
       });
   }
 
+  startContextCompactionActivity(
+    input: ContextCompactionActivityStart,
+  ): ContextCompactionActivity {
+    const activity = contextCompactionActivitySchema.parse(
+      input.activity,
+    ) as ContextCompactionActivity & { status: "preparing" };
+    const event = eventSchema.parse({
+      id: input.eventId,
+      type: "context.compaction.updated",
+      properties: { info: activity },
+      time: activity.startedAt,
+    }) as Event;
+    let committed = false;
+    const tx = this.db.transaction((): ContextCompactionActivity => {
+      const existing = this.getContextCompactionActivityByIdentity(
+        activity.runId,
+        activity.requestIndex,
+        activity.attemptIndex,
+      );
+      if (existing) {
+        if (existing.id !== activity.id || encode(existing) !== encode(activity)) {
+          throw new Error(
+            `Context compaction Activity identity conflict: ` +
+            `${activity.runId}/${activity.requestIndex}/${activity.attemptIndex}`,
+          );
+        }
+        return existing;
+      }
+      const conversation = this.getConversation(activity.conversationId);
+      const run = this.getRun(activity.runId);
+      if (
+        !conversation
+        || !run
+        || run.conversationId !== activity.conversationId
+        || conversation.activeHeadRunId !== activity.sourceHeadRunId
+        || activity.runId !== activity.sourceHeadRunId
+        || conversation.revision !== activity.sourceConversationRevision
+      ) {
+        throw new Error("Context compaction Activity source is stale or invalid");
+      }
+      this.db.query(
+        `INSERT INTO runtime_context_compaction_activities (
+          id, conversation_id, run_id, request_index, attempt_index,
+          status, payload_json, started_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        activity.id,
+        activity.conversationId,
+        activity.runId,
+        activity.requestIndex,
+        activity.attemptIndex,
+        activity.status,
+        encode(activity),
+        activity.startedAt,
+        null,
+      );
+      this.insertEvent(event);
+      committed = true;
+      return activity;
+    });
+    const result = tx();
+    if (committed) this.options.eventBus?.publish(runtimeEventToEnvelope(event));
+    return result;
+  }
+
+  finishContextCompactionActivity(
+    input: ContextCompactionActivityFinish,
+  ): ContextCompactionActivity {
+    let committedEvent: Event | null = null;
+    const tx = this.db.transaction(() => {
+      const result = this.finishContextCompactionActivityInTransaction(input);
+      committedEvent = result.event;
+      return result.activity;
+    });
+    const activity = tx();
+    if (committedEvent) {
+      this.options.eventBus?.publish(runtimeEventToEnvelope(committedEvent));
+    }
+    return activity;
+  }
+
+  listContextCompactionActivities(
+    conversationId: ConversationId,
+  ): ContextCompactionActivity[] {
+    return this.db.query<ContextCompactionActivityRow, [string]>(
+      `SELECT * FROM runtime_context_compaction_activities
+       WHERE conversation_id = ?
+       ORDER BY started_at ASC, run_id ASC, request_index ASC, attempt_index ASC, id ASC`,
+    ).all(conversationId).map(contextCompactionActivityFromRow);
+  }
+
+  listContextCompactionActivitiesByRun(runId: RunId): ContextCompactionActivity[] {
+    return this.db.query<ContextCompactionActivityRow, [string]>(
+      `SELECT * FROM runtime_context_compaction_activities
+       WHERE run_id = ?
+       ORDER BY request_index ASC, attempt_index ASC, started_at ASC, id ASC`,
+    ).all(runId).map(contextCompactionActivityFromRow);
+  }
+
+  private getContextCompactionActivityByIdentity(
+    runId: RunId,
+    requestIndex: number,
+    attemptIndex: number,
+  ): ContextCompactionActivity | null {
+    const row = this.db.query<ContextCompactionActivityRow, [string, number, number]>(
+      `SELECT * FROM runtime_context_compaction_activities
+       WHERE run_id = ? AND request_index = ? AND attempt_index = ?
+       LIMIT 1`,
+    ).get(runId, requestIndex, attemptIndex);
+    return row ? contextCompactionActivityFromRow(row) : null;
+  }
+
+  private finishContextCompactionActivityInTransaction(
+    input: ContextCompactionActivityFinish,
+  ): { activity: ContextCompactionActivity; event: Event | null } {
+    const row = this.db.query<ContextCompactionActivityRow, [string]>(
+      "SELECT * FROM runtime_context_compaction_activities WHERE id = ?",
+    ).get(input.activityId);
+    if (!row) {
+      throw new Error(`Context compaction Activity was not found: ${input.activityId}`);
+    }
+    const existing = contextCompactionActivityFromRow(row);
+    if (existing.status !== "preparing") {
+      const mayPromoteRecovery = existing.status === "created"
+        && existing.trigger === "provider_overflow"
+        && input.status === "recovered";
+      const alreadyFinished = existing.status === input.status
+        && existing.completedAt === input.completedAt
+        && existing.checkpointId === input.checkpointId
+        && existing.afterEstimatedInputTokens === input.afterEstimatedInputTokens;
+      if (alreadyFinished) return { activity: existing, event: null };
+      if (!mayPromoteRecovery) {
+        throw new Error(
+          `Context compaction Activity is already terminal: ${existing.id}/${existing.status}`,
+        );
+      }
+    }
+    const activity = contextCompactionActivitySchema.parse({
+      ...existing,
+      status: input.status,
+      ...(input.coverageCursor
+        ? { coverageCursor: input.coverageCursor }
+        : {}),
+      ...(input.checkpointId ? { checkpointId: input.checkpointId } : {}),
+      ...(input.afterEstimatedInputTokens === undefined
+        ? {}
+        : { afterEstimatedInputTokens: input.afterEstimatedInputTokens }),
+      completedAt: input.completedAt,
+    }) as ContextCompactionActivity;
+    const event = eventSchema.parse({
+      id: input.eventId,
+      type: "context.compaction.updated",
+      properties: { info: activity },
+      time: input.completedAt,
+    }) as Event;
+    this.db.query(
+      `UPDATE runtime_context_compaction_activities
+       SET status = ?, payload_json = ?, completed_at = ?
+       WHERE id = ?`,
+    ).run(activity.status, encode(activity), activity.completedAt ?? null, activity.id);
+    this.insertEvent(event);
+    return { activity, event };
+  }
+
   contextDiagnostics(): {
     status: "ok" | "warning" | "unavailable";
     warnings: Array<{
@@ -881,6 +1066,26 @@ export class RuntimeSqliteStore {
           },
         });
       }
+
+      const abandonedActivities = this.db
+        .query<ContextCompactionActivityRow, []>(
+          `SELECT * FROM runtime_context_compaction_activities
+           WHERE status = 'preparing'
+           ORDER BY started_at ASC, run_id ASC, request_index ASC, attempt_index ASC, id ASC`,
+        )
+        .all();
+      for (const row of abandonedActivities) {
+        const activity = contextCompactionActivityFromRow(row);
+        const recoveryEventId = `evt_context_compaction_recovery_${
+          createHash("sha256").update(activity.id).digest("hex")
+        }` as Event["id"];
+        this.finishContextCompactionActivity({
+          activityId: activity.id,
+          status: "interrupted",
+          completedAt: (this.options.now ?? Date.now)(),
+          eventId: recoveryEventId,
+        });
+      }
     } catch {
       // Context diagnostics are fail-safe: unrelated Runtime startup remains available.
     }
@@ -975,9 +1180,25 @@ export class RuntimeSqliteStore {
       this.rejectStartupCheckpoint(row, "coverage_not_active_ancestor");
       return null;
     }
+    const coverageCursor = resolveContextCoverageCursor(checkpoint);
+    if (contextCoverageRunId(coverageCursor) !== checkpoint.coverageThroughRunId) {
+      this.rejectStartupCheckpoint(row, "coverage_cursor_mismatch");
+      return null;
+    }
+    const messages = this.listTranscriptMessages(checkpoint.conversationId);
+    const runs = this.listRunsByConversation(checkpoint.conversationId);
+    const snapshot = {
+      conversation: this.getConversation(checkpoint.conversationId)!,
+      runs,
+      messages,
+      toolCalls: runs.flatMap((run) => this.listToolCallsByRun(run.id)),
+      permissions: runs.flatMap((run) => this.listPermissionsByRun(run.id)),
+      checkpoints: [],
+    };
     if (
-      computeContextLineageHash(lineage, checkpoint.coverageThroughRunId)
-      !== checkpoint.lineageHash
+      !isContextCoverageCursorSafe({ snapshot, lineageRuns: lineage, cursor: coverageCursor })
+      || computeContextCoverageHash(lineage, messages, coverageCursor)
+        !== checkpoint.lineageHash
     ) {
       this.rejectStartupCheckpoint(row, "lineage_hash_mismatch");
       return null;
@@ -1268,7 +1489,7 @@ export class RuntimeSqliteStore {
 
   commitContextCheckpoint(input: ContextCheckpointCommit): "committed" | "stale" {
     const checkpoint = contextCheckpointSchema.parse(input.checkpoint) as ContextCheckpoint;
-    let committedEvent: Event | null = null;
+    const committedEvents: Event[] = [];
     const tx = this.db.transaction((): "committed" | "stale" => {
       this.assertActiveContextPreparationClaim(input.preparationClaim);
       if (input.preparationClaim.runId !== checkpoint.sourceHeadRunId) {
@@ -1343,22 +1564,26 @@ export class RuntimeSqliteStore {
           "Context checkpoint coverage is not an ancestor of the source head",
         );
       }
+      const coverageCursor = resolveContextCoverageCursor(checkpoint);
+      if (contextCoverageRunId(coverageCursor) !== checkpoint.coverageThroughRunId) {
+        throw new ContextCheckpointRejectedError(
+          "unsafe_coverage_boundary",
+          "Context checkpoint cursor does not match its coverage Run",
+        );
+      }
       const coverageRun = lineage[coverageIndex];
       if (
         !coverageRun
-        || !["completed", "failed", "interrupted"].includes(coverageRun.status)
-        || coverageRun.id === checkpoint.sourceHeadRunId
+        || (coverageCursor.kind === "run" && (
+          !["completed", "failed", "interrupted"].includes(coverageRun.status)
+          || coverageRun.id === checkpoint.sourceHeadRunId
+        ))
+        || (coverageCursor.kind === "sealed_step"
+          && coverageRun.id !== checkpoint.sourceHeadRunId)
       ) {
         throw new ContextCheckpointRejectedError(
           "unsafe_coverage_boundary",
-          "Context checkpoint coverage must end after a terminal non-current Run",
-        );
-      }
-      const expectedHash = computeContextLineageHash(lineage, checkpoint.coverageThroughRunId);
-      if (checkpoint.lineageHash !== expectedHash) {
-        throw new ContextCheckpointRejectedError(
-          "lineage_hash_mismatch",
-          "Context checkpoint lineage hash does not match persisted history",
+          "Context checkpoint coverage must end after a terminal Run or sealed current step",
         );
       }
 
@@ -1407,10 +1632,22 @@ export class RuntimeSqliteStore {
         toolCalls,
         permissions,
       });
+      const expectedHash = computeContextCoverageHash(
+        lineage,
+        snapshot.messages,
+        coverageCursor,
+      );
+      if (checkpoint.lineageHash !== expectedHash) {
+        throw new ContextCheckpointRejectedError(
+          "lineage_hash_mismatch",
+          "Context checkpoint lineage hash does not match persisted history",
+        );
+      }
       const sourceState = computeContextCoverageSourceState({
         snapshot,
         lineageRuns: lineage,
         coverageIndex,
+        coverageCursor,
         safetyStateHash: safetyState.hash,
         parentCheckpoint,
       });
@@ -1457,7 +1694,7 @@ export class RuntimeSqliteStore {
           checkpoint.time.created,
         );
 
-      committedEvent = {
+      const committedEvent: Event = {
         id: input.eventId,
         type: "context.checkpoint.created",
         properties: {
@@ -1466,6 +1703,9 @@ export class RuntimeSqliteStore {
           sourceHeadRunId: checkpoint.sourceHeadRunId,
           sourceConversationRevision: checkpoint.sourceConversationRevision,
           coverageThroughRunId: checkpoint.coverageThroughRunId,
+          ...(checkpoint.coverageCursor
+            ? { coverageCursor: checkpoint.coverageCursor }
+            : {}),
           ...(checkpoint.parentCheckpointId
             ? { parentCheckpointId: checkpoint.parentCheckpointId }
             : {}),
@@ -1484,6 +1724,13 @@ export class RuntimeSqliteStore {
         time: checkpoint.time.created,
       };
       this.insertEvent(committedEvent);
+      committedEvents.push(committedEvent);
+      if (input.activityCompletion) {
+        const activityResult = this.finishContextCompactionActivityInTransaction(
+          input.activityCompletion,
+        );
+        if (activityResult.event) committedEvents.push(activityResult.event);
+      }
       return "committed";
     });
 
@@ -1508,8 +1755,10 @@ export class RuntimeSqliteStore {
       }
       throw error;
     }
-    if (result === "committed" && committedEvent) {
-      this.options.eventBus?.publish(runtimeEventToEnvelope(committedEvent));
+    if (result === "committed") {
+      committedEvents.forEach((event) =>
+        this.options.eventBus?.publish(runtimeEventToEnvelope(event))
+      );
     }
     return result;
   }
@@ -1780,7 +2029,10 @@ export class RuntimeSqliteStore {
       if (coverageIndex < 0) {
         throw new Error("Context plan checkpoint coverage is not on the active lineage");
       }
-      expectedRawRunIds = lineageRunIds.slice(coverageIndex + 1);
+      const coverageCursor = resolveContextCoverageCursor(checkpoint);
+      expectedRawRunIds = coverageCursor.kind === "sealed_step"
+        ? [coverageCursor.runId]
+        : lineageRunIds.slice(coverageIndex + 1);
     } else {
       if (plan.reason === "checkpoint_selected" || plan.checkpointId) {
         throw new Error("Context plan raw view cannot select a checkpoint");
@@ -1805,13 +2057,30 @@ export class RuntimeSqliteStore {
     }
 
     if (plan.reason === "compaction_required") {
-      const coverageIndex = plan.eligibleCoverageThroughRunId
-        ? lineageRunIds.indexOf(plan.eligibleCoverageThroughRunId)
+      const eligibleCursor = plan.eligibleCoverageCursor
+        ?? (plan.eligibleCoverageThroughRunId
+          ? {
+              kind: "run" as const,
+              throughRunId: plan.eligibleCoverageThroughRunId,
+            }
+          : undefined);
+      const coverageRunId = eligibleCursor
+        ? contextCoverageRunId(eligibleCursor)
+        : undefined;
+      const coverageIndex = coverageRunId
+        ? lineageRunIds.indexOf(coverageRunId)
         : -1;
-      if (coverageIndex < 0 || coverageIndex >= lineageRunIds.length - 1) {
-        throw new Error("Context plan eligible coverage is not a non-current ancestor");
+      const validRunBoundary = eligibleCursor?.kind === "run"
+        && coverageIndex >= 0
+        && coverageIndex < lineageRunIds.length - 1;
+      const validSealedStepBoundary = eligibleCursor?.kind === "sealed_step"
+        && coverageIndex === lineageRunIds.length - 1
+        && eligibleCursor.runId === plan.runId
+        && eligibleCursor.throughRequestIndex < plan.requestIndex;
+      if (!validRunBoundary && !validSealedStepBoundary) {
+        throw new Error("Context plan eligible coverage is not a safe prior boundary");
       }
-    } else if (plan.eligibleCoverageThroughRunId) {
+    } else if (plan.eligibleCoverageThroughRunId || plan.eligibleCoverageCursor) {
       throw new Error("Context plan has unexpected eligible coverage");
     }
   }
@@ -3149,6 +3418,27 @@ function contextPreparationClaimFromRow(
     claimedAt: row.claimed_at,
     expiresAt: row.expires_at,
   };
+}
+
+function contextCompactionActivityFromRow(
+  row: ContextCompactionActivityRow,
+): ContextCompactionActivity {
+  const activity = contextCompactionActivitySchema.parse(
+    JSON.parse(row.payload_json),
+  ) as ContextCompactionActivity;
+  if (
+    activity.id !== row.id
+    || activity.conversationId !== row.conversation_id
+    || activity.runId !== row.run_id
+    || activity.requestIndex !== row.request_index
+    || activity.attemptIndex !== row.attempt_index
+    || activity.status !== row.status
+    || activity.startedAt !== row.started_at
+    || (activity.completedAt ?? null) !== row.completed_at
+  ) {
+    throw new Error(`Context compaction Activity column mismatch: ${row.id}`);
+  }
+  return activity;
 }
 
 function assertContextPreparationRequestKey(runId: RunId, requestIndex: number): void {

@@ -8,7 +8,12 @@ import type {
   RunId,
   TraceEvent,
 } from "../core/types";
-import type { ContextCheckpoint, ContextPlan, ContextUsage } from "../context/types";
+import type {
+  ContextCheckpoint,
+  ContextCompactionActivity,
+  ContextPlan,
+  ContextUsage,
+} from "../context/types";
 import {
   projectMessageToAiSdkUIMessage,
   type AiSdkCompactionMarkerView,
@@ -148,6 +153,7 @@ export type MessageHistoryProjection = Message[] | UiMessageLike[] | AiSdkUIMess
 
 export interface ActiveHistoryContextStore {
   listContextCheckpoints(conversationId: Conversation["id"]): ContextCheckpoint[];
+  listContextCompactionActivitiesByRun(runId: RunId): ContextCompactionActivity[];
   listContextPlansByRun(runId: RunId): ContextPlan[];
   listContextUsagesByRun(runId: RunId): ContextUsage[];
   listTraces(runId: RunId): TraceEvent[];
@@ -160,6 +166,7 @@ export interface ConversationMessagesSnapshot {
   view: MessageHistoryView;
   format: MessageHistoryFormat;
   messages: MessageHistoryProjection;
+  context_compaction_activities: ContextCompactionActivity[];
   runs?: RunSnapshot[];
 }
 
@@ -267,6 +274,7 @@ export function buildActiveHistoryContextMetadata(
     if (message.role !== "assistant" || !message.runId) continue;
     const usages = store.listContextUsagesByRun(message.runId);
     const usage = usages.at(-1);
+    const compactionActivities = store.listContextCompactionActivitiesByRun(message.runId);
     const traces = store.listTraces(message.runId);
     const plans = store.listContextPlansByRun(message.runId);
     const markerAssociation = usage ? findLatestMarkerAssociation({
@@ -292,12 +300,13 @@ export function buildActiveHistoryContextMetadata(
           traces,
         )
       : lifecycleMarker;
-    if (!usage && !compaction) continue;
+    if (!usage && !compaction && compactionActivities.length === 0) continue;
     derived.set(message.runId, {
       ...(usage ? { contextUsage: projectContextUsage(usage) } : {}),
       ...(markerAssociation
         ? { compaction }
         : compaction ? { compaction } : {}),
+      ...(compactionActivities.length > 0 ? { compactionActivities } : {}),
     });
   }
   return derived;

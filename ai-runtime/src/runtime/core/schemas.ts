@@ -877,6 +877,18 @@ export const contextCheckpointSchema = z
     id: z.string().startsWith("ckpt_"),
     conversationId: z.string().startsWith("conv_"),
     coverageThroughRunId: z.string().startsWith("run_"),
+    coverageCursor: z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("run"),
+        throughRunId: z.string().startsWith("run_"),
+      }).strict(),
+      z.object({
+        kind: z.literal("sealed_step"),
+        runId: z.string().startsWith("run_"),
+        throughRequestIndex: z.number().int().nonnegative(),
+        throughPartId: z.string().startsWith("part_"),
+      }).strict(),
+    ]).optional(),
     sourceHeadRunId: z.string().startsWith("run_"),
     sourceConversationRevision: z.number().int().nonnegative(),
     lineageHash: z.string().startsWith("sha256:"),
@@ -896,6 +908,76 @@ export const contextCheckpointSchema = z
     time: timeCreatedSchema,
   })
   .strict();
+
+export const contextCompactionActivitySchema = z
+  .object({
+    id: z.string().startsWith("cmp_"),
+    conversationId: z.string().startsWith("conv_"),
+    runId: z.string().startsWith("run_"),
+    requestIndex: z.number().int().nonnegative(),
+    boundaryStepIndex: z.number().int().nonnegative().optional(),
+    attemptIndex: z.number().int().nonnegative(),
+    trigger: contextCompactionTriggerSchema,
+    status: z.enum(["preparing", "created", "failed", "recovered", "interrupted"]),
+    sourceHeadRunId: z.string().startsWith("run_"),
+    sourceConversationRevision: z.number().int().nonnegative(),
+    coverageCursor: z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("run"),
+        throughRunId: z.string().startsWith("run_"),
+      }).strict(),
+      z.object({
+        kind: z.literal("sealed_step"),
+        runId: z.string().startsWith("run_"),
+        throughRequestIndex: z.number().int().nonnegative(),
+        throughPartId: z.string().startsWith("part_"),
+      }).strict(),
+    ]).optional(),
+    checkpointId: z.string().startsWith("ckpt_").optional(),
+    beforeEstimatedInputTokens: nonnegativeTokenCountSchema,
+    afterEstimatedInputTokens: nonnegativeTokenCountSchema.optional(),
+    startedAt: z.number().finite().nonnegative(),
+    completedAt: z.number().finite().nonnegative().optional(),
+  })
+  .strict()
+  .superRefine((activity, context) => {
+    if (activity.status === "preparing" && activity.completedAt !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "A preparing compaction Activity cannot be completed",
+      });
+    }
+    if (activity.status !== "preparing" && activity.completedAt === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["completedAt"],
+        message: "A terminal compaction Activity must have completedAt",
+      });
+    }
+    if (
+      activity.checkpointId !== undefined
+      && activity.status !== "created"
+      && activity.status !== "recovered"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["checkpointId"],
+        message: "Only successful compaction Activities can reference a checkpoint",
+      });
+    }
+    if (
+      activity.afterEstimatedInputTokens !== undefined
+      && activity.status !== "created"
+      && activity.status !== "recovered"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["afterEstimatedInputTokens"],
+        message: "Only successful compaction Activities can expose an after estimate",
+      });
+    }
+  });
 
 export const contextPlanSchema = z
   .object({
@@ -927,6 +1009,18 @@ export const contextPlanSchema = z
       .strict()
       .optional(),
     eligibleCoverageThroughRunId: z.string().startsWith("run_").optional(),
+    eligibleCoverageCursor: z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("run"),
+        throughRunId: z.string().startsWith("run_"),
+      }).strict(),
+      z.object({
+        kind: z.literal("sealed_step"),
+        runId: z.string().startsWith("run_"),
+        throughRequestIndex: z.number().int().nonnegative(),
+        throughPartId: z.string().startsWith("part_"),
+      }).strict(),
+    ]).optional(),
     checkpointRejections: z.array(
       z.object({
         checkpointId: z.string().startsWith("ckpt_"),
@@ -950,7 +1044,11 @@ export const contextPlanSchema = z
   })
   .strict()
   .superRefine((plan, context) => {
-    if (plan.reason === "compaction_required" && !plan.eligibleCoverageThroughRunId) {
+    if (
+      plan.reason === "compaction_required"
+      && !plan.eligibleCoverageCursor
+      && !plan.eligibleCoverageThroughRunId
+    ) {
       context.addIssue({
         code: "custom",
         path: ["eligibleCoverageThroughRunId"],

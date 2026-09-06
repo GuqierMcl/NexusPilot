@@ -6,6 +6,7 @@ import type {
   TokenUsage,
   ToolState,
 } from "../core/types";
+import type { ContextCompactionActivity } from "../context/types";
 
 export interface AiSdkContextUsageView {
   contextWindow?: number;
@@ -31,6 +32,7 @@ export interface AiSdkCompactionMarkerView {
 export interface AiSdkDerivedMessageMetadata {
   contextUsage?: AiSdkContextUsageView;
   compaction?: AiSdkCompactionMarkerView;
+  compactionActivities?: readonly ContextCompactionActivity[];
 }
 
 export interface AiSdkUIMessageLike {
@@ -45,7 +47,17 @@ export type AiSdkUIPartLike =
   | { type: "reasoning"; text: string }
   | { type: "source-url"; sourceId: string; url: string; title?: string }
   | { type: "file"; mediaType: string; filename?: string; url: string }
+  | {
+      type: "data-context-compaction";
+      id: string;
+      data: ContextCompactionActivity;
+    }
   | AiSdkToolPartLike;
+
+export type AiSdkContextCompactionDataPart = Extract<
+  AiSdkUIPartLike,
+  { type: "data-context-compaction" }
+>;
 
 export type AiSdkToolPartLike = {
   type: `tool-${string}`;
@@ -80,7 +92,12 @@ export function projectMessageToAiSdkUIMessage(
   return {
     id: message.id,
     role: message.role,
-    parts: message.parts.flatMap(projectPartToAiSdkUIParts),
+    parts: message.role === "assistant" && derived?.compactionActivities?.length
+      ? projectAssistantPartsWithCompactionActivities(
+          message.parts,
+          derived.compactionActivities,
+        )
+      : message.parts.flatMap(projectPartToAiSdkUIParts),
     metadata: buildMessageMetadata(message, derived),
   };
 }
@@ -243,6 +260,83 @@ function buildMessageMetadata(
     },
     ...(aiSdkUsage ? { usage: aiSdkUsage } : {}),
   };
+}
+
+function projectAssistantPartsWithCompactionActivities(
+  parts: readonly Part[],
+  activities: readonly ContextCompactionActivity[],
+): AiSdkUIPartLike[] {
+  const ordered = [...activities].sort((left, right) =>
+    compactionBoundaryStepIndex(left) - compactionBoundaryStepIndex(right)
+    || left.requestIndex - right.requestIndex
+    || left.attemptIndex - right.attemptIndex
+    || left.startedAt - right.startedAt
+    || left.id.localeCompare(right.id),
+  );
+  const projected: AiSdkUIPartLike[] = [];
+  const inserted = new Set<string>();
+  const appendBoundaryActivities = (requestIndex: number): void => {
+    for (const activity of ordered) {
+      if (
+        compactionBoundaryStepIndex(activity) !== requestIndex
+        || inserted.has(activity.id)
+      ) continue;
+      projected.push(projectContextCompactionActivityToAiSdkDataPart(activity));
+      inserted.add(activity.id);
+    }
+  };
+  for (const part of parts) {
+    if (part.type === "step-start") appendBoundaryActivities(part.stepIndex);
+    projected.push(...projectPartToAiSdkUIParts(part));
+  }
+  for (const activity of ordered) {
+    if (inserted.has(activity.id)) continue;
+    projected.push(projectContextCompactionActivityToAiSdkDataPart(activity));
+  }
+  return projected;
+}
+
+export function projectContextCompactionActivityToAiSdkDataPart(
+  activity: ContextCompactionActivity,
+): AiSdkContextCompactionDataPart {
+  return {
+    type: "data-context-compaction",
+    id: activity.id,
+    data: sanitizeCompactionActivity(activity),
+  };
+}
+
+function sanitizeCompactionActivity(
+  activity: ContextCompactionActivity,
+): ContextCompactionActivity {
+  return {
+    id: activity.id,
+    conversationId: activity.conversationId,
+    runId: activity.runId,
+    requestIndex: activity.requestIndex,
+    ...(activity.boundaryStepIndex === undefined
+      ? {}
+      : { boundaryStepIndex: activity.boundaryStepIndex }),
+    attemptIndex: activity.attemptIndex,
+    trigger: activity.trigger,
+    status: activity.status,
+    sourceHeadRunId: activity.sourceHeadRunId,
+    sourceConversationRevision: activity.sourceConversationRevision,
+    ...(activity.coverageCursor
+      ? { coverageCursor: structuredClone(activity.coverageCursor) }
+      : {}),
+    ...(activity.checkpointId ? { checkpointId: activity.checkpointId } : {}),
+    beforeEstimatedInputTokens: activity.beforeEstimatedInputTokens,
+    ...(activity.afterEstimatedInputTokens === undefined
+      ? {}
+      : { afterEstimatedInputTokens: activity.afterEstimatedInputTokens }),
+    startedAt: activity.startedAt,
+    ...(activity.completedAt === undefined ? {} : { completedAt: activity.completedAt }),
+  };
+}
+
+function compactionBoundaryStepIndex(activity: ContextCompactionActivity): number {
+  return activity.boundaryStepIndex ?? activity.requestIndex;
 }
 
 function sanitizeInterrupt(value: unknown): RunInterrupt | undefined {

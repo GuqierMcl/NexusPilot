@@ -737,6 +737,7 @@ export type Event =
   | EventPermissionResolved
   | EventPermissionUpdated
   | EventPermissionReplied
+  | EventContextCompactionUpdated
   | EventContextCheckpointCreated
   | EventContextPlanCreated
   | EventRuntimeError;
@@ -788,6 +789,41 @@ export type EventPermissionReplied = BaseEvent<
 export type EventRuntimeError = BaseEvent<
   "runtime.error",
   { conversationId?: ConversationId; runId?: RunId; error: RuntimeError }
+>;
+export type EventContextCompactionUpdated = BaseEvent<
+  "context.compaction.updated",
+  {
+    info: {
+      id: `cmp_${string}`;
+      conversationId: ConversationId;
+      runId: RunId;
+      requestIndex: number;
+      boundaryStepIndex?: number;
+      attemptIndex: number;
+      trigger:
+        | "auto_pre_turn"
+        | "auto_mid_turn"
+        | "manual"
+        | "provider_overflow"
+        | "model_switch";
+      status: "preparing" | "created" | "failed" | "recovered" | "interrupted";
+      sourceHeadRunId: RunId;
+      sourceConversationRevision: number;
+      coverageCursor?:
+        | { kind: "run"; throughRunId: RunId }
+        | {
+            kind: "sealed_step";
+            runId: RunId;
+            throughRequestIndex: number;
+            throughPartId: PartId;
+          };
+      checkpointId?: ContextCheckpointId;
+      beforeEstimatedInputTokens: number;
+      afterEstimatedInputTokens?: number;
+      startedAt: number;
+      completedAt?: number;
+    };
+  }
 >;
 export type EventContextCheckpointCreated = BaseEvent<
   "context.checkpoint.created",

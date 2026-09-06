@@ -444,6 +444,7 @@ describe("AI SDK history projection", () => {
   test("keeps the checkpoint-producing marker stable when a later request selects the same checkpoint", () => {
     const messages: AssistantMessage[] = [{ ...baseMessage, parts: [] }];
     const derived = buildActiveHistoryContextMetadata(messages, {
+      listContextCompactionActivitiesByRun: () => [],
       listContextCheckpoints: () => [{
         id: "ckpt_active",
         conversationId: "conv_history",

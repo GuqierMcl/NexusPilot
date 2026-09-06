@@ -834,4 +834,35 @@ export const RUNTIME_MIGRATIONS: RuntimeMigration[] = [
         ON runtime_context_diagnostics(checkpoint_id, created_at, id);
     `,
   },
+  {
+    id: "0014_runtime_context_compaction_activities",
+    description: "Persist independently ordered context compaction lifecycle activities",
+    sql: `
+      CREATE TABLE runtime_context_compaction_activities (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        request_index INTEGER NOT NULL CHECK (request_index >= 0),
+        attempt_index INTEGER NOT NULL CHECK (attempt_index >= 0),
+        status TEXT NOT NULL CHECK (
+          status IN ('preparing', 'created', 'failed', 'recovered', 'interrupted')
+        ),
+        payload_json TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        FOREIGN KEY (conversation_id) REFERENCES runtime_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (run_id) REFERENCES runtime_runs(id) ON DELETE CASCADE,
+        UNIQUE (run_id, request_index, attempt_index)
+      );
+
+      CREATE INDEX idx_runtime_context_compaction_activities_conversation
+        ON runtime_context_compaction_activities(
+          conversation_id, started_at, run_id, request_index, attempt_index, id
+        );
+      CREATE INDEX idx_runtime_context_compaction_activities_run
+        ON runtime_context_compaction_activities(
+          run_id, request_index, attempt_index, started_at, id
+        );
+    `,
+  },
 ];

@@ -204,7 +204,19 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
       })
     : undefined;
 
-  return new Elysia()
+  return new Elysia({
+    serve: {
+      // Long-running model requests, context compaction, tool execution, and
+      // approval waits must be governed by their own lifecycle controls rather
+      // than Elysia's transport-level idle timeout.
+      idleTimeout: 0,
+    },
+    websocket: {
+      // The Backend Bridge uses protocol heartbeats for liveness; transport
+      // inactivity must not impose an independent connection lifetime.
+      idleTimeout: 0,
+    },
+  })
     .use(
       openapi({
         path: "/docs",

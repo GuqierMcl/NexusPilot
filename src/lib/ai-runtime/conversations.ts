@@ -37,6 +37,27 @@ export interface AiRuntimeTranscriptRunSnapshot {
     };
 }
 
+export interface AiRuntimeContextCompactionActivity {
+    id: string;
+    conversationId: string;
+    runId: string;
+    requestIndex: number;
+    boundaryStepIndex?: number;
+    attemptIndex: number;
+    trigger:
+        | "auto_pre_turn"
+        | "auto_mid_turn"
+        | "manual"
+        | "provider_overflow"
+        | "model_switch";
+    status: "preparing" | "created" | "failed" | "recovered" | "interrupted";
+    checkpointId?: string;
+    beforeEstimatedInputTokens: number;
+    afterEstimatedInputTokens?: number;
+    startedAt: number;
+    completedAt?: number;
+}
+
 export interface CreateRuntimeConversationInput {
     title?: string;
     metadata?: Record<string, unknown>;
@@ -80,6 +101,7 @@ export interface AiRuntimeConversationMessagesSnapshot<
     view: AiRuntimeMessageHistoryView;
     format: TFormat;
     messages: UIMessage[];
+    context_compaction_activities: AiRuntimeContextCompactionActivity[];
     runs?: AiRuntimeTranscriptRunSnapshot[];
 }
 

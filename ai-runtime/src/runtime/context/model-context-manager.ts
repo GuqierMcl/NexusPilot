@@ -21,15 +21,21 @@ import {
   ContextSummaryValidationError,
   readContextPlannerSnapshot,
 } from "./compaction-service";
-import { computeContextPlanRequestHash, planContextWindow } from "./planner";
+import {
+  computeContextPlanRequestHash,
+  planContextWindow,
+  resolveContextCoverageCursor,
+} from "./planner";
 import {
   CONTEXT_PREPARATION_CLAIM_TTL_MS,
   ContextPreparationLeaseLostError,
 } from "./types";
 import type {
   ContextCheckpoint,
+  ContextCompactionActivity,
   ContextCompactionPolicy,
   ContextCompactionTrigger,
+  ContextCoverageCursor,
   ContextPlan,
   ContextPlannerInput,
   ContextPreparationClaim,
@@ -47,6 +53,8 @@ export interface ModelContextPreparationInput {
   conversationId: ConversationId;
   runId: RunId;
   requestIndex: number;
+  /** Visible Assistant step boundary used only to place compaction Activity. */
+  activityBoundaryStepIndex?: number;
   providerId: string;
   modelId: string;
   model: LanguageModel;
@@ -64,6 +72,8 @@ export interface ModelContextPreparationInput {
   excludeAssistantMessageId?: MessageId;
   /** Exact AI SDK messages retained after the durable base projection. */
   retainedMessages?: ModelMessage[];
+  /** First model request represented by retainedMessages, when known. */
+  retainedMessagesStartRequestIndex?: number;
 }
 
 interface ResolvedModelContextPreparationInput extends ModelContextPreparationInput {
@@ -71,13 +81,15 @@ interface ResolvedModelContextPreparationInput extends ModelContextPreparationIn
 }
 
 export interface ContextCompactionMarker {
+  activityId?: ContextCompactionActivity["id"];
   checkpointId?: ContextCheckpoint["id"];
   trigger: ContextCompactionTrigger;
   auto: boolean;
   coverageThroughRunId?: RunId;
+  coverageCursor?: ContextCoverageCursor;
   beforeEstimatedInputTokens: number;
   afterEstimatedInputTokens?: number;
-  status: "preparing" | "created" | "failed" | "recovered";
+  status: "preparing" | "created" | "failed" | "recovered" | "interrupted";
   time: { created: number };
 }
 
@@ -86,6 +98,8 @@ export interface PreparedModelContext {
   instructions: SystemModelMessage[];
   messages: ModelMessage[];
   marker?: ContextCompactionMarker;
+  /** The selected sealed-step checkpoint replaced the previously retained AI SDK suffix. */
+  retainedMessagesCovered?: boolean;
 }
 
 export interface ModelContextForecastInput {
@@ -195,7 +209,10 @@ export class ModelContextManager {
     input.abortSignal?.throwIfAborted();
     const resolvedInput: ResolvedModelContextPreparationInput = {
       ...input,
-      retainedModelInput: describeRetainedModelInput(input.retainedMessages),
+      retainedModelInput: describeRetainedModelInput(
+        input.retainedMessages,
+        input.retainedMessagesStartRequestIndex,
+      ),
     };
     const requestHash = computeContextPlanRequestHash(resolvedInput);
     const key = `${input.runId}:${input.requestIndex}`;
@@ -271,8 +288,12 @@ export class ModelContextManager {
 
     let { snapshot, plan } = this.planFromStore(input, input.runId);
     let createdCheckpoint: ContextCheckpoint | undefined;
+    let createdActivityId: ContextCompactionActivity["id"] | undefined;
 
-    if (plan.reason === "compaction_required" && input.trigger !== "auto_mid_turn") {
+    if (
+      plan.reason === "compaction_required"
+      || plan.reason === "raw_compaction_blocked"
+    ) {
       const lifecyclePayload = {
         trigger: input.trigger,
         requestIndex: input.requestIndex,
@@ -294,12 +315,22 @@ export class ModelContextManager {
       });
       let result: Awaited<ReturnType<ContextCompactionService["compact"]>>;
       try {
+        const attemptIndex = this.store
+          .listContextCompactionActivitiesByRun(input.runId)
+          .filter((activity) => activity.requestIndex === input.requestIndex)
+          .reduce(
+            (nextAttemptIndex, activity) =>
+              Math.max(nextAttemptIndex, activity.attemptIndex + 1),
+            0,
+          );
         result = await this.compactionService.compact({
           conversationId: input.conversationId,
           expectedHeadRunId: plan.sourceHeadRunId,
           expectedConversationRevision: plan.sourceConversationRevision,
           runId: plan.runId,
           requestIndex: input.requestIndex,
+          activityBoundaryStepIndex: input.activityBoundaryStepIndex,
+          attemptIndex,
           preparationClaim,
           providerId: input.providerId,
           modelId: input.modelId,
@@ -311,6 +342,7 @@ export class ModelContextManager {
           toolSchemas: input.toolSchemas,
           trigger: input.trigger,
           candidateCoverageThroughRunId: plan.eligibleCoverageThroughRunId,
+          candidateCoverageCursor: plan.eligibleCoverageCursor,
           policy: input.policy,
           safetyStateMaxTokens: input.safetyStateMaxTokens,
           excludeAssistantMessageId: input.excludeAssistantMessageId,
@@ -345,19 +377,25 @@ export class ModelContextManager {
       }
       if (result.status === "created") {
         createdCheckpoint = result.checkpoint;
+        createdActivityId = result.activityId;
       }
       if (result.status === "created" || result.status === "stale") {
         const conversation = this.store.getConversation(input.conversationId);
         if (conversation?.activeHeadRunId !== input.runId) {
           throw new ContextPreparationStaleError(input.runId);
         }
-        ({ snapshot, plan } = this.planFromStore(input, input.runId));
+        ({ snapshot, plan } = this.planFromStore(
+          input,
+          input.runId,
+          input.trigger === "provider_overflow"
+            ? createdCheckpoint?.id
+            : undefined,
+        ));
       }
     }
 
     if (
       plan.reason === "compaction_required"
-      && input.trigger !== "auto_mid_turn"
     ) {
       const error = new Error(
         "Context compaction did not produce a model view within the hard budget",
@@ -390,7 +428,7 @@ export class ModelContextManager {
     }
     const context = await this.assembleContext(snapshot, plan, input);
     const marker = createdCheckpoint
-      ? createMarker(createdCheckpoint, plan)
+      ? createMarker(createdCheckpoint, plan, createdActivityId)
       : undefined;
     return { plan, ...context, ...(marker ? { marker } : {}) };
   }
@@ -491,6 +529,7 @@ export class ModelContextManager {
   private planFromStore(
     input: ResolvedModelContextPreparationInput,
     runId: RunId,
+    providerOverflowCheckpointId?: ContextCheckpoint["id"],
   ): { snapshot: ContextPlannerSnapshot; plan: ContextPlan } {
     const snapshot = readContextPlannerSnapshot(this.store, input.conversationId);
     return {
@@ -513,6 +552,9 @@ export class ModelContextManager {
         safetyStateMaxTokens: input.safetyStateMaxTokens,
         excludeAssistantMessageId: input.excludeAssistantMessageId,
         retainedModelInput: input.retainedModelInput,
+        ...(providerOverflowCheckpointId
+          ? { providerOverflowCheckpointId }
+          : {}),
       }),
     };
   }
@@ -521,7 +563,10 @@ export class ModelContextManager {
     snapshot: ContextPlannerSnapshot,
     plan: ContextPlan,
     input: ResolvedModelContextPreparationInput,
-  ): Promise<Pick<PreparedModelContext, "instructions" | "messages">> {
+  ): Promise<Pick<
+    PreparedModelContext,
+    "instructions" | "messages" | "retainedMessagesCovered"
+  >> {
     const checkpoint = plan.checkpointId
       ? snapshot.checkpoints.find((candidate) => candidate.id === plan.checkpointId)
       : undefined;
@@ -540,9 +585,17 @@ export class ModelContextManager {
     const rawInstructions = projectedRaw.filter(
       (message): message is SystemModelMessage => message.role === "system",
     );
+    const checkpointCursor = checkpoint
+      ? resolveContextCoverageCursor(checkpoint)
+      : undefined;
+    const retainedMessagesCovered = Boolean(input.retainedMessages?.length)
+      && checkpointCursor?.kind === "sealed_step"
+      && checkpointCursor.runId === input.runId
+      && input.retainedModelInput?.fromRequestIndex !== undefined
+      && input.retainedModelInput.fromRequestIndex <= checkpointCursor.throughRequestIndex;
     const messages = [
       ...projectedRaw.filter((message) => message.role !== "system"),
-      ...(input.retainedMessages ?? []),
+      ...(retainedMessagesCovered ? [] : input.retainedMessages ?? []),
     ];
     assertNoSystemModelMessages(messages);
     return {
@@ -554,6 +607,7 @@ export class ModelContextManager {
         }),
       ],
       messages,
+      ...(retainedMessagesCovered ? { retainedMessagesCovered: true } : {}),
     };
   }
 }
@@ -568,6 +622,7 @@ function assertNoSystemModelMessages(messages: readonly ModelMessage[]): void {
 
 function describeRetainedModelInput(
   messages: readonly ModelMessage[] | undefined,
+  fromRequestIndex: number | undefined,
 ): ContextPlannerInput["retainedModelInput"] {
   if (!messages?.length) return undefined;
   return {
@@ -581,6 +636,7 @@ function describeRetainedModelInput(
     contentHash: `sha256:${createHash("sha256")
       .update(stableStringifyJson(messages))
       .digest("hex")}`,
+    ...(fromRequestIndex === undefined ? {} : { fromRequestIndex }),
   };
 }
 
@@ -660,12 +716,17 @@ function messagesForPlan(
 function createMarker(
   checkpoint: ContextCheckpoint,
   plan: ContextPlan,
+  activityId?: ContextCompactionActivity["id"],
 ): ContextCompactionMarker {
   return {
+    ...(activityId ? { activityId } : {}),
     checkpointId: checkpoint.id,
     trigger: checkpoint.trigger,
     auto: checkpoint.trigger !== "manual",
     coverageThroughRunId: checkpoint.coverageThroughRunId,
+    ...(checkpoint.coverageCursor
+      ? { coverageCursor: checkpoint.coverageCursor }
+      : {}),
     beforeEstimatedInputTokens: checkpoint.budget.estimatedInputTokens,
     afterEstimatedInputTokens: plan.budget.estimatedInputTokens,
     status: "created",

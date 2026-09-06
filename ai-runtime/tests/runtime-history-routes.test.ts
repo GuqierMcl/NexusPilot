@@ -12,7 +12,6 @@ import {
   type Run,
   type RuntimeEventEnvelope,
 } from "../src/runtime";
-import { computeContextLineageHash } from "../src/runtime/context/planner";
 import { openRuntimeDatabase } from "../src/storage/runtime-database";
 
 function config() {
@@ -239,7 +238,7 @@ async function createAppWithBranchedHistoryFixtures() {
   });
 
   const app = await createApp(config(), { runtimeDatabase: db });
-  return { app, db };
+  return { app, db, store, conversation };
 }
 
 describe("runtime history routes", () => {
@@ -673,195 +672,57 @@ describe("runtime history routes", () => {
     db.close();
   });
 
-  test("reopens the checkpoint-producing marker unchanged after later usage selects it", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "nexuspilot-history-context-"));
-    const databasePath = join(directory, "runtime.sqlite");
-    let db: ReturnType<typeof openRuntimeDatabase> | undefined;
-    try {
-      const first = await createAppWithHistoryFixtures(databasePath);
-      db = first.db;
-      const budget = {
-        providerId: "openai",
-        modelId: "gpt-4o",
-        contextWindow: 1000,
-        reservedOutputTokens: 120,
-        safetyMarginTokens: 20,
-        systemPromptTokens: 20,
-        toolSchemaTokens: 20,
-        hardInputBudget: 840,
-        softTriggerTokens: 700,
-        targetTokens: 500,
-        rawHistoryTokens: 820,
-        checkpointTokens: 340,
-        safetyStateTokens: 20,
-        estimatedInputTokens: 400,
-      };
-      const checkpoint = {
-        id: "ckpt_history",
+  test("projects a durable compaction Activity at its request boundary", async () => {
+    const { app, db, store } = await createAppWithHistoryFixtures();
+    store.startContextCompactionActivity({
+      activity: {
+        id: "cmp_history",
         conversationId: "conv_history",
-        coverageThroughRunId: "run_history",
+        runId: "run_history",
+        requestIndex: 0,
+        attemptIndex: 0,
+        trigger: "auto_pre_turn",
+        status: "preparing",
         sourceHeadRunId: "run_history",
         sourceConversationRevision: 1,
-        lineageHash: computeContextLineageHash([first.run], first.run.id),
-        sourceStateHash: `sha256:${"2".repeat(64)}`,
-        safetyStateHash: `sha256:${"3".repeat(64)}`,
-        trigger: "auto_pre_turn",
-        formatVersion: "1",
-        compatibility: { kind: "provider-neutral-text", version: 1 },
-        generatedBy: { providerId: "openai", modelId: "gpt-4o" },
-        summary: "MUST_NOT_APPEAR",
-        safetyStateVersion: "1",
-        budget,
-        time: { created: 100 },
-      };
-      const plan = (requestIndex: number) => ({
-        id: `ctxplan_history_${requestIndex}`,
-        conversationId: "conv_history",
-        runId: "run_history",
-        requestIndex,
-        sourceHeadRunId: "run_history",
-        sourceConversationRevision: 1,
-        trigger: "auto_pre_turn",
-        providerId: "openai",
-        modelId: "gpt-4o",
-        view: "checkpoint",
-        reason: "checkpoint_selected",
-        checkpointId: "ckpt_history",
-        lineageRunIds: ["run_history"],
-        rawRunIds: [],
-        safetyState: {
-          version: "1",
-          conversationId: "conv_history",
-          effects: [],
-          permissions: [],
-          hash: `sha256:${"4".repeat(64)}`,
-        },
-        budget: { ...budget, estimatedInputTokens: requestIndex === 1 ? 400 : 480 },
-        requestHash: `sha256:${String(requestIndex).repeat(64)}`,
-        viewHash: `sha256:${String(requestIndex + 2).repeat(64)}`,
-        time: { created: 100 + requestIndex },
-      });
-      const usage = (requestIndex: number) => ({
-        id: `ctxuse_history_${requestIndex}`,
-        conversationId: "conv_history",
-        runId: "run_history",
-        requestIndex,
-        providerId: "openai",
-        modelId: "gpt-4o",
-        contextWindow: 1000,
-        estimatedInputTokens: requestIndex === 1 ? 400 : 480,
-        estimateSource: "estimate",
-        reservedOutputTokens: 120,
-        view: "checkpoint",
-        checkpointId: "ckpt_history",
-        breakdown: {
-          rawTokens: 0,
-          checkpointTokens: requestIndex === 1 ? 340 : 420,
-          safetyStateTokens: 20,
-          systemPromptTokens: 20,
-          toolSchemaTokens: 20,
-        },
-        estimatorVersion: "test",
-        policyVersion: "test",
-        checkpointFormatVersion: "1",
-        time: { created: 110 + requestIndex },
-      });
-      db.query(`INSERT INTO runtime_context_checkpoints (
-        id, conversation_id, coverage_through_run_id, source_head_run_id,
-        source_conversation_revision, format_version, compatibility_kind,
-        compatibility_version, payload_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(
-          checkpoint.id,
-          checkpoint.conversationId,
-          checkpoint.coverageThroughRunId,
-          checkpoint.sourceHeadRunId,
-          checkpoint.sourceConversationRevision,
-          checkpoint.formatVersion,
-          checkpoint.compatibility.kind,
-          checkpoint.compatibility.version,
-          JSON.stringify(checkpoint),
-          checkpoint.time.created,
-        );
-      for (const requestIndex of [1, 2]) {
-        const durablePlan = plan(requestIndex);
-        const durableUsage = usage(requestIndex);
-        db.query(`INSERT INTO runtime_context_plans (
-          id, conversation_id, run_id, request_index, payload_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(
-            durablePlan.id,
-            durablePlan.conversationId,
-            durablePlan.runId,
-            durablePlan.requestIndex,
-            JSON.stringify(durablePlan),
-            durablePlan.time.created,
-          );
-        db.query(`INSERT INTO runtime_context_usage (
-          id, conversation_id, run_id, request_index, payload_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(
-            durableUsage.id,
-            durableUsage.conversationId,
-            durableUsage.runId,
-            durableUsage.requestIndex,
-            JSON.stringify(durableUsage),
-            durableUsage.time.created,
-          );
-      }
-      first.store.appendTrace({
-        id: "trace_history_recovered",
-        conversationId: "conv_history",
-        runId: "run_history",
-        type: "context.overflow.recovered",
-        level: "warn",
-        time: 150,
-        payload: {
-          error: {
-            name: "ContextWindowExceededError",
-            data: { message: "context window exceeded" },
-          },
-          requestIndex: 1,
-          sourceHeadRunId: "run_history",
-          sourceConversationRevision: 1,
-          checkpointId: "ckpt_history",
-          beforeEstimatedInputTokens: 900,
-          afterEstimatedInputTokens: 400,
-        },
-      });
-      const readMarker = async (app: Awaited<ReturnType<typeof createApp>>) => {
-        const response = await app.handle(new Request(
-          "http://localhost/v1/conversations/conv_history/messages?format=ai_sdk",
-        ));
-        const body = await response.json() as {
-          messages: Array<{ id: string; metadata?: { custom?: { nexus?: { compaction?: unknown } } } }>;
-        };
-        return body.messages.find((message) => message.id === "msg_assistant")
-          ?.metadata?.custom?.nexus?.compaction;
-      };
-      const producingRequestMarker = {
-        trigger: "provider_overflow",
-        createdAt: 150,
-        coverageThroughRunId: "run_history",
-        beforeTokens: 900,
-        afterTokens: 400,
-        status: "recovered",
-      };
-      expect(await readMarker(first.app)).toEqual(producingRequestMarker);
+        beforeEstimatedInputTokens: 900,
+        startedAt: 20,
+      },
+      eventId: "evt_activity_preparing",
+    });
+    store.finishContextCompactionActivity({
+      activityId: "cmp_history",
+      status: "failed",
+      completedAt: 21,
+      eventId: "evt_activity_failed",
+    });
 
-      Bun.gc(true);
-      db.close(true);
-      db = openRuntimeDatabase(databasePath);
-      const reopened = await createApp(config(), { runtimeDatabase: db });
-      expect(await readMarker(reopened)).toEqual(producingRequestMarker);
-    } finally {
-      try {
-        db?.close();
-      } catch {
-        // The successful path already closed the first database handle.
-      }
-      rmSync(directory, { recursive: true, force: true });
-    }
+    const response = await app.handle(new Request(
+      "http://localhost/v1/conversations/conv_history/messages?format=ai_sdk",
+    ));
+    const body = await response.json() as {
+      context_compaction_activities: Array<Record<string, unknown>>;
+      messages: Array<{ id: string; parts: Array<Record<string, unknown>> }>;
+    };
+    const assistant = body.messages.find((message) => message.id === "msg_assistant");
+
+    expect(response.status).toBe(200);
+    expect(body.context_compaction_activities).toEqual([
+      expect.objectContaining({
+        id: "cmp_history",
+        requestIndex: 0,
+        attemptIndex: 0,
+        status: "failed",
+      }),
+    ]);
+    expect(assistant?.parts).toContainEqual(expect.objectContaining({
+      type: "data-context-compaction",
+      id: "cmp_history",
+      data: expect.objectContaining({ status: "failed" }),
+    }));
+    expect(JSON.stringify(body)).not.toMatch(/summary|reasoningText|safetyState/);
+
+    db.close();
   });
 
   test("does not expose poisoned stored Assistant metadata from the active AI SDK route", async () => {
@@ -913,7 +774,43 @@ describe("runtime history routes", () => {
   });
 
   test("returns active history by default and an explicit append-only transcript with DAG runs", async () => {
-    const { app, db } = await createAppWithBranchedHistoryFixtures();
+    const { app, db, store, conversation } = await createAppWithBranchedHistoryFixtures();
+    const persistFailedActivity = (
+      runId: Run["id"],
+      revision: number,
+      activityId: `cmp_${string}`,
+    ): void => {
+      store.saveConversation({
+        ...conversation,
+        activeHeadRunId: runId,
+        revision,
+        time: { ...conversation.time, updated: 60 + revision },
+      });
+      store.startContextCompactionActivity({
+        activity: {
+          id: activityId,
+          conversationId: conversation.id,
+          runId,
+          requestIndex: 0,
+          attemptIndex: 0,
+          trigger: "auto_pre_turn",
+          status: "preparing",
+          sourceHeadRunId: runId,
+          sourceConversationRevision: revision,
+          beforeEstimatedInputTokens: 900,
+          startedAt: 60 + revision,
+        },
+        eventId: `evt_${activityId}_preparing`,
+      });
+      store.finishContextCompactionActivity({
+        activityId,
+        status: "failed",
+        completedAt: 70 + revision,
+        eventId: `evt_${activityId}_failed`,
+      });
+    };
+    persistFailedActivity("run_d", 4, "cmp_old_branch");
+    persistFailedActivity("run_e", 5, "cmp_active_branch");
 
     const defaultResponse = await app.handle(new Request(
       "http://localhost/v1/conversations/conv_branched_history/messages",
@@ -931,6 +828,7 @@ describe("runtime history routes", () => {
       view: string;
       format: string;
       messages: Message[];
+      context_compaction_activities: Array<{ id: string; runId: string }>;
       runs?: unknown[];
     };
     const activeBody = await activeResponse.json() as typeof defaultBody;
@@ -957,6 +855,9 @@ describe("runtime history routes", () => {
       "Question E",
     ]);
     expect(defaultBody.runs).toBeUndefined();
+    expect(defaultBody.context_compaction_activities).toEqual([
+      expect.objectContaining({ id: "cmp_active_branch", runId: "run_e" }),
+    ]);
 
     expect(transcriptResponse.status).toBe(200);
     expect(transcriptBody).toMatchObject({
@@ -972,6 +873,10 @@ describe("runtime history routes", () => {
       "Question C",
       "Question D",
       "Question E",
+    ]);
+    expect(transcriptBody.context_compaction_activities).toEqual([
+      expect.objectContaining({ id: "cmp_old_branch", runId: "run_d" }),
+      expect.objectContaining({ id: "cmp_active_branch", runId: "run_e" }),
     ]);
     expect(transcriptBody.runs).toEqual([
       expect.objectContaining({ id: "run_a", conversation_id: "conv_branched_history" }),

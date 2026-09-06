@@ -63,9 +63,16 @@ import {
   type ComponentType,
   type FC,
   type PropsWithChildren,
+  type ReactNode,
 } from "react";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
+
+export interface ThreadDataPartProps {
+  name: string;
+  data: unknown;
+  dataRendererUI: ReactNode;
+}
 
 /**
  * Optional component overrides for the thread. `AssistantMessage` and
@@ -88,6 +95,7 @@ export type ThreadComponents = {
   ReasoningGroup?:
     | ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
     | undefined;
+  DataPart?: ComponentType<ThreadDataPartProps> | undefined;
 };
 
 export type ThreadVariant = "default" | "workbench";
@@ -733,6 +741,7 @@ const AssistantMessage: FC = () => {
     ToolFallback: ToolFallbackComponent = ToolFallback,
     ToolGroup,
     ReasoningGroup,
+    DataPart,
     AssistantMessageStatus,
   } = useContext(ThreadComponentsContext);
   const messageMetadata = useAuiState((state) => state.message.metadata);
@@ -811,7 +820,13 @@ const AssistantMessage: FC = () => {
               case "tool-call":
                 return part.toolUI ?? <ToolFallbackComponent {...part} />;
               case "data":
-                return part.dataRendererUI;
+                return DataPart ? (
+                  <DataPart
+                    name={part.name}
+                    data={part.data}
+                    dataRendererUI={part.dataRendererUI}
+                  />
+                ) : part.dataRendererUI;
               default:
                 return null;
             }

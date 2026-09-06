@@ -14,7 +14,8 @@ export type RuntimeIdPrefix =
   | "diag"
   | "ckpt"
   | "ctxplan"
-  | "ctxuse";
+  | "ctxuse"
+  | "cmp";
 
 export type RuntimeId<TPrefix extends RuntimeIdPrefix = RuntimeIdPrefix> =
   `${TPrefix}_${string}`;

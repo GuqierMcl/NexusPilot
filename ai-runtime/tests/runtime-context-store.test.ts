@@ -11,6 +11,7 @@ import {
   type AssistantMessage,
   type ContextBudgetSnapshot,
   type ContextCheckpoint,
+  type ContextCompactionActivity,
   type ContextPlan,
   type ContextPreparationClaim,
   type ContextUsage,
@@ -258,6 +259,31 @@ function usage(id = "ctxuse_1"): ContextUsage {
   };
 }
 
+function compactionActivity(
+  overrides: Partial<ContextCompactionActivity> = {},
+): ContextCompactionActivity {
+  return {
+    id: "cmp_1",
+    conversationId: "conv_context",
+    runId: "run_c",
+    requestIndex: 1,
+    attemptIndex: 0,
+    trigger: "auto_mid_turn",
+    status: "preparing",
+    sourceHeadRunId: "run_c",
+    sourceConversationRevision: 3,
+    coverageCursor: {
+      kind: "sealed_step",
+      runId: "run_c",
+      throughRequestIndex: 0,
+      throughPartId: "part_step_finish_c_0",
+    },
+    beforeEstimatedInputTokens: 900,
+    startedAt: 320,
+    ...overrides,
+  };
+}
+
 function nextTurnForecast(
   overrides: Partial<NonNullable<ContextUsage["nextTurnForecast"]>> = {},
 ): NonNullable<ContextUsage["nextTurnForecast"]> {
@@ -405,7 +431,118 @@ describe("Runtime context schemas and persistence", () => {
     expect(runtime.contextCheckpointSchema.parse(record)).toEqual(record);
     expect(runtime.contextPlanSchema.parse(plan())).toEqual(plan());
     expect(runtime.contextUsageSchema.parse(usage())).toEqual(usage());
+    expect(runtime.contextCompactionActivitySchema.parse(compactionActivity()))
+      .toEqual(compactionActivity());
     expect(runtime.runtimeSafetyStateSchema.parse(plan().safetyState)).toEqual(plan().safetyState);
+  });
+
+  test("round-trips a compaction Activity whose Provider request differs from its visible boundary", () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    createHistory(store);
+    const preparing = compactionActivity({
+      requestIndex: 2,
+      boundaryStepIndex: 1,
+    }) as ContextCompactionActivity & { status: "preparing" };
+
+    expect(runtime.contextCompactionActivitySchema.parse(preparing)).toEqual(preparing);
+    expect(store.startContextCompactionActivity({
+      activity: preparing,
+      eventId: "evt_compaction_distinct_boundary",
+    })).toEqual(preparing);
+    expect(store.listContextCompactionActivitiesByRun("run_c")).toEqual([preparing]);
+    expect(store.listEvents("conv_context").find(
+      (event) => event.type === "context.compaction.updated",
+    )?.properties.info).toEqual(preparing);
+    db.close();
+  });
+
+  test("persists one stable compaction Activity and converges it to a durable terminal state", () => {
+    const db = openRuntimeDatabase(":memory:");
+    const store = new RuntimeSqliteStore(db);
+    createHistory(store);
+    const preparing = compactionActivity() as ContextCompactionActivity & {
+      status: "preparing";
+    };
+
+    expect(store.startContextCompactionActivity({
+      activity: preparing,
+      eventId: "evt_compaction_preparing",
+    })).toEqual(preparing);
+    expect(store.startContextCompactionActivity({
+      activity: preparing,
+      eventId: "evt_compaction_preparing_duplicate",
+    })).toEqual(preparing);
+    expect(store.listContextCompactionActivities("conv_context")).toEqual([preparing]);
+
+    const created = store.finishContextCompactionActivity({
+      activityId: preparing.id,
+      status: "created",
+      checkpointId: "ckpt_1",
+      afterEstimatedInputTokens: 410,
+      completedAt: 330,
+      eventId: "evt_compaction_created",
+    });
+    expect(created).toEqual({
+      ...preparing,
+      status: "created",
+      checkpointId: "ckpt_1",
+      afterEstimatedInputTokens: 410,
+      completedAt: 330,
+    });
+    expect(store.listContextCompactionActivitiesByRun("run_c")).toEqual([created]);
+    expect(store.listEvents("conv_context").filter(
+      (event) => event.type === "context.compaction.updated",
+    )).toHaveLength(2);
+    expect(JSON.stringify(store.listEvents("conv_context"))).not.toContain("summary through");
+    db.close();
+  });
+
+  test("converges an abandoned preparing Activity to interrupted exactly once on restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "nexuspilot-context-activity-"));
+    const path = join(directory, "runtime.sqlite");
+    let db: ReturnType<typeof openRuntimeDatabase> | undefined;
+    try {
+      db = openRuntimeDatabase(path);
+      let store = new RuntimeSqliteStore(db, { now: () => 500 });
+      createHistory(store);
+      const preparing = compactionActivity() as ContextCompactionActivity & {
+        status: "preparing";
+      };
+      store.startContextCompactionActivity({
+        activity: preparing,
+        eventId: "evt_activity_started",
+      });
+      db.close();
+
+      db = openRuntimeDatabase(path);
+      store = new RuntimeSqliteStore(db, { now: () => 500 });
+      expect(store.listContextCompactionActivitiesByRun("run_c")).toEqual([{
+        ...preparing,
+        status: "interrupted",
+        completedAt: 500,
+      }]);
+      expect(store.listEvents("conv_context").filter(
+        (event) => event.type === "context.compaction.updated",
+      )).toHaveLength(2);
+      db.close();
+
+      db = openRuntimeDatabase(path);
+      store = new RuntimeSqliteStore(db, { now: () => 600 });
+      expect(store.listContextCompactionActivitiesByRun("run_c")[0]?.completedAt).toBe(500);
+      expect(store.listEvents("conv_context").filter(
+        (event) => event.type === "context.compaction.updated",
+      )).toHaveLength(2);
+      db.close();
+      db = undefined;
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // The successful path already closed the handle.
+      }
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test("validates raw and checkpoint next-turn forecast identities", () => {

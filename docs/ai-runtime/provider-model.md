@@ -337,7 +337,7 @@ AI SDK full stream 的标准 `{ type: "error", error }` part 是模型执行失�
 
 上述模型执行错误与 Provider/model 解析阶段的 HTTP 错误、具体 ToolCall 的业务错误、sidecar/transport 可用性错误保持分层。模型错误在消息流原位置显示并可由 Snapshot 恢复；Tool 错误继续留在对应 tool result/card；transport 状态继续使用产品基础设施提示。
 
-Provider 的 `contextLength` 和 output length 也是 Context Window Manager 的预算输入。有限、有效的窗口会启用 automatic pre-turn compaction；缺失或无效窗口不会猜测更小的窗口，而是优先发送完整 active raw lineage。summary 首次预算与 reasoning-only retry 阶梯受 Provider/model output length 上限约束；无法获得更大合法预算时不发起伪重试。唯一的运行中恢复是明确 context-overflow 且当前请求尚无 output/tool/Permission/side effect 时，对同一 Provider/model 安全重试一次；其他错误和不安全的 mid-turn overflow 仍按上述透明路径展示。每步的 `ContextUsage` 分别保留 estimate、Provider input observation 和 output reserve；主百分比只使用包含最新 Assistant 的 durable next-turn forecast，不能用 Provider observation、reserve 或累计 `Run.usage` 冒充窗口使用量。
+Provider 的 `contextLength` 和 output length 也是 Context Window Manager 的预算输入。有限、有效的窗口会在新 Run 首次请求和同一 Run 每个安全 model-step boundary 启用 automatic pre-turn/mid-turn planning；缺失或无效窗口不会猜测更小的窗口，而是优先发送完整 active raw lineage。summary 首次预算与 reasoning-only retry 阶梯受 Provider/model output length 上限约束；无法获得更大合法预算时不发起伪重试。唯一的 overflow 恢复是明确 context-overflow 且失败 attempt 尚无 output/tool/Permission/side effect 时，对同一 Provider/model 使用本次新建 checkpoint 安全重试一次；其他错误和不安全 overflow 仍按上述透明路径展示。每步的 `ContextUsage` 分别保留 estimate、Provider input observation 和 output reserve；主百分比只使用包含最新 Assistant 的 durable next-turn forecast，不能用 Provider observation、reserve 或累计 `Run.usage` 冒充窗口使用量。
 
 ## 与 Agent Definition 的关系
 

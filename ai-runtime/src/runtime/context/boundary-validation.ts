@@ -4,11 +4,16 @@ import type {
   AssistantMessage,
   Permission,
   Run,
+  StepFinishPart,
   ToolCall,
   ToolPart,
 } from "../core/types";
 import { stableStringifyJson } from "./token-estimator";
-import type { ContextCheckpoint, ContextPlannerSnapshot } from "./types";
+import type {
+  ContextCheckpoint,
+  ContextCoverageCursor,
+  ContextPlannerSnapshot,
+} from "./types";
 import {
   canonicalizeContextSummarySource,
   projectCanonicalContextSummarySource,
@@ -40,6 +45,7 @@ export interface ContextCoverageBoundaryInput {
 export interface ContextCoverageSourceStateInput extends ContextCoverageBoundaryInput {
   safetyStateHash: string;
   parentCheckpoint?: ContextCheckpoint;
+  coverageCursor?: ContextCoverageCursor;
 }
 
 export interface ContextCoverageSourceState {
@@ -74,10 +80,206 @@ export function isContextCoverageBoundarySafe(
   return analyzeContextCoverageBoundary(input).safe;
 }
 
+export function isContextCoverageCursorSafe(input: {
+  snapshot: ContextPlannerSnapshot;
+  lineageRuns: readonly Run[];
+  cursor: ContextCoverageCursor;
+}): boolean {
+  const runId = input.cursor.kind === "run"
+    ? input.cursor.throughRunId
+    : input.cursor.runId;
+  const coverageIndex = input.lineageRuns.findIndex((run) => run.id === runId);
+  if (coverageIndex < 0) return false;
+  if (input.cursor.kind === "run") {
+    return isContextCoverageBoundarySafe({
+      snapshot: input.snapshot,
+      lineageRuns: input.lineageRuns,
+      coverageIndex,
+    });
+  }
+  if (coverageIndex !== input.lineageRuns.length - 1) return false;
+  if (
+    coverageIndex > 0
+    && !isContextCoverageBoundarySafe({
+      snapshot: input.snapshot,
+      lineageRuns: input.lineageRuns,
+      coverageIndex: coverageIndex - 1,
+    })
+  ) {
+    return false;
+  }
+  return isCurrentRunSealedStepSafe({
+    snapshot: input.snapshot,
+    run: input.lineageRuns[coverageIndex]!,
+    cursor: input.cursor,
+  });
+}
+
+export function findLatestSafeSealedStepCursor(input: {
+  snapshot: ContextPlannerSnapshot;
+  lineageRuns: readonly Run[];
+  beforeRequestIndex: number;
+}): ContextCoverageCursor | undefined {
+  const run = input.lineageRuns.at(-1);
+  if (!run?.assistantMessageId) return undefined;
+  const assistant = input.snapshot.messages.find(
+    (message): message is AssistantMessage =>
+      message.role === "assistant" && message.id === run.assistantMessageId,
+  );
+  if (!assistant) return undefined;
+  const candidates = assistant.parts
+    .filter((part): part is StepFinishPart =>
+      part.type === "step-finish"
+      && Number.isSafeInteger(part.stepIndex)
+      && part.stepIndex >= 0
+      && part.stepIndex < input.beforeRequestIndex,
+    )
+    .sort((left, right) => right.stepIndex - left.stepIndex);
+  for (const part of candidates) {
+    const cursor: ContextCoverageCursor = {
+      kind: "sealed_step",
+      runId: run.id,
+      throughRequestIndex: part.stepIndex,
+      throughPartId: part.id,
+    };
+    if (isContextCoverageCursorSafe({
+      snapshot: input.snapshot,
+      lineageRuns: input.lineageRuns,
+      cursor,
+    })) {
+      return cursor;
+    }
+  }
+  return undefined;
+}
+
+function isCurrentRunSealedStepSafe(input: {
+  snapshot: ContextPlannerSnapshot;
+  run: Run;
+  cursor: Extract<ContextCoverageCursor, { kind: "sealed_step" }>;
+}): boolean {
+  const { snapshot, run, cursor } = input;
+  const conversationId = snapshot.conversation.id;
+  if (
+    run.id !== cursor.runId
+    || run.conversationId !== conversationId
+    || !run.parentMessageId
+    || !run.assistantMessageId
+  ) {
+    return false;
+  }
+  const user = snapshot.messages.find(
+    (message) => message.id === run.parentMessageId && message.role === "user",
+  );
+  const assistant = snapshot.messages.find(
+    (message): message is AssistantMessage =>
+      message.id === run.assistantMessageId && message.role === "assistant",
+  );
+  if (
+    !user
+    || user.conversationId !== conversationId
+    || !run.input.messageIds.includes(user.id)
+    || !assistant
+    || assistant.conversationId !== conversationId
+    || assistant.runId !== run.id
+    || assistant.parentId !== user.id
+  ) {
+    return false;
+  }
+  const boundaryIndex = assistant.parts.findIndex(
+    (part) => part.id === cursor.throughPartId,
+  );
+  const boundary = assistant.parts[boundaryIndex];
+  if (
+    boundaryIndex < 0
+    || boundary?.type !== "step-finish"
+    || boundary.stepIndex !== cursor.throughRequestIndex
+  ) {
+    return false;
+  }
+  const prefix = assistant.parts.slice(0, boundaryIndex + 1);
+  let openStep: number | undefined;
+  for (const part of prefix) {
+    if (
+      part.conversationId !== conversationId
+      || part.messageId !== assistant.id
+      || (run.output !== undefined && !run.output.partIds.includes(part.id))
+    ) {
+      return false;
+    }
+    if (part.type === "step-start") {
+      if (openStep !== undefined || part.stepIndex > cursor.throughRequestIndex) return false;
+      openStep = part.stepIndex;
+    } else if (part.type === "step-finish") {
+      if (openStep !== part.stepIndex) return false;
+      openStep = undefined;
+    }
+  }
+  if (openStep !== undefined) return false;
+
+  const toolCallsById = new Map(snapshot.toolCalls.map((call) => [call.id, call]));
+  const coveredToolCallIds = new Set<ToolCall["id"]>();
+  for (const part of prefix) {
+    if (part.type !== "tool") continue;
+    if (!TERMINAL_TOOL_STATUSES.has(part.state.status)) return false;
+    const toolCall = toolCallsById.get(part.toolCallId);
+    if (!toolCall) {
+      if (!isProviderValidationErrorWithoutToolCall(part)) return false;
+      continue;
+    }
+    if (
+      toolCall.conversationId !== conversationId
+      || toolCall.runId !== run.id
+      || toolCall.messageId !== assistant.id
+      || toolCall.partId !== part.id
+      || toolCall.toolName !== part.toolName
+      || toolCall.state !== part.state.status
+    ) {
+      return false;
+    }
+    coveredToolCallIds.add(toolCall.id);
+  }
+  const prefixPartIds = new Set(prefix.map((part) => part.id));
+  for (const toolCall of snapshot.toolCalls) {
+    if (
+      toolCall.runId === run.id
+      && toolCall.partId !== undefined
+      && prefixPartIds.has(toolCall.partId)
+      && !coveredToolCallIds.has(toolCall.id)
+    ) {
+      return false;
+    }
+  }
+  for (const permission of snapshot.permissions) {
+    if (permission.runId !== run.id) continue;
+    const toolCall = toolCallsById.get(permission.toolCallId);
+    if (!toolCall || !coveredToolCallIds.has(toolCall.id)) continue;
+    if (
+      permission.status === "pending"
+      || permission.messageId !== toolCall.messageId
+      || permission.toolId !== toolCall.toolName
+      || toolCall.permissionId !== permission.id
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function computeContextCoverageSourceState(
   input: ContextCoverageSourceStateInput,
 ): ContextCoverageSourceState {
-  const analysis = analyzeContextCoverageBoundary(input);
+  const coverageCursor = input.coverageCursor ?? {
+    kind: "run" as const,
+    throughRunId: input.lineageRuns[input.coverageIndex]!.id,
+  };
+  const analysis = coverageCursor.kind === "run"
+    ? analyzeContextCoverageBoundary(input)
+    : { safe: isContextCoverageCursorSafe({
+        snapshot: input.snapshot,
+        lineageRuns: input.lineageRuns,
+        cursor: coverageCursor,
+      }), coveredRuns: [] };
   const activeRunIds = new Set(input.lineageRuns.map((run) => run.id));
   const toolCalls = input.snapshot.toolCalls
     .filter((toolCall) =>
@@ -104,6 +306,7 @@ export function computeContextCoverageSourceState(
         id: input.parentCheckpoint.id,
         conversationId: input.parentCheckpoint.conversationId,
         coverageThroughRunId: input.parentCheckpoint.coverageThroughRunId,
+        coverageCursor: input.parentCheckpoint.coverageCursor,
         lineageHash: input.parentCheckpoint.lineageHash,
         sourceStateHash: input.parentCheckpoint.sourceStateHash,
         safetyStateHash: input.parentCheckpoint.safetyStateHash,
@@ -119,13 +322,53 @@ export function computeContextCoverageSourceState(
       )
     : -1;
   let canonicalSource: CanonicalContextSummarySource = { version: "1", pairs: [] };
-  let sourceSafe = analysis.safe && parentCoverageIndex < input.coverageIndex;
+  const parentCursor = input.parentCheckpoint?.coverageCursor ?? (
+    input.parentCheckpoint
+      ? { kind: "run" as const, throughRunId: input.parentCheckpoint.coverageThroughRunId }
+      : undefined
+  );
+  let sourceSafe = analysis.safe && (
+    parentCoverageIndex < input.coverageIndex
+    || (parentCoverageIndex === input.coverageIndex
+      && parentCursor?.kind === "sealed_step"
+      && coverageCursor.kind === "sealed_step"
+      && parentCursor.throughRequestIndex < coverageCursor.throughRequestIndex)
+  );
   if (sourceSafe) {
     try {
+      const sourceRuns = input.lineageRuns.slice(
+        parentCoverageIndex + 1,
+        input.coverageIndex + 1,
+      );
+      const sourceMessages = [...input.snapshot.messages];
+      if (coverageCursor.kind === "sealed_step") {
+        const run = input.lineageRuns[input.coverageIndex]!;
+        const assistantIndex = sourceMessages.findIndex(
+          (message) => message.id === run.assistantMessageId && message.role === "assistant",
+        );
+        const assistant = sourceMessages[assistantIndex];
+        if (!assistant || assistant.role !== "assistant") {
+          throw new Error("Context sealed-step source Assistant is unavailable");
+        }
+        const throughIndex = assistant.parts.findIndex(
+          (part) => part.id === coverageCursor.throughPartId,
+        );
+        const afterIndex = parentCursor?.kind === "sealed_step"
+          && parentCursor.runId === coverageCursor.runId
+          ? assistant.parts.findIndex((part) => part.id === parentCursor.throughPartId) + 1
+          : 0;
+        sourceMessages[assistantIndex] = {
+          ...assistant,
+          parts: assistant.parts.slice(afterIndex, throughIndex + 1),
+        };
+        if (!sourceRuns.some((candidate) => candidate.id === run.id)) {
+          sourceRuns.push(run);
+        }
+      }
       canonicalSource = canonicalizeContextSummarySource({
         conversationId: input.snapshot.conversation.id,
-        runs: input.lineageRuns.slice(parentCoverageIndex + 1, input.coverageIndex + 1),
-        messages: input.snapshot.messages,
+        runs: sourceRuns,
+        messages: sourceMessages,
       });
     } catch {
       sourceSafe = false;
@@ -135,6 +378,7 @@ export function computeContextCoverageSourceState(
     version: "1",
     conversationId: input.snapshot.conversation.id,
     sourceHeadRunId: input.snapshot.conversation.activeHeadRunId,
+    coverageCursor,
     coverageThroughRunId: input.lineageRuns[input.coverageIndex]?.id,
     coveredRuns: analysis.coveredRuns,
     toolCalls,

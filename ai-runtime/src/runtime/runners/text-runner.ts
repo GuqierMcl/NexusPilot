@@ -50,7 +50,9 @@ import {
 import type {
   FinishReason,
   InterruptReason,
+  Permission,
   PermissionId,
+  AssistantMessage,
   Message,
   Run,
   Part,
@@ -70,6 +72,9 @@ import type {
 import type { RuntimeAttachmentService } from "../attachments";
 import { mapAiSdkUsage } from "../core/usage";
 import { projectModelHistory } from "../projection/model-history-projection";
+import {
+  projectContextCompactionActivityToAiSdkDataPart,
+} from "../projection/ai-sdk-projection";
 import {
   modelErrorMessage,
   toRuntimeModelError,
@@ -232,6 +237,7 @@ export interface RuntimePrepareStepEvent {
 export interface RuntimeStepEndEvent {
   stepNumber: number;
   usage?: LanguageModelUsage;
+  finishReason?: AiFinishReason;
 }
 
 export interface RuntimeStreamAbortEvent {
@@ -303,6 +309,19 @@ export interface RuntimeStreamTextResult {
   /** Resolves once this attempt can be exposed without losing a safe replacement. */
   responseReady?: PromiseLike<void>;
   toUIMessageStreamResponse(options?: RuntimeUIMessageStreamResponseOptions): Response;
+}
+
+interface ContextOverflowRequestBaseline {
+  requestIndex: number;
+  semanticStepIndex: number;
+  finalText: string;
+  semanticPartCount: number;
+  streamedStepCount: number;
+  openToolLifecycle: boolean;
+  pendingPermission: boolean;
+  toolFactsHash: string;
+  permissionFactsHash: string;
+  sideEffectFactsHash: string;
 }
 
 export type RuntimeStreamText = (
@@ -726,6 +745,11 @@ export class RuntimeTextRunner {
       releaseContinuation,
     } = input;
     const createId = this.deps.createId ?? createRuntimeId;
+    const contextRequestIndexBase = nextContextRequestIndex(
+      this.deps.store,
+      started.run.id,
+      previousStepCount,
+    );
     let finalText = "";
     let terminalWritten = false;
     let coordinatorState: StreamCoordinatorState = "attempt0";
@@ -840,6 +864,26 @@ export class RuntimeTextRunner {
     const markOverflowRecoverySucceeded = (): void => {
       if (!pendingOverflowRecoveryPayload) return;
       const recoveredAt = now();
+      if (latestContextMarker?.activityId) {
+        this.deps.store.finishContextCompactionActivity({
+          activityId: latestContextMarker.activityId,
+          status: "recovered",
+          ...(latestContextMarker.checkpointId
+            ? { checkpointId: latestContextMarker.checkpointId }
+            : {}),
+          ...(latestContextMarker.coverageCursor
+            ? { coverageCursor: latestContextMarker.coverageCursor }
+            : {}),
+          ...(latestContextMarker.afterEstimatedInputTokens === undefined
+            ? {}
+            : {
+                afterEstimatedInputTokens:
+                  latestContextMarker.afterEstimatedInputTokens,
+              }),
+          completedAt: recoveredAt,
+          eventId: createId("evt"),
+        });
+      }
       this.deps.store.appendTrace({
         id: createId("trace"),
         conversationId: started.conversation.id,
@@ -915,7 +959,7 @@ export class RuntimeTextRunner {
         : undefined;
       const requestIndex = latestContextUsage?.requestIndex
         ?? lifecycleRequestIndex
-        ?? previousStepCount;
+        ?? contextRequestIndexBase;
       latestContextUsage ??= this.deps.store.getContextUsageByRunRequest(
         started.run.id,
         requestIndex,
@@ -1299,26 +1343,84 @@ export class RuntimeTextRunner {
     let result: RuntimeStreamTextResult;
     let streamedStepCount = 0;
     const initialToolCalls = this.deps.store.listToolCallsByRun(started.run.id);
+    const initialPermissions = this.deps.store.listPermissionsByRun(started.run.id);
     const overflowGate: ContextOverflowRetryGate = {
       runId: started.run.id,
       attempted: false,
       modelOutputObserved: false,
-      toolLifecycleObserved: initialToolCalls.length > 0,
-      permissionObserved: this.deps.store.listPermissionsByRun(started.run.id).length > 0,
-      sideEffectObserved: hasDurableSideEffectFact(initialToolCalls),
+      toolLifecycleObserved: hasOpenToolLifecycle(initialToolCalls),
+      permissionObserved: initialPermissions.some((permission) =>
+        permission.status === "pending"
+      ),
+      sideEffectObserved: false,
+    };
+    let overflowRequestBaseline = createContextOverflowRequestBaseline({
+      requestIndex: contextRequestIndexBase,
+      semanticStepIndex: previousStepCount,
+      finalText,
+      semanticPartCount: semanticParts.length,
+      streamedStepCount,
+      toolCalls: initialToolCalls,
+      permissions: initialPermissions,
+    });
+    let observedOverflowRequestIndex = overflowRequestBaseline.requestIndex;
+    const activateContextOverflowRequest = (): void => {
+      const toolCalls = this.deps.store.listToolCallsByRun(started.run.id);
+      const permissions = this.deps.store.listPermissionsByRun(started.run.id);
+      overflowRequestBaseline = createContextOverflowRequestBaseline({
+        requestIndex: overflowRequestBaseline.requestIndex,
+        semanticStepIndex: overflowRequestBaseline.semanticStepIndex,
+        finalText,
+        semanticPartCount: semanticParts.length,
+        streamedStepCount,
+        toolCalls,
+        permissions,
+      });
+      observedOverflowRequestIndex = overflowRequestBaseline.requestIndex;
+      overflowGate.modelOutputObserved = false;
+      overflowGate.toolLifecycleObserved = overflowRequestBaseline.openToolLifecycle;
+      overflowGate.permissionObserved = overflowRequestBaseline.pendingPermission;
+      overflowGate.sideEffectObserved = false;
+    };
+    const beginContextOverflowRequest = (
+      requestIndex: number,
+      semanticStepIndex: number,
+    ): void => {
+      const toolCalls = this.deps.store.listToolCallsByRun(started.run.id);
+      const permissions = this.deps.store.listPermissionsByRun(started.run.id);
+      overflowRequestBaseline = createContextOverflowRequestBaseline({
+        requestIndex,
+        semanticStepIndex,
+        finalText,
+        semanticPartCount: semanticParts.length,
+        streamedStepCount,
+        toolCalls,
+        permissions,
+      });
+      // ToolLoop can begin preparing request N+1 before the Runtime full-stream
+      // consumer has observed every chunk from request N. Do not reset the
+      // active observation gate until the corresponding start-step is consumed.
+      if (observedOverflowRequestIndex === requestIndex) {
+        activateContextOverflowRequest();
+      }
     };
     let retryResult: RuntimeStreamTextResult | undefined;
+    let pendingOverflowRecovery: Promise<void> | undefined;
+    let pendingPrimaryUiStreamError: unknown;
     try {
       const prepareManagedContext = async (
         requestIndex: number,
         trigger: "auto_pre_turn" | "auto_mid_turn" | "provider_overflow",
         retainedMessages: ModelMessage[],
+        retainedMessagesStartRequestIndex?: number,
+        activityBoundaryStepIndex?: number,
       ): Promise<PreparedModelContext | undefined> => {
         if (!this.deps.contextManager) return undefined;
         return this.deps.contextManager.prepare({
           conversationId: started.conversation.id,
           runId: started.run.id,
           requestIndex,
+          activityBoundaryStepIndex,
           providerId: request.providerId,
           modelId: request.modelId,
           model: resolved.languageModel,
@@ -1340,15 +1442,24 @@ export class RuntimeTextRunner {
           ),
           excludeAssistantMessageId: started.assistantMessage.id,
           retainedMessages,
+          retainedMessagesStartRequestIndex,
         });
       };
       let retainedModelMessages = [...(continuationResponsePrefix ?? [])];
+      let retainedMessagesStartRequestIndex = retainedModelMessages.length > 0
+        ? 0
+        : undefined;
       const initialPrepared = await prepareManagedContext(
-        previousStepCount,
+        contextRequestIndexBase,
         continuationMessages ? "auto_mid_turn" : "auto_pre_turn",
         retainedModelMessages,
+        retainedMessagesStartRequestIndex,
       );
       if (initialPrepared) {
+        if (initialPrepared.retainedMessagesCovered) {
+          retainedModelMessages = [];
+          retainedMessagesStartRequestIndex = undefined;
+        }
         latestContextUsage = persistContextUsageEstimate({
           store: this.deps.store,
           createId,
@@ -1427,6 +1538,14 @@ export class RuntimeTextRunner {
                   terminalAttempt = attempt;
                   return attemptInput.onFinish?.(event);
                 }
+                // AI SDK's outer completion can report the same failed model
+                // request while the full-stream error is preparing a safe
+                // replacement. It carries no additional output or side effect.
+                if (
+                  attempt === 0
+                  && coordinatorState === "recovering"
+                  && event.finishReason === "error"
+                ) return;
                 quarantineStaleAttempt(attempt);
               }
             : undefined,
@@ -1464,6 +1583,10 @@ export class RuntimeTextRunner {
           onStepEnd: attemptInput.onStepEnd
             ? (event) => {
                 if (ownsStreamAttempt(attempt)) return attemptInput.onStepEnd?.(event);
+                // AI SDK closes the failed model step after emitting an error.
+                // This callback contains no user-visible output or tool effect;
+                // discard it while overflow preparation owns the coordinator.
+                if (attempt === 0 && coordinatorState === "recovering") return;
                 quarantineStaleAttempt(attempt);
               }
             : undefined,
@@ -1479,12 +1602,15 @@ export class RuntimeTextRunner {
           };
       };
       const createManagedPrepareStep = (
-        baseRequestIndex: number,
+        baseSemanticStepIndex: number,
+        baseContextRequestIndex: number,
         firstMessages: ModelMessage[],
         firstInstructions: PreparedModelContext["instructions"] | undefined,
         firstPrepared: boolean,
       ): NonNullable<RuntimeStreamTextInput["prepareStep"]> => async (event) => {
-        const requestIndex = baseRequestIndex + event.stepNumber;
+        const requestIndex = baseContextRequestIndex + event.stepNumber;
+        const semanticStepIndex = baseSemanticStepIndex + event.stepNumber;
+        beginContextOverflowRequest(requestIndex, semanticStepIndex);
         if (event.stepNumber === 0 && firstPrepared) {
           lastPreparedModelMessages = firstMessages;
           return {
@@ -1496,6 +1622,9 @@ export class RuntimeTextRunner {
           };
         }
         const inFlightSuffix = event.messages.slice(lastPreparedModelMessages.length);
+        if (inFlightSuffix.length > 0 && retainedMessagesStartRequestIndex === undefined) {
+          retainedMessagesStartRequestIndex = Math.max(0, semanticStepIndex - 1);
+        }
         retainedModelMessages = [
           ...retainedModelMessages,
           ...inFlightSuffix,
@@ -1504,8 +1633,14 @@ export class RuntimeTextRunner {
           requestIndex,
           "auto_mid_turn",
           retainedModelMessages,
+          retainedMessagesStartRequestIndex,
+          semanticStepIndex,
         );
         if (!prepared) return undefined;
+        if (prepared.retainedMessagesCovered) {
+          retainedModelMessages = [];
+          retainedMessagesStartRequestIndex = undefined;
+        }
         const nextMessages = prepared.messages;
         latestContextUsage = persistContextUsageEstimate({
           store: this.deps.store,
@@ -1528,13 +1663,39 @@ export class RuntimeTextRunner {
         };
       };
       const createManagedOnStepEnd = (
-        baseRequestIndex: number,
+        baseSemanticStepIndex: number,
+        baseContextRequestIndex: number,
       ): NonNullable<RuntimeStreamTextInput["onStepEnd"]> => async (event) => {
+        const stepIndex = baseSemanticStepIndex + event.stepNumber;
+        if (!semanticParts.some(
+          (part) => part.type === "step-finish" && part.stepIndex === stepIndex,
+        )) {
+          const completedAt = now();
+          semanticParts.push({
+            id: createId("part"),
+            conversationId: started.conversation.id,
+            messageId: started.assistantMessage.id,
+            type: "step-finish",
+            stepIndex,
+            reason: event.finishReason
+              ? mapAiSdkFinishReason(event.finishReason)
+              : "unknown",
+            ...(event.usage ? { usage: mapAiSdkUsage(event.usage) } : {}),
+            time: { created: completedAt },
+          });
+          persistSealedAssistantPrefix({
+            store: this.deps.store,
+            createId,
+            started,
+            parts: semanticParts,
+            completedAt,
+          });
+        }
         const observation = toContextProviderObservation(event.usage);
         if (!observation) return;
         latestContextUsage = this.deps.store.updateContextUsageProviderObservation({
           runId: started.run.id,
-          requestIndex: baseRequestIndex + event.stepNumber,
+          requestIndex: baseContextRequestIndex + event.stepNumber,
           providerObservation: observation,
         });
       };
@@ -1557,20 +1718,35 @@ export class RuntimeTextRunner {
         cleanupPreparedRun();
       };
       const retryContextOverflow = async (error: unknown): Promise<boolean> => {
-        if (coordinatorState !== "attempt0") return false;
+        if (
+          coordinatorState !== "attempt0"
+          && !(coordinatorState === "committed" && committedAttempt === 0)
+        ) return false;
         const currentRun = this.deps.store.getRun(started.run.id);
         const currentConversation = this.deps.store.getConversation(started.conversation.id);
         if (!currentRun || !currentConversation || !this.deps.contextManager) return false;
+        // Some Providers fail before AI SDK emits start-step. The full-stream
+        // error is still an exact model-request boundary, so activate the most
+        // recently prepared request before evaluating its observations.
+        if (observedOverflowRequestIndex !== overflowRequestBaseline.requestIndex) {
+          activateContextOverflowRequest();
+        }
         if (isTerminalRunStatus(currentRun.status)) {
           adoptDurableTerminalState();
           return true;
         }
         if (currentRun.status !== "running") return false;
         const currentToolCalls = this.deps.store.listToolCallsByRun(started.run.id);
-        overflowGate.toolLifecycleObserved ||= currentToolCalls.length > 0;
+        const currentPermissions = this.deps.store.listPermissionsByRun(started.run.id);
+        overflowGate.toolLifecycleObserved ||=
+          contextOverflowToolFactsHash(currentToolCalls)
+            !== overflowRequestBaseline.toolFactsHash;
         overflowGate.permissionObserved ||=
-          this.deps.store.listPermissionsByRun(started.run.id).length > 0;
-        overflowGate.sideEffectObserved ||= hasDurableSideEffectFact(currentToolCalls);
+          contextOverflowPermissionFactsHash(currentPermissions)
+            !== overflowRequestBaseline.permissionFactsHash;
+        overflowGate.sideEffectObserved ||=
+          contextOverflowSideEffectFactsHash(currentToolCalls)
+            !== overflowRequestBaseline.sideEffectFactsHash;
         if (currentConversation.revision !== started.conversation.revision) return false;
         const decision = recoverContextOverflow({
           error,
@@ -1584,26 +1760,22 @@ export class RuntimeTextRunner {
           return false;
         }
 
-        finalText = "";
-        for (let index = semanticParts.length - 1; index >= 0; index -= 1) {
-          const part = semanticParts[index]!;
-          if (
-            ((part.type === "text" || part.type === "reasoning") && part.text.length === 0)
-            || part.type === "step-start"
-          ) {
-            semanticParts.splice(index, 1);
-          }
-        }
-        streamedStepCount = 0;
+        finalText = overflowRequestBaseline.finalText;
+        semanticParts.splice(overflowRequestBaseline.semanticPartCount);
+        streamedStepCount = overflowRequestBaseline.streamedStepCount;
         resetActiveStreamParts();
 
-        const requestIndex = previousStepCount + 1;
+        const failedRequestIndex = overflowRequestBaseline.requestIndex;
+        const failedSemanticStepIndex = overflowRequestBaseline.semanticStepIndex;
+        const requestIndex = failedRequestIndex + 1;
         let prepared: PreparedModelContext;
         try {
           prepared = await prepareManagedContext(
             requestIndex,
             "provider_overflow",
             [],
+            undefined,
+            failedSemanticStepIndex,
           ) as PreparedModelContext;
         } catch {
           const failedRecoveryRun = this.deps.store.getRun(started.run.id);
@@ -1628,9 +1800,15 @@ export class RuntimeTextRunner {
         );
         const applicablePermissions = this.deps.store.listPermissionsByRun(started.run.id);
         const applicableToolCalls = this.deps.store.listToolCallsByRun(started.run.id);
-        overflowGate.permissionObserved ||= applicablePermissions.length > 0;
-        overflowGate.toolLifecycleObserved ||= applicableToolCalls.length > 0;
-        overflowGate.sideEffectObserved ||= hasDurableSideEffectFact(applicableToolCalls);
+        overflowGate.permissionObserved ||=
+          contextOverflowPermissionFactsHash(applicablePermissions)
+            !== overflowRequestBaseline.permissionFactsHash;
+        overflowGate.toolLifecycleObserved ||=
+          contextOverflowToolFactsHash(applicableToolCalls)
+            !== overflowRequestBaseline.toolFactsHash;
+        overflowGate.sideEffectObserved ||=
+          contextOverflowSideEffectFactsHash(applicableToolCalls)
+            !== overflowRequestBaseline.sideEffectFactsHash;
         if (abortSignal?.aborted || abortSignalLink.signal.aborted) {
           const message = abortReasonMessage(
             abortSignal?.reason ?? abortSignalLink.signal.reason,
@@ -1707,12 +1885,16 @@ export class RuntimeTextRunner {
           messages: prepared.messages,
           prompt: undefined,
           prepareStep: createManagedPrepareStep(
+            failedSemanticStepIndex,
             requestIndex,
             prepared.messages,
             prepared.instructions,
             true,
           ),
-          onStepEnd: createManagedOnStepEnd(requestIndex),
+          onStepEnd: createManagedOnStepEnd(
+            failedSemanticStepIndex,
+            requestIndex,
+          ),
         };
         coordinatorState = "attempt1";
         try {
@@ -1782,13 +1964,14 @@ export class RuntimeTextRunner {
         prepareStep: this.deps.contextManager
           ? createManagedPrepareStep(
               previousStepCount,
+              contextRequestIndexBase,
               messages,
               runtimeInstructions,
               initialPrepared !== undefined,
             )
           : undefined,
         onStepEnd: this.deps.contextManager
-          ? createManagedOnStepEnd(previousStepCount)
+          ? createManagedOnStepEnd(previousStepCount, contextRequestIndexBase)
           : undefined,
         messageMetadata: this.deps.contextManager
           ? () => projectSafeContextMetadata(
@@ -2163,6 +2346,12 @@ export class RuntimeTextRunner {
               });
               break;
             case "start-step":
+              if (
+                previousStepCount + streamedStepCount
+                  === overflowRequestBaseline.semanticStepIndex
+              ) {
+                activateContextOverflowRequest();
+              }
               semanticParts.push({
                 id: createId("part"),
                 conversationId: started.conversation.id,
@@ -2186,6 +2375,12 @@ export class RuntimeTextRunner {
           stepCount = 0,
         }) => {
           if (terminalWritten) {
+            return;
+          }
+          // AI SDK also emits the original error through fullStream. Keep that
+          // path authoritative so a safe overflow can replace this attempt and
+          // a final failure retains the exact Provider/SDK error object.
+          if (finishReason === "error") {
             return;
           }
 
@@ -2252,8 +2447,12 @@ export class RuntimeTextRunner {
             });
           }
         },
-        onError: async ({ error }) => {
-          if (!await retryContextOverflow(error)) writeFailure(error);
+        onError: ({ error }) => {
+          const recovery = retryContextOverflow(error).then((recovered) => {
+            if (!recovered) writeFailure(error);
+          });
+          pendingOverflowRecovery = recovery;
+          return recovery;
         },
         onAbort: ({ reason }) => {
           writeInterruption(mapStreamAbortReason(reason), reason ?? "stream aborted");
@@ -2342,6 +2541,15 @@ export class RuntimeTextRunner {
           if (sourcePart) {
             insertSourcePartAfterTool(event.toolCall.toolCallId, toolPart, sourcePart);
           }
+          if (isPartCoveredBySealedStep(semanticParts, toolPart.id)) {
+            persistSealedAssistantPrefix({
+              store: this.deps.store,
+              createId,
+              started,
+              parts: semanticParts,
+              completedAt,
+            });
+          }
         },
       };
       result = await this.streamTextImpl(bindStreamAttempt(streamInput, 0));
@@ -2355,58 +2563,103 @@ export class RuntimeTextRunner {
       }
       return {
         started,
-        response: withRuntimeHeaders(createUIMessageStreamResponse({
-          stream: createUIMessageStream({
-            execute: ({ writer }) => {
-              writer.write({
-                type: "start",
-                messageId: started.assistantMessage.id,
-                messageMetadata: projectSafeContextMetadata(
-                  latestContextUsage,
-                  latestContextMarker,
-                ),
-              });
-              writer.write({
-                type: "error",
-                errorText: modelErrorMessage(
-                  error,
-                  this.deps.getErrorMessageSecrets?.() ?? [],
-                ),
-              });
-            },
-            generateId: () => started.assistantMessage.id,
-            onError: (streamError) => modelErrorMessage(
-              streamError,
-              this.deps.getErrorMessageSecrets?.() ?? [],
-            ),
+        response: withRuntimeHeaders(withContextCompactionActivityUpdates(
+          createUIMessageStreamResponse({
+            stream: createUIMessageStream({
+              execute: ({ writer }) => {
+                writer.write({
+                  type: "start",
+                  messageId: started.assistantMessage.id,
+                  messageMetadata: projectSafeContextMetadata(
+                    latestContextUsage,
+                    latestContextMarker,
+                  ),
+                });
+                writer.write({
+                  type: "error",
+                  errorText: modelErrorMessage(
+                    error,
+                    this.deps.getErrorMessageSecrets?.() ?? [],
+                  ),
+                });
+              },
+              generateId: () => started.assistantMessage.id,
+              onError: (streamError) => modelErrorMessage(
+                streamError,
+                this.deps.getErrorMessageSecrets?.() ?? [],
+              ),
+            }),
           }),
-        }), started),
+          {
+            store: this.deps.store,
+            runId: started.run.id,
+            baseSemanticStepIndex: previousStepCount,
+          },
+        ), started),
       };
     }
 
     const responseResult = retryResult ?? result;
     committedAttempt = retryResult ? 1 : 0;
     if (!terminalWritten) coordinatorState = "committed";
+    const createUiResponseOptions = (
+      streamResult: RuntimeStreamTextResult,
+    ): RuntimeUIMessageStreamResponseOptions => ({
+      consumeSseStream: consumeStream,
+      generateMessageId: () => started.assistantMessage.id,
+      onError: (streamError) => {
+        // The production adapter exposes responseReady only when it also owns
+        // a full-stream consumer. That consumer is authoritative for Provider
+        // failures and overflow recovery; eagerly failing here would race it.
+        // Custom/UI-only adapters have no such consumer and retain this path as
+        // their durable failure fallback.
+        if (!isToolScopedStreamError(streamError)) {
+          if (streamResult === result && streamResult.responseReady) {
+            pendingPrimaryUiStreamError = streamError;
+          } else {
+            writeFailure(streamError);
+          }
+        }
+        return modelErrorMessage(
+          streamError,
+          this.deps.getErrorMessageSecrets?.() ?? [],
+        );
+      },
+      messageMetadata: () => projectSafeContextMetadata(
+        latestContextUsage,
+        latestContextMarker,
+      ),
+    });
+    const response = responseResult.toUIMessageStreamResponse(
+      createUiResponseOptions(responseResult),
+    );
+    const responseWithLateRecovery = responseResult === result
+      ? withLateContextOverflowReplacement(
+          response,
+          async () => {
+            await pendingOverflowRecovery;
+            const replacement = retryResult;
+            if (!replacement && pendingPrimaryUiStreamError && !terminalWritten) {
+              writeFailure(pendingPrimaryUiStreamError);
+            }
+            return replacement?.toUIMessageStreamResponse(
+              createUiResponseOptions(replacement),
+            ) ?? null;
+          },
+        )
+      : response;
+    const responseWithLiveCompactionActivities = withContextCompactionActivityUpdates(
+      responseWithLateRecovery,
+      {
+        store: this.deps.store,
+        runId: started.run.id,
+        baseSemanticStepIndex: previousStepCount,
+      },
+    );
     return {
       started,
       response: withRuntimeHeaders(
-        responseResult.toUIMessageStreamResponse({
-          consumeSseStream: consumeStream,
-          generateMessageId: () => started.assistantMessage.id,
-          onError: (streamError) => {
-            if (!isToolScopedStreamError(streamError)) {
-              writeFailure(streamError);
-            }
-            return modelErrorMessage(
-              streamError,
-              this.deps.getErrorMessageSecrets?.() ?? [],
-            );
-          },
-          messageMetadata: () => projectSafeContextMetadata(
-            latestContextUsage,
-            latestContextMarker,
-          ),
-        }),
+        responseWithLiveCompactionActivities,
         started,
       ),
     };
@@ -2741,6 +2994,56 @@ function persistContextUsageEstimate(input: {
   }
 }
 
+function persistSealedAssistantPrefix(input: {
+  store: RuntimeRunnerStore;
+  createId: <TPrefix extends RuntimeIdPrefix>(prefix: TPrefix) => RuntimeId<TPrefix>;
+  started: RuntimeRunStarted;
+  parts: readonly Part[];
+  completedAt: number;
+}): void {
+  const currentRun = input.store.getRun(input.started.run.id);
+  const currentMessage = input.store.getMessage(input.started.assistantMessage.id);
+  if (
+    !currentRun
+    || currentRun.status !== "running"
+    || !currentMessage
+    || currentMessage.role !== "assistant"
+  ) {
+    return;
+  }
+  const assistantMessage: AssistantMessage = {
+    ...currentMessage,
+    parts: structuredClone([...input.parts]),
+  };
+  const run: Run = {
+    ...currentRun,
+    output: {
+      messageId: assistantMessage.id,
+      partIds: assistantMessage.parts.map((part) => part.id),
+    },
+  };
+  input.store.saveMessage(assistantMessage);
+  input.store.saveRun(run);
+  input.store.appendEvent({
+    id: input.createId("evt"),
+    type: "message.updated",
+    properties: { info: assistantMessage },
+    time: input.completedAt,
+  });
+  input.store.appendEvent({
+    id: input.createId("evt"),
+    type: "run.updated",
+    properties: { info: run },
+    time: input.completedAt,
+  });
+}
+
+function isPartCoveredBySealedStep(parts: readonly Part[], partId: Part["id"]): boolean {
+  const partIndex = parts.findIndex((part) => part.id === partId);
+  return partIndex >= 0
+    && parts.slice(partIndex + 1).some((part) => part.type === "step-finish");
+}
+
 // A racing writer may allocate a different record ID/time, and a Provider
 // observation may land before the re-read. Every request-scoped estimate field
 // remains immutable and must agree exactly.
@@ -3003,6 +3306,7 @@ const defaultStreamText: RuntimeStreamText = async (input) => {
             await input.onStepEnd?.({
               stepNumber: event.stepNumber,
               usage: event.usage,
+              finishReason: event.finishReason,
             });
           } catch (error) {
             recordCallbackFailure(error);
@@ -3158,6 +3462,319 @@ function withRuntimeFactsBarrier(
   });
 }
 
+interface BufferedSseBlock {
+  block: string;
+  separator: string;
+}
+
+/**
+ * Keeps an already-published ToolLoop prefix while allowing a context-overflow
+ * replacement, which is created after the primary response has been returned,
+ * to continue the same UI message stream.
+ *
+ * The primary stream is forwarded without buffering until its top-level error
+ * block. The inner runtime-facts barrier keeps that terminal tail open until
+ * the full-stream callbacks (including overflow recovery) have settled. At
+ * that point we either release the original Provider error verbatim or replace
+ * only the failed request's terminal tail with the replacement stream.
+ */
+function withLateContextOverflowReplacement(
+  response: Response,
+  getReplacementResponse: () => Response | null | Promise<Response | null>,
+): Response {
+  if (!response.body) return response;
+
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  let openStep = false;
+  let holdingTerminalTail = false;
+  const heldBlocks: BufferedSseBlock[] = [];
+
+  const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      drainSseBlocks(buffer, (pending, remaining) => {
+        buffer = remaining;
+        const payload = readSseJsonPayload(pending.block);
+        if (holdingTerminalTail || payload?.type === "error") {
+          holdingTerminalTail = true;
+          heldBlocks.push(pending);
+          return;
+        }
+        updateOpenUiStep(payload, (next) => {
+          openStep = next;
+        }, openStep);
+        controller.enqueue(encoder.encode(pending.block + pending.separator));
+      });
+    },
+    async flush(controller) {
+      buffer += decoder.decode();
+      if (buffer.length > 0) {
+        const pending = { block: buffer, separator: "" };
+        const payload = readSseJsonPayload(pending.block);
+        if (holdingTerminalTail || payload?.type === "error") {
+          holdingTerminalTail = true;
+          heldBlocks.push(pending);
+        } else {
+          updateOpenUiStep(payload, (next) => {
+            openStep = next;
+          }, openStep);
+          controller.enqueue(encoder.encode(pending.block));
+        }
+      }
+
+      if (!holdingTerminalTail) return;
+      const replacement = await getReplacementResponse();
+      if (!replacement) {
+        for (const pending of heldBlocks) {
+          controller.enqueue(encoder.encode(pending.block + pending.separator));
+        }
+        return;
+      }
+
+      await pipeReplacementUiStream({
+        response: replacement,
+        controller,
+        encoder,
+        skipFirstStepStart: openStep,
+      });
+    },
+  }));
+
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+function withContextCompactionActivityUpdates(
+  response: Response,
+  input: {
+    store: Pick<RuntimeRunnerStore, "listContextCompactionActivitiesByRun">;
+    runId: Run["id"];
+    baseSemanticStepIndex: number;
+  },
+): Response {
+  if (!response.body) return response;
+
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const sentActivityFingerprints = new Map<string, string>();
+  let buffer = "";
+  let currentBoundaryStepIndex = input.baseSemanticStepIndex;
+  let hasStartedStep = false;
+
+  const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      drainSseBlocks(buffer, (pending, remaining) => {
+        buffer = remaining;
+        const payload = readSseJsonPayload(pending.block);
+        rememberIncomingCompactionActivity(payload, sentActivityFingerprints);
+
+        if (payload?.type === "start") {
+          controller.enqueue(encoder.encode(pending.block + pending.separator));
+          enqueueContextCompactionActivities({
+            ...input,
+            controller,
+            encoder,
+            sentActivityFingerprints,
+            throughBoundaryStepIndex: currentBoundaryStepIndex,
+          });
+          return;
+        }
+
+        if (payload?.type === "start-step") {
+          if (hasStartedStep) currentBoundaryStepIndex += 1;
+          hasStartedStep = true;
+        }
+
+        if (shouldRefreshContextCompactionActivities(payload, pending.block)) {
+          enqueueContextCompactionActivities({
+            ...input,
+            controller,
+            encoder,
+            sentActivityFingerprints,
+            throughBoundaryStepIndex:
+              payload?.type === "finish" || payload?.type === "error"
+                || isUiDoneSseBlock(pending.block)
+                ? Number.POSITIVE_INFINITY
+                : currentBoundaryStepIndex,
+          });
+        }
+        controller.enqueue(encoder.encode(pending.block + pending.separator));
+      });
+    },
+    flush(controller) {
+      buffer += decoder.decode();
+      if (buffer.length > 0) {
+        const payload = readSseJsonPayload(buffer);
+        rememberIncomingCompactionActivity(payload, sentActivityFingerprints);
+        enqueueContextCompactionActivities({
+          ...input,
+          controller,
+          encoder,
+          sentActivityFingerprints,
+          throughBoundaryStepIndex: Number.POSITIVE_INFINITY,
+        });
+        controller.enqueue(encoder.encode(buffer));
+      } else {
+        enqueueContextCompactionActivities({
+          ...input,
+          controller,
+          encoder,
+          sentActivityFingerprints,
+          throughBoundaryStepIndex: Number.POSITIVE_INFINITY,
+        });
+      }
+    },
+  }));
+
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+function enqueueContextCompactionActivities(input: {
+  store: Pick<RuntimeRunnerStore, "listContextCompactionActivitiesByRun">;
+  runId: Run["id"];
+  baseSemanticStepIndex: number;
+  throughBoundaryStepIndex: number;
+  controller: TransformStreamDefaultController<Uint8Array>;
+  encoder: TextEncoder;
+  sentActivityFingerprints: Map<string, string>;
+}): void {
+  const activities = input.store.listContextCompactionActivitiesByRun(input.runId)
+    .filter((activity) => {
+      const boundaryStepIndex = activity.boundaryStepIndex ?? activity.requestIndex;
+      return boundaryStepIndex >= input.baseSemanticStepIndex
+        && boundaryStepIndex <= input.throughBoundaryStepIndex;
+    })
+    .sort((left, right) =>
+      (left.boundaryStepIndex ?? left.requestIndex)
+        - (right.boundaryStepIndex ?? right.requestIndex)
+      || left.requestIndex - right.requestIndex
+      || left.attemptIndex - right.attemptIndex
+      || left.startedAt - right.startedAt
+      || left.id.localeCompare(right.id)
+    );
+
+  for (const activity of activities) {
+    const part = projectContextCompactionActivityToAiSdkDataPart(activity);
+    const fingerprint = stableStringifyJson(part.data);
+    if (input.sentActivityFingerprints.get(part.id) === fingerprint) continue;
+    input.sentActivityFingerprints.set(part.id, fingerprint);
+    input.controller.enqueue(input.encoder.encode(
+      `data: ${JSON.stringify(part)}\n\n`,
+    ));
+  }
+}
+
+function rememberIncomingCompactionActivity(
+  payload: Record<string, unknown> | null,
+  sentActivityFingerprints: Map<string, string>,
+): void {
+  if (
+    payload?.type !== "data-context-compaction"
+    || typeof payload.id !== "string"
+    || !isRecord(payload.data)
+  ) return;
+  sentActivityFingerprints.set(payload.id, stableStringifyJson(payload.data));
+}
+
+function shouldRefreshContextCompactionActivities(
+  payload: Record<string, unknown> | null,
+  block: string,
+): boolean {
+  if (isUiDoneSseBlock(block)) return true;
+  return payload?.type !== "text-delta"
+    && payload?.type !== "reasoning-delta"
+    && payload?.type !== "tool-input-delta";
+}
+
+function isUiDoneSseBlock(block: string): boolean {
+  return block.split(/\r?\n/).some((line) => line.trim() === "data: [DONE]");
+}
+
+function drainSseBlocks(
+  value: string,
+  consume: (block: BufferedSseBlock, remaining: string) => void,
+): void {
+  let remaining = value;
+  while (true) {
+    const separatorMatch = /\r?\n\r?\n/.exec(remaining);
+    if (!separatorMatch || separatorMatch.index === undefined) return;
+    const block = remaining.slice(0, separatorMatch.index);
+    const separator = separatorMatch[0];
+    remaining = remaining.slice(separatorMatch.index + separator.length);
+    consume({ block, separator }, remaining);
+  }
+}
+
+function updateOpenUiStep(
+  payload: Record<string, unknown> | null,
+  setOpenStep: (open: boolean) => void,
+  current: boolean,
+): void {
+  if (payload?.type === "start-step") {
+    setOpenStep(true);
+  } else if (payload?.type === "finish-step") {
+    setOpenStep(false);
+  } else {
+    setOpenStep(current);
+  }
+}
+
+async function pipeReplacementUiStream(input: {
+  response: Response;
+  controller: TransformStreamDefaultController<Uint8Array>;
+  encoder: TextEncoder;
+  skipFirstStepStart: boolean;
+}): Promise<void> {
+  if (!input.response.body) return;
+
+  const decoder = new TextDecoder();
+  const reader = input.response.body.getReader();
+  let buffer = "";
+  let skippedMessageStart = false;
+  let shouldSkipStepStart = input.skipFirstStepStart;
+
+  const forward = (pending: BufferedSseBlock): void => {
+    const payload = readSseJsonPayload(pending.block);
+    if (!skippedMessageStart && payload?.type === "start") {
+      skippedMessageStart = true;
+      return;
+    }
+    if (shouldSkipStepStart && payload?.type === "start-step") {
+      shouldSkipStepStart = false;
+      return;
+    }
+    input.controller.enqueue(input.encoder.encode(pending.block + pending.separator));
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      drainSseBlocks(buffer, (pending, remaining) => {
+        buffer = remaining;
+        forward(pending);
+      });
+    }
+    buffer += decoder.decode();
+    if (buffer.length > 0) {
+      forward({ block: buffer, separator: "" });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function isUiFinishSseBlock(block: string): boolean {
   return readSseJsonPayload(block)?.type === "finish";
 }
@@ -3209,7 +3826,7 @@ async function consumeRuntimeFullStream(
         continue;
       }
       if (part.type === "abort") {
-        await onAbort?.({ reason: "stream aborted" });
+        await onAbort?.({ reason: part.reason ?? "stream aborted" });
         onResponseReady?.();
         continue;
       }
@@ -3275,8 +3892,77 @@ function isPublishableRuntimeChunk(chunk: RuntimeTextChunk): boolean {
     && chunk.type !== "finish-step";
 }
 
-function hasDurableSideEffectFact(toolCalls: readonly ToolCall[]): boolean {
+function createContextOverflowRequestBaseline(input: {
+  requestIndex: number;
+  semanticStepIndex: number;
+  finalText: string;
+  semanticPartCount: number;
+  streamedStepCount: number;
+  toolCalls: readonly ToolCall[];
+  permissions: readonly Permission[];
+}): ContextOverflowRequestBaseline {
+  return {
+    requestIndex: input.requestIndex,
+    semanticStepIndex: input.semanticStepIndex,
+    finalText: input.finalText,
+    semanticPartCount: input.semanticPartCount,
+    streamedStepCount: input.streamedStepCount,
+    openToolLifecycle: hasOpenToolLifecycle(input.toolCalls),
+    pendingPermission: input.permissions.some((permission) =>
+      permission.status === "pending"
+    ),
+    toolFactsHash: contextOverflowToolFactsHash(input.toolCalls),
+    permissionFactsHash: contextOverflowPermissionFactsHash(input.permissions),
+    sideEffectFactsHash: contextOverflowSideEffectFactsHash(input.toolCalls),
+  };
+}
+
+function nextContextRequestIndex(
+  store: Pick<RuntimeRunnerStore, "listContextPlansByRun" | "listContextUsagesByRun">,
+  runId: Run["id"],
+  semanticStepCount: number,
+): number {
+  let nextRequestIndex = semanticStepCount;
+  for (const plan of store.listContextPlansByRun(runId)) {
+    nextRequestIndex = Math.max(nextRequestIndex, plan.requestIndex + 1);
+  }
+  for (const usage of store.listContextUsagesByRun(runId)) {
+    nextRequestIndex = Math.max(nextRequestIndex, usage.requestIndex + 1);
+  }
+  return nextRequestIndex;
+}
+
+function contextOverflowToolFactsHash(toolCalls: readonly ToolCall[]): string {
+  return stableStringifyJson([...toolCalls].sort(compareRuntimeFactIds));
+}
+
+function contextOverflowPermissionFactsHash(permissions: readonly Permission[]): string {
+  return stableStringifyJson([...permissions].sort(compareRuntimeFactIds));
+}
+
+function contextOverflowSideEffectFactsHash(toolCalls: readonly ToolCall[]): string {
+  return stableStringifyJson(
+    [...toolCalls].filter(isDurableSideEffectFact).sort(compareRuntimeFactIds),
+  );
+}
+
+function compareRuntimeFactIds(
+  left: { id: string },
+  right: { id: string },
+): number {
+  return left.id.localeCompare(right.id);
+}
+
+function hasOpenToolLifecycle(toolCalls: readonly ToolCall[]): boolean {
   return toolCalls.some((toolCall) =>
+    toolCall.state !== "completed"
+    && toolCall.state !== "error"
+    && toolCall.state !== "interrupted"
+  );
+}
+
+function isDurableSideEffectFact(toolCall: ToolCall): boolean {
+  return (
     toolCall.time.started !== undefined
     || toolCall.state === "running"
     || toolCall.state === "completed"
