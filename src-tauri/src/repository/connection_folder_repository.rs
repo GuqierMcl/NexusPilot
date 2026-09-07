@@ -59,14 +59,22 @@ pub struct ConnectionFolderRepository;
 
 impl ConnectionFolderRepository {
     pub async fn list(pool: &SqlitePool) -> AppResult<Vec<StoredConnectionFolder>> {
+        // Older Cloud downloads/defaults wrote epoch milliseconds into these INTEGER-affinity
+        // columns; local folder commands write ISO text. Keep the public string contract for both.
         let rows = sqlx::query_as::<_, ConnectionFolderRow>(
             r#"
             SELECT
                 id,
                 name,
                 parent_id,
-                created_at,
-                updated_at,
+                CASE typeof(created_at)
+                    WHEN 'integer' THEN strftime('%Y-%m-%dT%H:%M:%fZ', created_at / 1000.0, 'unixepoch')
+                    ELSE created_at
+                END AS created_at,
+                CASE typeof(updated_at)
+                    WHEN 'integer' THEN strftime('%Y-%m-%dT%H:%M:%fZ', updated_at / 1000.0, 'unixepoch')
+                    ELSE updated_at
+                END AS updated_at,
                 sort_order
             FROM connection_folders
             ORDER BY
@@ -90,8 +98,14 @@ impl ConnectionFolderRepository {
                 id,
                 name,
                 parent_id,
-                created_at,
-                updated_at,
+                CASE typeof(created_at)
+                    WHEN 'integer' THEN strftime('%Y-%m-%dT%H:%M:%fZ', created_at / 1000.0, 'unixepoch')
+                    ELSE created_at
+                END AS created_at,
+                CASE typeof(updated_at)
+                    WHEN 'integer' THEN strftime('%Y-%m-%dT%H:%M:%fZ', updated_at / 1000.0, 'unixepoch')
+                    ELSE updated_at
+                END AS updated_at,
                 sort_order
             FROM connection_folders
             WHERE id = ?1
@@ -326,4 +340,61 @@ async fn ensure_no_parent_cycle(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn reads_mixed_legacy_milliseconds_and_iso_folder_timestamps() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().in_memory(true))
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO connection_folders (id, name, created_at, updated_at) VALUES ('legacy', 'Downloaded', 0, 1234), ('mixed', 'Edited download', 1234, '2026-09-07T08:37:43.456Z'), ('local', 'Local', '2026-09-07T08:37:00.123Z', '2026-09-07T08:37:43.456Z')")
+            .execute(&pool).await.unwrap();
+        let all = ConnectionFolderRepository::list(&pool).await.unwrap();
+        assert_eq!(all.len(), 3);
+        for (id, expected_created, expected_updated) in [
+            (
+                "legacy",
+                "1970-01-01T00:00:00.000Z",
+                "1970-01-01T00:00:01.234Z",
+            ),
+            (
+                "mixed",
+                "1970-01-01T00:00:01.234Z",
+                "2026-09-07T08:37:43.456Z",
+            ),
+            (
+                "local",
+                "2026-09-07T08:37:00.123Z",
+                "2026-09-07T08:37:43.456Z",
+            ),
+        ] {
+            let folder = ConnectionFolderRepository::get(&pool, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(folder.created_at, expected_created);
+            assert_eq!(folder.updated_at, expected_updated);
+            let listed = all.iter().find(|folder| folder.id == id).unwrap();
+            assert_eq!(listed.created_at, expected_created);
+            assert_eq!(listed.updated_at, expected_updated);
+        }
+        // Reading compatibility must not rewrite stored data.
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT typeof(created_at) FROM connection_folders WHERE id = 'legacy'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "integer"
+        );
+    }
 }

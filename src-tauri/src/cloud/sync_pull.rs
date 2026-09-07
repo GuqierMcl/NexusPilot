@@ -103,7 +103,7 @@ pub(crate) fn validate_and_decrypt_page(
     })
 }
 
-fn validate_and_decrypt_change(
+pub(crate) fn validate_and_decrypt_change(
     account_id: &str,
     change: CloudConnectionAssetChange,
     keys: &CommittedSyncKeyBundle,

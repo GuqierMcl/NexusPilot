@@ -113,8 +113,7 @@ pub(crate) async fn apply_validated_page(
         ));
     }
 
-    let mut changes = deduplicate_current_assets(page.items)?;
-    changes.sort_by_key(apply_order);
+    let changes = order_changes(deduplicate_current_assets(page.items)?)?;
     let mut summary = SyncApplySummary {
         next_cursor: page.next_cursor,
         ..SyncApplySummary::default()
@@ -150,6 +149,39 @@ fn apply_order(change: &ValidatedSyncChange) -> u8 {
         (true, "connection_folder") => 3,
         _ => 4,
     }
+}
+
+fn order_changes(changes: Vec<ValidatedSyncChange>) -> AppResult<Vec<ValidatedSyncChange>> {
+    let (mut folders, mut other): (Vec<_>, Vec<_>) = changes
+        .into_iter()
+        .partition(|change| apply_order(change) == 0);
+    let mut ordered = Vec::new();
+    while !folders.is_empty() {
+        let pending_ids: HashSet<_> = folders
+            .iter()
+            .map(|change| change.asset.id.clone())
+            .collect();
+        let (ready, pending): (Vec<_>, Vec<_>) =
+            folders
+                .into_iter()
+                .partition(|change| match &change.projection {
+                    Some(DecryptedSyncProjection::ConnectionFolder(folder)) => folder
+                        .parent_id
+                        .as_ref()
+                        .is_none_or(|parent| !pending_ids.contains(parent)),
+                    _ => true,
+                });
+        if ready.is_empty() {
+            return Err(AppError::validation(
+                "Cloud sync folders contain a parent cycle",
+            ));
+        }
+        ordered.extend(ready);
+        folders = pending;
+    }
+    other.sort_by_key(apply_order);
+    ordered.extend(other);
+    Ok(ordered)
 }
 
 async fn apply_change(
@@ -720,12 +752,12 @@ async fn upsert_folder(
     sqlx::query(
         r#"
         INSERT INTO connection_folders (id, name, parent_id, created_at, updated_at, sort_order)
-        VALUES (?1, ?2, ?3, strftime('%s','now') * 1000, strftime('%s','now') * 1000, ?4)
+        VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4)
         ON CONFLICT (id) DO UPDATE SET
             name = excluded.name,
             parent_id = excluded.parent_id,
             sort_order = excluded.sort_order,
-            updated_at = strftime('%s','now') * 1000
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         "#,
     )
     .bind(&projection.id)
@@ -1149,6 +1181,136 @@ mod tests {
             projection: None,
             payload_hash: None,
         }
+    }
+
+    fn folder_change(id: &str, parent_id: Option<&str>, cursor: &str) -> ValidatedSyncChange {
+        let projection = ConnectionFolderSyncProjection {
+            schema_version: 1,
+            asset_type: CloudSyncAssetType::ConnectionFolder,
+            id: id.to_string(),
+            name: "Folder".to_string(),
+            parent_id: parent_id.map(str::to_string),
+            sort_order: None,
+        };
+        let plaintext = serde_json::to_vec(&projection).unwrap();
+        ValidatedSyncChange {
+            change_cursor: cursor.parse().unwrap(),
+            asset: asset("connection_folder", id, "1", cursor, false),
+            projection: Some(DecryptedSyncProjection::ConnectionFolder(projection)),
+            payload_hash: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(plaintext))),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_pull_applies_parent_before_child_even_when_cloud_order_is_reversed() {
+        let pool = pool().await;
+        let parent_id = "0198f5dc-0000-7000-8000-000000000020";
+        let child_id = "0198f5dc-0000-7000-8000-000000000021";
+        let connection_id = "0198f5dc-0000-7000-8000-000000000022";
+        let mut connection = connection_change(connection_id, "1", "Nested connection");
+        if let Some(DecryptedSyncProjection::Connection(ref mut projection)) = connection.projection
+        {
+            projection.folder_id = Some(child_id.to_string());
+        }
+        let summary = apply_validated_page(
+            &pool,
+            "account-1",
+            page(
+                vec![
+                    connection,
+                    folder_change(child_id, Some(parent_id), "2"),
+                    folder_change(parent_id, None, "3"),
+                ],
+                3,
+            ),
+            &keys(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.applied, 3);
+        let folders =
+            crate::repository::connection_folder_repository::ConnectionFolderRepository::list(
+                &pool,
+            )
+            .await
+            .unwrap();
+        assert_eq!(folders.len(), 2);
+        assert!(folders
+            .iter()
+            .all(|folder| folder.created_at.ends_with('Z') && folder.updated_at.ends_with('Z')));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT typeof(created_at) FROM connection_folders WHERE id = ?1"
+            )
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "text"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT parent_id FROM connection_folders WHERE id = ?1"
+            )
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            parent_id
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT folder_id FROM connections WHERE id = ?1")
+                .bind(connection_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            child_id
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT cursor FROM cloud_sync_cursors WHERE cloud_account_id = 'account-1'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn cyclic_remote_folders_leave_data_and_cursor_unchanged() {
+        let pool = pool().await;
+        let first = "0198f5dc-0000-7000-8000-000000000020";
+        let second = "0198f5dc-0000-7000-8000-000000000021";
+        let error = apply_validated_page(
+            &pool,
+            "account-1",
+            page(
+                vec![
+                    folder_change(first, Some(second), "1"),
+                    folder_change(second, Some(first), "2"),
+                ],
+                2,
+            ),
+            &keys(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Validation(_)));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM connection_folders")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cloud_sync_cursors")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     fn page(items: Vec<ValidatedSyncChange>, next: u64) -> ValidatedSyncPage {

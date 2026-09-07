@@ -1,8 +1,11 @@
+use crate::cloud::sync_upload::{prepare_connection_delete, prepare_connection_upload};
+use crate::repository::cloud_sync_repository::CloudSyncAssetType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::str::FromStr;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::cloud::sync_apply::merge_local_paths;
 use crate::cloud::sync_crypto::{decrypt_connection_asset, CONNECTION_ASSET_SUITE};
@@ -11,7 +14,7 @@ use crate::cloud::sync_projection::{collect_local_dependencies, LocalDependencyK
 use crate::cloud::sync_projection::{ConnectionFolderSyncProjection, ConnectionSyncProjection};
 use crate::error::{AppError, AppResult};
 use crate::repository::cloud_sync_repository::{
-    CloudSyncAssetStatus, CloudSyncOperationAction, CloudSyncRepository, EnqueueCloudSyncOperation,
+    CloudSyncAssetStatus, CloudSyncRepository, EnqueueCloudSyncOperation,
 };
 use crate::repository::connection_folder_repository::{
     ConnectionFolderRepository, CreateConnectionFolderInput,
@@ -121,16 +124,16 @@ pub async fn resolve_conflict(
     match decision {
         CloudSyncConflictDecision::KeepCloud => {
             apply_candidate(pool, cloud_account_id, &row, false, keys).await?;
-            mark_resolved(pool, cloud_account_id, &row.asset_id, conflict_id).await?;
+            mark_resolved(pool, cloud_account_id, &row).await?;
         }
         CloudSyncConflictDecision::KeepLocal => {
-            enqueue_local_candidate(pool, cloud_account_id, &row).await?;
+            enqueue_local_candidate(pool, cloud_account_id, &row, keys).await?;
             mark_conflict_resolved(pool, cloud_account_id, conflict_id).await?;
         }
         CloudSyncConflictDecision::KeepBoth => {
-            apply_candidate(pool, cloud_account_id, &row, false, keys).await?;
             duplicate_local_candidate(pool, cloud_account_id, &row, keys).await?;
-            mark_resolved(pool, cloud_account_id, &row.asset_id, conflict_id).await?;
+            apply_candidate(pool, cloud_account_id, &row, false, keys).await?;
+            mark_resolved(pool, cloud_account_id, &row).await?;
         }
     }
     list_conflicts(pool, cloud_account_id, keys).await
@@ -207,15 +210,46 @@ fn decrypt_name(
         .map(ToOwned::to_owned)
 }
 
-async fn mark_resolved(
-    pool: &SqlitePool,
-    account: &str,
-    asset_id: &str,
-    conflict_id: &str,
-) -> AppResult<()> {
-    mark_conflict_resolved(pool, account, conflict_id).await?;
-    sqlx::query("UPDATE cloud_sync_assets SET sync_status = 'synced', pending_operation_id = NULL, updated_at = strftime('%s','now') * 1000 WHERE cloud_account_id = ?1 AND asset_id = ?2")
-        .bind(account).bind(asset_id).execute(pool).await?;
+async fn mark_resolved(pool: &SqlitePool, account: &str, row: &ConflictRow) -> AppResult<()> {
+    let (status, hash) = if row.remote_tombstone != 0 {
+        ("remote_deleted", None)
+    } else if row.asset_type == "connection" {
+        let record = ConnectionRepository::get(pool, &row.asset_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("Resolved connection missing"))?;
+        let missing_path = collect_local_dependencies(&record.driver, &record.payload)
+            .iter()
+            .any(|kind| {
+                dependency_path(&record.payload, kind).is_none_or(|path| path.trim().is_empty())
+            });
+        (
+            if missing_path {
+                "needs_local_file"
+            } else {
+                "synced"
+            },
+            Some(
+                crate::cloud::sync_projection::connection_projection(&record)?
+                    .1
+                    .as_base64url(),
+            ),
+        )
+    } else {
+        let record = ConnectionFolderRepository::get(pool, &row.asset_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("Resolved folder missing"))?;
+        (
+            "synced",
+            Some(
+                crate::cloud::sync_projection::folder_projection(&record)?
+                    .1
+                    .as_base64url(),
+            ),
+        )
+    };
+    sqlx::query("UPDATE cloud_sync_assets SET sync_status = ?3, remote_revision = ?4, base_revision = ?4, local_payload_hash = ?5, tombstone = ?6, pending_operation_id = NULL, last_error_code = NULL, last_error_at = NULL, updated_at = strftime('%s','now') * 1000 WHERE cloud_account_id = ?1 AND asset_id = ?2")
+        .bind(account).bind(&row.asset_id).bind(status).bind(row.remote_revision).bind(hash).bind(row.remote_tombstone).execute(pool).await?;
+    mark_conflict_resolved(pool, account, &row.id).await?;
     Ok(())
 }
 
@@ -224,6 +258,9 @@ async fn mark_conflict_resolved(
     account: &str,
     conflict_id: &str,
 ) -> AppResult<()> {
+    // Old conflicted writes must not be reconsidered by the next pull after a decision.
+    sqlx::query("UPDATE cloud_sync_operations SET status = 'rejected', last_error_code = 'conflict_resolved' WHERE cloud_account_id = ?1 AND status = 'conflicted' AND asset_id = (SELECT asset_id FROM cloud_sync_conflicts WHERE cloud_account_id = ?1 AND id = ?2)")
+        .bind(account).bind(conflict_id).execute(pool).await?;
     sqlx::query("UPDATE cloud_sync_conflicts SET status = 'resolved', updated_at = strftime('%s','now') * 1000 WHERE cloud_account_id = ?1 AND id = ?2")
         .bind(account).bind(conflict_id).execute(pool).await?;
     Ok(())
@@ -233,43 +270,159 @@ async fn enqueue_local_candidate(
     pool: &SqlitePool,
     account: &str,
     row: &ConflictRow,
+    keys: &CommittedSyncKeyBundle,
 ) -> AppResult<()> {
-    let operation_id = Uuid::new_v4().to_string();
-    CloudSyncRepository::enqueue_operation(
-        pool,
-        EnqueueCloudSyncOperation {
-            operation_id: operation_id.clone(),
-            cloud_account_id: account.to_string(),
-            asset_id: row.asset_id.clone(),
-            asset_type: if row.asset_type == "connection" {
-                crate::repository::cloud_sync_repository::CloudSyncAssetType::Connection
-            } else {
-                crate::repository::cloud_sync_repository::CloudSyncAssetType::ConnectionFolder
-            },
-            action: if row.local_action == "delete" {
-                CloudSyncOperationAction::Delete
-            } else {
-                CloudSyncOperationAction::Put
-            },
-            expected_revision: u64::try_from(row.remote_revision).ok(),
-            schema_version: row.local_schema_version.and_then(|v| u16::try_from(v).ok()),
-            key_generation: row.local_key_generation.and_then(|v| u64::try_from(v).ok()),
-            nonce: if row.local_nonce.is_empty() {
-                None
-            } else {
-                Some(row.local_nonce.clone())
-            },
-            ciphertext: if row.local_ciphertext.is_empty() {
-                None
-            } else {
-                Some(row.local_ciphertext.clone())
-            },
-            payload_hash: Some(row.local_payload_hash.clone()),
-        },
-    )
-    .await?;
+    let operation = prepare_local_candidate(account, row, row.remote_revision, keys)?;
+    let operation_id = operation.operation_id.clone();
+    CloudSyncRepository::enqueue_operation(pool, operation).await?;
     sqlx::query("UPDATE cloud_sync_assets SET sync_status = 'pending_upload', pending_operation_id = ?3, updated_at = strftime('%s','now') * 1000 WHERE cloud_account_id = ?1 AND asset_id = ?2").bind(account).bind(&row.asset_id).bind(operation_id).execute(pool).await?;
     Ok(())
+}
+
+fn prepare_local_candidate(
+    account: &str,
+    row: &ConflictRow,
+    expected_revision: i64,
+    keys: &CommittedSyncKeyBundle,
+) -> AppResult<EnqueueCloudSyncOperation> {
+    if keys.cloud_account_id != account {
+        return Err(AppError::validation("Conflict account mismatch"));
+    }
+    let asset_type = match row.asset_type.as_str() {
+        "connection" => CloudSyncAssetType::Connection,
+        "connection_folder" => CloudSyncAssetType::ConnectionFolder,
+        _ => return Err(AppError::validation("Invalid conflict asset type")),
+    };
+    let expected = u64::try_from(expected_revision)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AppError::validation("Invalid conflict remote revision"))?;
+    if row.local_action == "delete" {
+        return prepare_connection_delete(account, &row.asset_id, asset_type, expected)
+            .map_err(|_| AppError::validation("Failed to prepare conflict deletion"));
+    }
+    if row.local_action != "put" {
+        return Err(AppError::validation("Invalid conflict action"));
+    }
+    let revision = row
+        .local_revision
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or_else(|| AppError::validation("Invalid local candidate revision"))?;
+    let schema = row
+        .local_schema_version
+        .and_then(|v| u16::try_from(v).ok())
+        .ok_or_else(|| AppError::validation("Invalid local candidate schema"))?;
+    let generation = row
+        .local_key_generation
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or_else(|| AppError::validation("Invalid local candidate generation"))?;
+    if generation != u64::from(keys.key_generation) {
+        return Err(AppError::validation("Conflict key generation mismatch"));
+    }
+    let encryption = crate::cloud::types::CloudConnectionAssetEncryption {
+        suite: CONNECTION_ASSET_SUITE.into(),
+        nonce: row.local_nonce.clone(),
+        ciphertext: row.local_ciphertext.clone(),
+    };
+    let plaintext = Zeroizing::new(
+        decrypt_connection_asset(
+            account,
+            &row.asset_id,
+            &row.asset_type,
+            revision,
+            schema,
+            generation,
+            &encryption,
+            &keys.amk,
+        )
+        .map_err(|_| AppError::validation("Cannot decrypt local conflict candidate"))?,
+    );
+    // Revision is authenticated AAD: changing the CAS base requires fresh encryption.
+    prepare_connection_upload(
+        account,
+        &row.asset_id,
+        asset_type,
+        Some(expected),
+        schema,
+        generation,
+        &plaintext,
+        &keys.amk,
+    )
+    .map(|prepared| prepared.operation)
+    .map_err(|_| AppError::validation("Failed to reencrypt local conflict candidate"))
+}
+
+/// Repair only the exact legacy KeepLocal ciphertext this device demonstrably uploaded.
+/// A remote-only device cannot infer the original authenticated revision and must fail closed.
+pub(crate) async fn prepare_legacy_conflict_repair(
+    pool: &SqlitePool,
+    account: &str,
+    asset: &crate::cloud::types::CloudConnectionAssetProjection,
+    keys: &CommittedSyncKeyBundle,
+) -> AppResult<Option<EnqueueCloudSyncOperation>> {
+    if asset.tombstone
+        || asset.updated_by_device_id != keys.device_id
+        || account != keys.cloud_account_id
+    {
+        return Ok(None);
+    }
+    let Some(encryption) = asset.encryption.as_ref() else {
+        return Ok(None);
+    };
+    if encryption.suite != CONNECTION_ASSET_SUITE {
+        return Ok(None);
+    }
+    let revision = asset
+        .revision
+        .parse::<i64>()
+        .ok()
+        .filter(|v| *v > 1)
+        .ok_or_else(|| AppError::validation("Invalid legacy repair revision"))?;
+    let parent = asset
+        .parent_revision
+        .as_deref()
+        .and_then(|v| v.parse::<i64>().ok());
+    if parent != Some(revision - 1) {
+        return Ok(None);
+    }
+    let row = sqlx::query_as::<_, ConflictRow>(
+        "SELECT c.id, c.asset_id, c.asset_type, c.remote_revision, c.local_ciphertext, c.remote_ciphertext, c.local_nonce, c.remote_nonce, c.local_payload_hash, c.remote_payload_hash, c.local_action, c.local_revision, c.local_schema_version, c.local_key_generation, c.remote_schema_version, c.remote_key_generation, c.remote_tombstone, c.detected_at FROM cloud_sync_conflicts c WHERE c.cloud_account_id = ?1 AND c.asset_id = ?2 AND c.asset_type = ?3 AND c.status = 'resolved' AND c.local_action = 'put' AND c.local_ciphertext = ?4 AND c.local_nonce = ?5 AND c.remote_revision = ?6 AND c.local_revision != ?7 AND c.local_schema_version = ?8 AND c.local_key_generation = ?9 AND EXISTS (SELECT 1 FROM cloud_sync_operations o WHERE o.cloud_account_id = c.cloud_account_id AND o.asset_id = c.asset_id AND o.asset_type = c.asset_type AND o.action = 'put' AND o.status IN ('applied', 'unknown') AND o.expected_revision = c.remote_revision AND o.nonce = c.local_nonce AND o.ciphertext = c.local_ciphertext AND o.payload_hash = c.local_payload_hash AND o.schema_version = c.local_schema_version AND o.key_generation = c.local_key_generation) LIMIT 1"
+    ).bind(account).bind(&asset.id).bind(&asset.asset_type).bind(&encryption.ciphertext).bind(&encryption.nonce)
+        .bind(revision - 1).bind(revision).bind(i64::from(asset.schema_version)).bind(i64::try_from(asset.key_generation).unwrap_or(-1))
+        .fetch_optional(pool).await?;
+    let Some(row) = row else { return Ok(None) };
+    // This decrypts using the recorded original AAD, then authenticates the new revision.
+    let mut prepared = prepare_local_candidate(account, &row, revision, keys)?;
+    if prepared.payload_hash.as_deref() != Some(row.local_payload_hash.as_str()) {
+        return Err(AppError::validation(
+            "Legacy conflict candidate hash mismatch",
+        ));
+    }
+    // Reuse a previously staged repair verbatim after a transport failure/restart.
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(serde_json::to_vec(&(
+        "legacy-keep-local-repair-v1",
+        account,
+        &asset.id,
+        revision,
+        &row.id,
+    ))?);
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    prepared.operation_id = Uuid::from_bytes(bytes).to_string();
+    if let Some(existing) = CloudSyncRepository::get_operation(pool, &prepared.operation_id).await?
+    {
+        if existing.expected_revision != Some(revision as u64)
+            || existing.payload_hash != prepared.payload_hash
+            || existing.cloud_account_id != account
+            || existing.asset_id != asset.id
+        {
+            return Err(AppError::validation("Legacy repair operation mismatch"));
+        }
+        prepared.nonce = existing.nonce;
+        prepared.ciphertext = existing.ciphertext;
+    }
+    Ok(Some(prepared))
 }
 
 async fn apply_candidate(
@@ -447,9 +600,11 @@ async fn duplicate_local_candidate(
     let projection: ConnectionSyncProjection = serde_json::from_slice(&bytes)?;
     let new_id = Uuid::new_v4().to_string();
     let current = ConnectionRepository::get(pool, &old_id).await?;
-    let payload = current
-        .map(|record| record.payload)
-        .unwrap_or(projection.payload);
+    let payload = merge_local_paths(
+        &projection.payload,
+        current.as_ref().map(|record| &record.payload),
+        &projection.local_dependencies,
+    );
     ConnectionRepository::create(
         pool,
         CreateConnectionInput {
@@ -642,4 +797,297 @@ fn set_dependency_path(
             Value::String(local_path.to_string()),
         );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud::sync_crypto::encrypt_connection_asset;
+    use crate::cloud::sync_projection::{connection_projection, SYNC_SCHEMA_VERSION};
+    use serde_json::json;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    const ASSET: &str = "0198f5dc-0000-7000-8000-000000000003";
+    fn keys() -> CommittedSyncKeyBundle {
+        CommittedSyncKeyBundle {
+            cloud_account_id: "account-1".into(),
+            device_id: "0198f5dc-0000-7000-8000-000000000002".into(),
+            key_generation: 1,
+            amk: [7; 32],
+            encryption_private_key: [2; 32],
+            signing_private_key: [3; 32],
+        }
+    }
+
+    async fn fixture() -> (SqlitePool, Vec<u8>) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().in_memory(true))
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO connections (id,name,driver,payload) VALUES (?1,'Local','postgres','{\"host\":\"local.example\"}')").bind(ASSET).execute(&pool).await.unwrap();
+        let local = ConnectionRepository::get(&pool, ASSET)
+            .await
+            .unwrap()
+            .unwrap();
+        let (local_bytes, local_hash) = connection_projection(&local).unwrap();
+        let mut remote = local.clone();
+        remote.name = "Cloud".into();
+        remote.payload = json!({"host":"cloud.example"});
+        let (remote_bytes, remote_hash) = connection_projection(&remote).unwrap();
+        let local_enc = encrypt_connection_asset(
+            "account-1",
+            ASSET,
+            "connection",
+            2,
+            1,
+            1,
+            &local_bytes,
+            &keys().amk,
+        )
+        .unwrap();
+        let remote_enc = encrypt_connection_asset(
+            "account-1",
+            ASSET,
+            "connection",
+            3,
+            1,
+            1,
+            &remote_bytes,
+            &keys().amk,
+        )
+        .unwrap();
+        sqlx::query("INSERT INTO cloud_sync_assets (cloud_account_id,asset_id,asset_type,local_entity_id,remote_revision,base_revision,sync_status,local_payload_hash) VALUES ('account-1',?1,'connection',?1,3,1,'conflicted',?2)")
+            .bind(ASSET).bind(local_hash.as_base64url()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO cloud_sync_conflicts (id,cloud_account_id,asset_id,asset_type,remote_revision,local_ciphertext,remote_ciphertext,local_nonce,remote_nonce,local_payload_hash,remote_payload_hash,local_revision,local_schema_version,local_key_generation) VALUES ('conflict-1','account-1',?1,'connection',3,?2,?3,?4,?5,?6,?7,2,1,1)")
+            .bind(ASSET).bind(local_enc.ciphertext).bind(remote_enc.ciphertext).bind(local_enc.nonce).bind(remote_enc.nonce)
+            .bind(local_hash.as_base64url()).bind(remote_hash.as_base64url()).execute(&pool).await.unwrap();
+        (pool, local_bytes)
+    }
+
+    #[tokio::test]
+    async fn keep_local_reencrypts_for_the_new_cloud_revision() {
+        let (pool, original) = fixture().await;
+        resolve_conflict(
+            &pool,
+            "account-1",
+            "conflict-1",
+            CloudSyncConflictDecision::KeepLocal,
+            &keys(),
+        )
+        .await
+        .unwrap();
+        let operations = CloudSyncRepository::list_pending_operations(&pool, "account-1")
+            .await
+            .unwrap();
+        assert_eq!(operations.len(), 1);
+        let op = &operations[0];
+        assert_eq!(op.expected_revision, Some(3));
+        let plaintext = decrypt_connection_asset(
+            "account-1",
+            ASSET,
+            "connection",
+            4,
+            SYNC_SCHEMA_VERSION as u16,
+            1,
+            &crate::cloud::types::CloudConnectionAssetEncryption {
+                suite: CONNECTION_ASSET_SUITE.into(),
+                nonce: op.nonce.clone().unwrap(),
+                ciphertext: op.ciphertext.clone().unwrap(),
+            },
+            &keys().amk,
+        )
+        .unwrap();
+        assert_eq!(plaintext, original);
+    }
+
+    #[tokio::test]
+    async fn repairs_only_exact_legacy_uploads_and_reuses_staged_ciphertext() {
+        use crate::cloud::types::{CloudConnectionAssetEncryption, CloudConnectionAssetProjection};
+        let (pool, original) = fixture().await;
+        let (nonce, ciphertext, hash): (String, String, String) = sqlx::query_as(
+            "SELECT local_nonce,local_ciphertext,local_payload_hash FROM cloud_sync_conflicts WHERE id='conflict-1'"
+        ).fetch_one(&pool).await.unwrap();
+        let mut asset = CloudConnectionAssetProjection {
+            id: ASSET.into(),
+            asset_type: "connection".into(),
+            revision: "4".into(),
+            parent_revision: Some("3".into()),
+            change_cursor: "34".into(),
+            schema_version: 1,
+            key_generation: 1,
+            encryption: Some(CloudConnectionAssetEncryption {
+                suite: CONNECTION_ASSET_SUITE.into(),
+                nonce: nonce.clone(),
+                ciphertext: ciphertext.clone(),
+            }),
+            encrypted_bytes: 0,
+            tombstone: false,
+            updated_by_device_id: keys().device_id.clone(),
+            created_at: "2026-09-07T00:00:00.000Z".into(),
+            updated_at: "2026-09-07T00:00:00.000Z".into(),
+            deleted_at: None,
+        };
+        assert!(
+            prepare_legacy_conflict_repair(&pool, "account-1", &asset, &keys())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE cloud_sync_conflicts SET status='resolved' WHERE id='conflict-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            prepare_legacy_conflict_repair(&pool, "account-1", &asset, &keys())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Reproduce the old writer: ciphertext authenticated revision 2, CAS requests revision 4.
+        sqlx::query("INSERT INTO cloud_sync_operations (operation_id,cloud_account_id,asset_id,asset_type,action,expected_revision,schema_version,key_generation,nonce,ciphertext,payload_hash,status) VALUES ('legacy-upload','account-1',?1,'connection','put',3,1,1,?2,?3,?4,'applied')")
+            .bind(ASSET).bind(&nonce).bind(&ciphertext).bind(&hash).execute(&pool).await.unwrap();
+        assert!(decrypt_connection_asset(
+            "account-1",
+            ASSET,
+            "connection",
+            4,
+            1,
+            1,
+            asset.encryption.as_ref().unwrap(),
+            &keys().amk
+        )
+        .is_err());
+        let repair = prepare_legacy_conflict_repair(&pool, "account-1", &asset, &keys())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repair.expected_revision, Some(4));
+        let encryption = CloudConnectionAssetEncryption {
+            suite: CONNECTION_ASSET_SUITE.into(),
+            nonce: repair.nonce.clone().unwrap(),
+            ciphertext: repair.ciphertext.clone().unwrap(),
+        };
+        assert_eq!(
+            decrypt_connection_asset(
+                "account-1",
+                ASSET,
+                "connection",
+                5,
+                1,
+                1,
+                &encryption,
+                &keys().amk
+            )
+            .unwrap(),
+            original
+        );
+        let operation_id = repair.operation_id.clone();
+        CloudSyncRepository::enqueue_operation(&pool, repair)
+            .await
+            .unwrap();
+        let retried = prepare_legacy_conflict_repair(&pool, "account-1", &asset, &keys())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.operation_id, operation_id);
+        assert_eq!(
+            retried.ciphertext.as_deref(),
+            Some(encryption.ciphertext.as_str())
+        );
+        assert_eq!(retried.nonce.as_deref(), Some(encryption.nonce.as_str()));
+        asset.updated_by_device_id = "other-device".into();
+        assert!(
+            prepare_legacy_conflict_repair(&pool, "account-1", &asset, &keys())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        asset.updated_by_device_id = keys().device_id.clone();
+        asset.encryption.as_mut().unwrap().ciphertext.push('A');
+        assert!(
+            prepare_legacy_conflict_repair(&pool, "account-1", &asset, &keys())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_local_delete_does_not_require_or_reuse_ciphertext() {
+        let (pool, _) = fixture().await;
+        sqlx::query("UPDATE cloud_sync_conflicts SET local_action='delete',local_revision=NULL,local_schema_version=NULL,local_key_generation=NULL,local_nonce='',local_ciphertext='' WHERE id='conflict-1'").execute(&pool).await.unwrap();
+        resolve_conflict(
+            &pool,
+            "account-1",
+            "conflict-1",
+            CloudSyncConflictDecision::KeepLocal,
+            &keys(),
+        )
+        .await
+        .unwrap();
+        let ops = CloudSyncRepository::list_pending_operations(&pool, "account-1")
+            .await
+            .unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            ops[0].action,
+            crate::repository::cloud_sync_repository::CloudSyncOperationAction::Delete
+        );
+        assert_eq!(ops[0].expected_revision, Some(3));
+        assert!(ops[0].ciphertext.is_none());
+    }
+
+    #[tokio::test]
+    async fn keep_both_preserves_distinct_connection_payloads() {
+        let (pool, _) = fixture().await;
+        resolve_conflict(
+            &pool,
+            "account-1",
+            "conflict-1",
+            CloudSyncConflictDecision::KeepBoth,
+            &keys(),
+        )
+        .await
+        .unwrap();
+        let rows = ConnectionRepository::list(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().find(|r| r.id == ASSET).unwrap().payload["host"],
+            "cloud.example"
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.id != ASSET).unwrap().payload["host"],
+            "local.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_cloud_updates_the_synced_hash_and_base_revision() {
+        let (pool, _) = fixture().await;
+        resolve_conflict(
+            &pool,
+            "account-1",
+            "conflict-1",
+            CloudSyncConflictDecision::KeepCloud,
+            &keys(),
+        )
+        .await
+        .unwrap();
+        let local = ConnectionRepository::get(&pool, ASSET)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.payload["host"], "cloud.example");
+        let metadata = CloudSyncRepository::get_asset(&pool, "account-1", ASSET)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metadata.local_payload_hash,
+            Some(connection_projection(&local).unwrap().1.as_base64url())
+        );
+        assert_eq!(metadata.base_revision, Some(3));
+    }
 }

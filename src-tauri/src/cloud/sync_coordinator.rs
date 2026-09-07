@@ -75,11 +75,14 @@ pub(crate) async fn run_execution(
     let bootstrap = client
         .bootstrap_account(&access_token)
         .await
-        .map_err(public_client_error)?;
-    let state = client
-        .sync_state(&access_token)
-        .await
-        .map_err(public_client_error)?;
+        .map_err(|error| {
+            tauri_plugin_log::log::warn!("Cloud sync failed: stage=bootstrap reason={error:?}");
+            public_client_error(error)
+        })?;
+    let state = client.sync_state(&access_token).await.map_err(|error| {
+        tauri_plugin_log::log::warn!("Cloud sync failed: stage=sync_state reason={error:?}");
+        public_client_error(error)
+    })?;
     let account_id = bootstrap.account.id;
     if !guard() {
         return Err(CloudPublicError::from_code(
@@ -174,8 +177,12 @@ pub(crate) async fn run_execution(
     if state.connection_sync.permissions.write_encrypted_assets {
         reconcile_local_assets(pool, &account_id, &keys, &guard)
             .await
-            .map_err(|_| {
+            .map_err(|error| {
                 if guard() {
+                    tauri_plugin_log::log::warn!(
+                        "Cloud sync failed: stage=reconcile reason={}",
+                        local_sync_error_reason(&error)
+                    );
                     CloudPublicError::from_code(super::CloudErrorCode::ProtocolError)
                 } else {
                     CloudPublicError::from_code(super::CloudErrorCode::Unauthenticated)
@@ -208,6 +215,7 @@ pub(crate) async fn run_execution(
             &keys,
             &mut result,
             &guard,
+            state.connection_sync.permissions.write_encrypted_assets,
         )
         .await?;
     }
@@ -529,6 +537,7 @@ async fn flush_pending_operations(
                 result.conflicted += 1;
             }
             Err(CloudAssetPutError::Client(error)) => {
+                tauri_plugin_log::log::warn!("Cloud sync failed: stage=upload reason={error:?}");
                 let (status, code) = if error.sync_operation_outcome_unknown() {
                     (
                         CloudSyncOperationStatus::Unknown,
@@ -596,7 +605,9 @@ async fn pull_pages(
     keys: &CommittedSyncKeyBundle,
     result: &mut CloudSyncRunResult,
     guard: &SyncRunGuard,
+    allow_repair: bool,
 ) -> Result<(), CloudPublicError> {
+    let mut repaired_cursors = HashSet::new();
     for _ in 0..MAX_PAGES_PER_RUN {
         if !guard() {
             return Err(CloudPublicError::from_code(
@@ -609,9 +620,87 @@ async fn pull_pages(
         let response = client
             .list_connection_assets(access_token, account_id, cursor, PAGE_SIZE, keys)
             .await
-            .map_err(public_client_error)?;
-        let page = validate_and_decrypt_page(account_id, cursor, response, keys)
-            .map_err(|_| CloudPublicError::from_code(super::CloudErrorCode::ProtocolError))?;
+            .map_err(|error| {
+                tauri_plugin_log::log::warn!(
+                    "Cloud sync failed: stage=pull.request cursor={cursor} reason={error:?}"
+                );
+                public_client_error(error)
+            })?;
+        let page = match validate_and_decrypt_page(account_id, cursor, response.clone(), keys) {
+            Ok(page) => page,
+            Err(super::sync_pull::SyncPullError::DecryptionFailed)
+                if allow_repair && !repaired_cursors.contains(&cursor) =>
+            {
+                let mut repairs = Vec::new();
+                for change in &response.items {
+                    if super::sync_pull::validate_and_decrypt_change(
+                        account_id,
+                        change.clone(),
+                        keys,
+                    )
+                    .is_err()
+                    {
+                        let repair = super::sync_management::prepare_legacy_conflict_repair(
+                            pool,
+                            account_id,
+                            &change.asset,
+                            keys,
+                        )
+                        .await
+                        .map_err(|_| {
+                            CloudPublicError::from_code(super::CloudErrorCode::ProtocolError)
+                        })?;
+                        let Some(repair) = repair else {
+                            tauri_plugin_log::log::warn!("Cloud sync failed: stage=pull.validate cursor={cursor} reason=DecryptionFailed legacy_repair=unavailable");
+                            return Err(CloudPublicError::from_code(
+                                super::CloudErrorCode::ProtocolError,
+                            ));
+                        };
+                        if !repairs.iter().any(|value: &crate::repository::cloud_sync_repository::EnqueueCloudSyncOperation| value.operation_id == repair.operation_id) {
+                            repairs.push(repair);
+                        }
+                    }
+                }
+                if repairs.is_empty() || !guard() {
+                    return Err(CloudPublicError::from_code(
+                        super::CloudErrorCode::ProtocolError,
+                    ));
+                }
+                for repair in repairs {
+                    CloudSyncRepository::enqueue_operation(pool, repair)
+                        .await
+                        .map_err(|_| {
+                            CloudPublicError::from_code(super::CloudErrorCode::ProtocolError)
+                        })?;
+                }
+                repaired_cursors.insert(cursor);
+                if let Some(error) = flush_pending_operations(
+                    pool,
+                    client,
+                    access_token,
+                    account_id,
+                    keys,
+                    result,
+                    guard,
+                )
+                .await
+                {
+                    return Err(error);
+                }
+                tauri_plugin_log::log::info!(
+                    "Cloud sync legacy conflict repair uploaded; refetching cursor={cursor}"
+                );
+                continue;
+            }
+            Err(error) => {
+                tauri_plugin_log::log::warn!(
+                    "Cloud sync failed: stage=pull.validate cursor={cursor} reason={error:?}"
+                );
+                return Err(CloudPublicError::from_code(
+                    super::CloudErrorCode::ProtocolError,
+                ));
+            }
+        };
         if !guard() {
             return Err(CloudPublicError::from_code(
                 super::CloudErrorCode::Unauthenticated,
@@ -620,7 +709,13 @@ async fn pull_pages(
         let has_more = page.has_more;
         let summary = apply_validated_page(pool, account_id, page, keys)
             .await
-            .map_err(|_| CloudPublicError::from_code(super::CloudErrorCode::ProtocolError))?;
+            .map_err(|error| {
+                tauri_plugin_log::log::warn!(
+                    "Cloud sync failed: stage=pull.apply cursor={cursor} reason={}",
+                    local_sync_error_reason(&error)
+                );
+                CloudPublicError::from_code(super::CloudErrorCode::ProtocolError)
+            })?;
         result.pulled += (summary.applied + summary.deleted) as u64;
         result.conflicted += summary.conflicted as u64;
         result.ignored += summary.ignored as u64;
@@ -634,6 +729,28 @@ async fn pull_pages(
     ))
 }
 
+// Only stable, allowlisted categories reach logs; AppError can contain SQL values or plaintext.
+fn local_sync_error_reason(error: &crate::error::AppError) -> &'static str {
+    use crate::error::AppError;
+    match error {
+        AppError::Validation(message)
+            if message == "Cloud sync projection references a missing parent folder" =>
+        {
+            "missing_parent_folder"
+        }
+        AppError::Validation(_) => "validation",
+        AppError::Sqlx(sqlx::Error::ColumnDecode { index, .. }) => match index.as_str() {
+            "\"created_at\"" => "local_column_decode_created_at",
+            "\"updated_at\"" => "local_column_decode_updated_at",
+            _ => "local_column_decode",
+        },
+        AppError::Sqlx(_) | AppError::SqlxMigrate(_) => "local_database",
+        AppError::SerdeJson(_) => "local_json",
+        AppError::NotFound(_) => "local_entity_missing",
+        _ => "local_storage",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +758,36 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
     use std::sync::Arc;
+
+    #[test]
+    fn local_sync_diagnostics_do_not_include_error_contents() {
+        use crate::error::AppError;
+        assert_eq!(
+            local_sync_error_reason(&AppError::validation("secret connection value")),
+            "validation"
+        );
+        assert_eq!(
+            local_sync_error_reason(&AppError::not_found("private connection name")),
+            "local_entity_missing"
+        );
+        assert_eq!(
+            local_sync_error_reason(&AppError::validation(
+                "Cloud sync projection references a missing parent folder"
+            )),
+            "missing_parent_folder"
+        );
+        for (index, expected) in [
+            ("\"created_at\"", "local_column_decode_created_at"),
+            ("\"updated_at\"", "local_column_decode_updated_at"),
+            ("private column value", "local_column_decode"),
+        ] {
+            let error = AppError::Sqlx(sqlx::Error::ColumnDecode {
+                index: index.to_string(),
+                source: "private database value".into(),
+            });
+            assert_eq!(local_sync_error_reason(&error), expected);
+        }
+    }
 
     async fn pool() -> SqlitePool {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -664,6 +811,26 @@ mod tests {
             encryption_private_key: [2; 32],
             signing_private_key: [3; 32],
         }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_reads_folders_previously_downloaded_from_cloud() {
+        let pool = pool().await;
+        // Cloud's folder upsert used the migration's INTEGER millisecond timestamps,
+        // while folders created locally used ISO 8601 TEXT in those same columns.
+        sqlx::query("INSERT INTO connection_folders (id, name) VALUES ('0198f5dc-0000-7000-8000-000000000020', 'Downloaded folder')")
+            .execute(&pool).await.unwrap();
+        let guard: SyncRunGuard = Arc::new(|| true);
+        reconcile_local_assets(&pool, "account-1", &keys(), &guard)
+            .await
+            .unwrap();
+        assert_eq!(
+            CloudSyncRepository::list_pending_operations(&pool, "account-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

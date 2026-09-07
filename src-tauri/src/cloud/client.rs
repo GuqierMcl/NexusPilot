@@ -777,17 +777,38 @@ impl CloudApiClient {
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(is_json_content_type);
-        let bytes = read_bounded_body(response, self.max_response_bytes).await?;
+        let response_type = std::any::type_name::<T>();
+        let bytes = read_bounded_body(response, self.max_response_bytes).await.map_err(|error| {
+            tauri_plugin_log::log::warn!(
+                "Cloud response rejected: type={response_type} status={} stage=body reason={error:?}", status.as_u16()
+            );
+            error
+        })?;
         if status == StatusCode::OK {
             if !content_type_is_json || bytes.is_empty() {
+                tauri_plugin_log::log::warn!(
+                    "Cloud response rejected: type={response_type} status=200 stage=envelope json={content_type_is_json} bytes={}", bytes.len()
+                );
                 return Err(CloudClientError::InvalidResponse);
             }
-            return serde_json::from_slice(&bytes).map_err(|_| CloudClientError::InvalidResponse);
+            return serde_json::from_slice(&bytes).map_err(|error| {
+                // Serde's Display can include response values. Log only structural coordinates.
+                tauri_plugin_log::log::warn!(
+                    "Cloud response rejected: type={response_type} status=200 stage=decode category={:?} line={} column={}",
+                    error.classify(), error.line(), error.column()
+                );
+                CloudClientError::InvalidResponse
+            });
         }
         let code = serde_json::from_slice::<CloudErrorEnvelope>(&bytes)
             .ok()
             .map(|envelope| envelope.error.code);
-        Err(map_error_response(status, code.as_deref()))
+        let error = map_error_response(status, code.as_deref());
+        tauri_plugin_log::log::warn!(
+            "Cloud response rejected: type={response_type} status={} stage=http reason={error:?}",
+            status.as_u16()
+        );
+        Err(error)
     }
 
     fn build(
