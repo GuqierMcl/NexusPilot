@@ -76,6 +76,8 @@ The Desktop may persist the last complete successful projection for offline disp
 - Creates use revision `1`; updates use `expectedRevision + 1`; deletes are ciphertext-free Tombstones.
 - Cloud stores the values as opaque data and does not decrypt or decode AAD.
 
+`limit` is an upper bound on the number of returned changes. A byte-limited page may contain fewer items while `hasMore` remains true; clients must use the returned `next` cursor rather than infer completion from item count. Asset responses may include a ciphertext of up to 16 MiB before Base64url encoding. The desktop accepts bounded asset responses up to 32 MiB and can retry an oversized list response with a lower `limit` and a fresh proof at the same cursor. These limits do not enlarge authentication or account-response limits.
+
 ## Compatibility
 
 - Existing optional fields cannot become required, and existing enum values cannot change meaning.
