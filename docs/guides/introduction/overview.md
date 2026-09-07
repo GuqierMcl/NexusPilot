@@ -11,7 +11,7 @@ NexusPilot 面向经常需要查看数据库结构、编写查询、检查数据
 
 ## 一个围绕数据工作的工作台
 
-连接浏览器、对象浏览、查询编辑和数据视图围绕同一个工作区协同，减少在多个工具和上下文之间来回切换的成本。
+连接列表、对象浏览、查询编辑和数据视图围绕同一个工作区协同，减少在多个工具和上下文之间来回切换的成本。
 
 - 统一管理数据库连接配置。
 - 按连接逐层浏览数据库对象、结构和数据。
@@ -33,4 +33,4 @@ NexusPilot 的 AI 能力由本地 AI Runtime 承载。前端不直接持有 LLM 
 
 ## 从这里开始
 
-如果你准备开始使用，请先阅读[安装与更新](/getting-started/installation/)，然后跟随[5 分钟快速开始](/getting-started/quick-start/)创建第一个连接。完成基本工作流后，可继续阅读[AI 助手](/guides/using-ai-assistant/)。
+如果你准备开始使用，请先阅读[安装与更新](/getting-started/installation/)，然后跟随[快速开始](/getting-started/quick-start/)创建第一个连接。完成基本工作流后，可继续阅读[AI 助手](/guides/using-ai-assistant/)。

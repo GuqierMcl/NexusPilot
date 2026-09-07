@@ -61,9 +61,9 @@
 | `delete_key` | `{ profileId, request }` | `RedisDeleteKeyResult` | Redis 删除单个 key；要求 `expectedFingerprint`，不存在或 stale 返回无业务效果错误 |
 | `delete_key_prefix` | `{ profileId, request }` | `RedisDeleteKeyResult` | Redis 删除前缀目录下所有后代 key；后端完整 `SCAN pattern` 后批量 `DEL`，拒绝空 pattern 与全局 `*` |
 | `rename_key` | `{ profileId, request }` | `RedisKeyMutationResult` | Redis key 重命名；要求 source `expectedFingerprint`，目标 key 已存在或并发出现时拒绝覆盖 |
+| `set_key_ttl` | `{ profileId, request }` | `RedisKeyMutationResult` | Redis TTL 独立原子修改；要求 `expectedFingerprint`，`expire` 要求正整数秒数，`persist` 移除过期时间 |
 
 `update_table_row/delete_table_rows` 是关系型主键兼容入口；ClickHouse 不把 sorting/primary key 冒充唯一键，因此只通过 `preview_table_change_set/commit_table_change_set` 接收中性 `rowSnapshot` locator。旧式主键命令在 ClickHouse 上返回可操作的 `FEATURE_UNAVAILABLE`，引导用户回到 DataTable 保存流程或 SQL 编辑器。
-| `set_key_ttl` | `{ profileId, request }` | `RedisKeyMutationResult` | Redis TTL 独立原子修改；要求 `expectedFingerprint`，`expire` 要求正整数秒数，`persist` 移除过期时间 |
 
 旧命令已移除，不保留 wrapper 兼容层。
 
@@ -278,7 +278,7 @@ interface CreateTableResult {
 }
 ```
 
-关系型对象分组统一使用 `kind: "asset_group"` 与 `groupType`，例如 `tables`、`views`、`functions`、`indexes`。Redis 专属类型：`RedisScanRequest`、`RedisKeyTreeRequest`、`RedisKeyTreeResult`、`RedisKeyRef`、`RedisKeyInfo`、`RedisScanResult`、`RedisKeyValue`、`RedisKeyPrecondition`、`RedisEditableValue`、`RedisSetKeyValueRequest`、`RedisCreateKeyValueRequest`、`RedisDeleteKeyRequest`、`RedisDeleteKeyPrefixRequest`、`RedisDeleteKeyResult`、`RedisRenameKeyRequest`、`RedisSetKeyTtlRequest`、`RedisKeyMutationResult`。Redis value 读取支持 `string/json/hash/list/set/sorted_set/stream/unsupported`；写入和新建使用 `RedisEditableValue`，不接受 binary string，hash/list/set/sorted_set/stream 整体替换时必须至少包含一个成员。RedisJSON module 类型会规范化为 `json`，读取使用 `JSON.GET key`，写入使用 `JSON.SET key $ <json>`。读取和 mutation response 携带基于 DUMP bytes 的 opaque fingerprint；Workbench value draft 保存 baseline fingerprint，set/rename/TTL/delete 必须回传该前置条件，成功结果更新 baseline。TTL 修改独立于 value dirty 状态，`set_key_ttl` 不重建 value；新建 key 的 TTL 作为 create draft 一部分提交给 `create_key_value`。删除单 key 使用 `delete_key`；目录删除仍使用 `delete_key_prefix`，返回 `deletedCount` 供前端提示与刷新，但它不属于 Agent Tool。
+关系型对象分组统一使用 `kind: "asset_group"` 与 `groupType`，例如 `tables`、`views`、`functions`、`indexes`。Redis 专属类型：`RedisScanRequest`、`RedisKeyTreeRequest`、`RedisKeyTreeResult`、`RedisKeyRef`、`RedisKeyInfo`、`RedisScanResult`、`RedisKeyValue`、`RedisEditableValue`、`RedisSetKeyValueRequest`、`RedisCreateKeyValueRequest`、`RedisDeleteKeyRequest`、`RedisDeleteKeyPrefixRequest`、`RedisDeleteKeyResult`、`RedisRenameKeyRequest`、`RedisSetKeyTtlRequest`、`RedisKeyMutationResult`。Redis value 读取支持 `string/json/hash/list/set/sorted_set/stream/unsupported`；写入和新建使用 `RedisEditableValue`，不接受 binary string，hash/list/set/sorted_set/stream 整体替换时必须至少包含一个成员。RedisJSON module 类型会规范化为 `json`，读取使用 `JSON.GET key`，写入使用 `JSON.SET key $ <json>`。读取和 mutation response 携带基于 DUMP bytes 的 opaque fingerprint；Workbench value draft 保存 baseline fingerprint，set/rename/TTL/delete 请求必须通过 `expectedFingerprint` 字段回传该前置条件，成功结果更新 baseline。TTL 修改独立于 value dirty 状态，`set_key_ttl` 不重建 value；新建 key 的 TTL 作为 create draft 一部分提交给 `create_key_value`。删除单 key 使用 `delete_key`；目录删除仍使用 `delete_key_prefix`，返回 `deletedCount` 供前端提示与刷新，但它不属于 Agent Tool。
 
 表数据浏览结果携带资源能力元数据：`QueryResult.sourceWritable`、`QueryResult.sourceInsertable`、`rowLocatorStrategy`、`primaryKeyColumns`、`stableOrderColumns` 与 `columns[].isWritable/isPrimaryKey`。`rowLocatorStrategy` 为 `primaryKey | rowSnapshot | null`；关系型驱动继续返回主键策略，ClickHouse 返回原始行快照策略且 `primaryKeyColumns` 保持为空。`sourceWritable` 表达 update/delete 的资源可写性，`sourceInsertable` 单独表达 insert 能力。`ColumnMeta.dataCategory` 由后端统一归类；`structured` 是 Array/Map/Tuple/Nested/Variant 等中性只读类别，共享 DataTable 不读取 driver name。
 
@@ -340,7 +340,7 @@ Query key 工厂位于 `src/lib/query-keys.ts`。所有远端数据 key 均以 `
 
 ## 5. Query Hooks
 
-Query hooks 位于 `src/hooks/queries/use-db-metadata.ts`。
+Query hooks 主要分布在 `src/hooks/queries/use-db-metadata.ts`；下表同时覆盖 `src/features/workbench/content/components/sql-editor/useSqlExecutionLifecycle.ts` 的 SQL 执行 lifecycle、`SqlEditorView` 脚本 runner 以及 `WorkbenchExplorerPanel.tsx` 的 saved-query 查询。
 
 | Hook | IPC | enabled 条件 |
 |------|-----|--------------|

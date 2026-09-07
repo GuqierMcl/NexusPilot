@@ -97,7 +97,7 @@ cd src-tauri && cargo clippy -- -D warnings
 - 前端常规验证：`bun run tsc --noEmit`
 - Rust 单元测试：`cd src-tauri && cargo test`
 - AI Runtime：`bun run ai-runtime:test`
-- 真实数据库集成测试见 `tests/` 与 `.env.test.example` 的配置说明
+- 真实数据库集成测试位于 `src-tauri/src/real_db_tests/`（按驱动分文件），配置说明见 `docs/development/real-database-tests.md`；`tests/` 目录仅包含前端 bun 测试
 
 ---
 

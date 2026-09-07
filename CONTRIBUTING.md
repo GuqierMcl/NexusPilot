@@ -65,16 +65,16 @@ If a check cannot be run locally, explain why in the Pull Request and include th
 
 ## Commit messages
 
-Use Conventional Commit types with a concise Chinese summary, following the repository convention in `AGENTS.md`:
+Use Conventional Commits, following the repository convention in `AGENTS.md`. Write the subject in English by default so it is accessible to the broader community; Chinese subjects are also accepted when they communicate the change more clearly:
 
 ```text
-feat(scope): 添加清晰的功能摘要
+feat(scope): add a clear feature summary
 
-- 说明主要实现变化。
-- 说明测试或文档同步情况。
+- Describe the main implementation changes.
+- Describe test or documentation updates.
 ```
 
-Common types include `feat`, `fix`, `docs`, `test`, `refactor`, and `chore`.
+Use an English Conventional Commit type such as `feat`, `fix`, `docs`, `test`, `refactor`, or `chore`, with an English module name as scope (for example `ai-runtime`, `editor`, `settings`, or `table-designer`). Non-trivial commits must include a bullet-list body; keep the body in the same language as the summary when practical.
 
 ## Pull Requests
 

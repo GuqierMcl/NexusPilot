@@ -279,7 +279,7 @@ Core/adapter 不自动重放 Bridge request。`outcome=not_started/no_effect` �
 
 ## 9. 第一批 Operation 与已确认 DTO
 
-第一批 Gateway operation：
+第一批 Gateway operation（此后已追加 `sql.analyze`、`sql.execute` 与仅供 Runtime 终止清理调用的 `prepared_plan.cleanup_run`，当前完整注册见 §10）：
 
 ~~~text
 connection.list

@@ -70,14 +70,19 @@ features.connectionSync:
   usage
   effectiveAt / expiresAt / phaseEndsAt / deletionEligibleAt
   entitlementVersion / policyVersion
-sync:
-  initialized / keyGeneration / activeDeviceCount / initializedAt
-localSync:
-  status: disabled | ready | secure_storage_unavailable | corrupted
-  keyGeneration
 ```
 
 `planCode`、subscription status 和 `phase` 是服务端展示/状态机字段，Desktop 不得据此自行授权。所有 Cloud 动作必须消费服务端返回的具体 `permissions` 和 `limits`，服务端仍会在每次业务请求中执行最终授权。Cloud 是 `evaluatedAt`、绝对期限、配额和用量的权威来源；IPC 投影可以在前端内存中用于显示，但不能作为离线授权副本。
+
+`get_sync_setup_context` 和 `get_cloud_sync_status` 返回 `CloudSyncSetupContext`，其中包含：
+
+```text
+sync:
+  initialized / keyGeneration / activeDeviceCount / initializedAt
+localSync:
+  status: disabled | paused | ready | secure_storage_unavailable | corrupted
+  keyGeneration
+```
 
 `sync` 表示 Cloud 服务端同步域状态；`localSync` 表示当前设备对对应 Cloud Account 的本地 SyncKeyStore 状态。只有 Cloud `sync.initialized=true` 且 `localSync.status=ready` 时，Desktop 才能把本机显示为可进行端到端同步。`localSync` 由 Rust 每次读取当前 Keychain 得出，不参与 Cloud 权益授权，也不写入 Cloud projection cache；缓存回退时 Rust 仍会重新读取本地 Keychain。
 
@@ -95,7 +100,15 @@ CLOUD_PROTOCOL_ERROR
 CLOUD_ACCOUNT_NOT_INITIALIZED
 CLOUD_CONNECTION_SYNC_NOT_ENTITLED
 CLOUD_CONNECTION_SYNC_RESTRICTED
+CLOUD_ACCOUNT_UNAVAILABLE
 CLOUD_SYNC_DEVICE_LIMIT_EXCEEDED
+CLOUD_SYNC_DEVICE_ALREADY_CONFIGURED
+CLOUD_SYNC_NOT_INITIALIZED
+CLOUD_DEVICE_AUTHORIZATION_CONFLICT
+CLOUD_DEVICE_AUTHORIZATION_INVALID
+CLOUD_DEVICE_AUTHORIZATION_PENDING_LIMIT_EXCEEDED
+CLOUD_DEVICE_AUTHORIZATION_NOT_FOUND
+CLOUD_DEVICE_AUTHORIZATION_NOT_PENDING
 CLOUD_SYNC_ALREADY_INITIALIZED
 CLOUD_SYNC_INITIALIZATION_MISMATCH
 CLOUD_SYNC_DEVICE_NOT_AUTHORIZED
@@ -103,6 +116,7 @@ CLOUD_SYNC_SETUP_INVALID
 CLOUD_SYNC_SETUP_EXPIRED
 CLOUD_SECURE_STORAGE_UNAVAILABLE
 CLOUD_RECOVERY_KEY_EXPORT_FAILED
+CLOUD_RECOVERY_KEY_INVALID
 CLOUD_CONNECTION_SYNC_CONFLICT
 CLOUD_CONNECTION_SYNC_QUOTA_EXCEEDED
 CLOUD_CONNECTION_SYNC_ASSET_TOO_LARGE
@@ -429,9 +443,9 @@ interface ConnectionTestResult {
 
 ClickHouse 的 `test_connection_config`、`connect_profile` 和 `open_tab_runtime` 都通过同一个官方 HTTP client 构造路径并执行有界真实探测。当前 runtime 返回 `schemaBrowser=true`、`dataTableBrowser=true`、`tableRowMutator=true`、`tableRowInserter=true`、`sqlExecutor=true`，声明 direct managed SQL execution，并通过 `schemaMutation` 精确声明七类 schema object；`schemaMutator=false`、`transactionManager=false`。native schema mutation、SQL Editor direct access 和 DataTable write 是相互独立的授权边界，具体表是否可写仍以 `QueryResult` 为准。
 
-具体结构写入授权以可选 `DriverCapabilities.schemaMutation` 为唯一权威来源。它按 `ContainerKind` 声明 `create/alter/drop/clear/materialize` 操作，并同时描述 driver 级 `ddlPreview`、`destructiveConfirmation`、`remoteDriftProtection` 保护设施。迁移期 `schemaMutator` 只保留关系型 `SchemaMutator` trait 的兼容布尔值；前端不得再从该布尔值推导某个具体操作。当前 MySQL/PostgreSQL 声明 database/table 的 create/alter/drop，Oracle 只声明 table 的 create/alter/drop；ClickHouse Phase 5C 保持 `schemaMutator=false` 与 `as_schema_mutator()=None`，同时通过 native extension 精确声明 database create/drop、table create/alter/drop、column clear/materialize，并把三项保护设施全部设为 true。
+具体结构写入授权以可选 `DriverCapabilities.schemaMutation` 为唯一权威来源。它按 `ContainerKind` 声明 `create/alter/rename/drop/clear/materialize` 操作，并同时描述 driver 级 `ddlPreview`、`destructiveConfirmation`、`remoteDriftProtection` 保护设施。迁移期 `schemaMutator` 只保留关系型 `SchemaMutator` trait 的兼容布尔值；前端不得再从该布尔值推导某个具体操作。当前 MySQL/PostgreSQL 声明 database/table 的 create/alter/drop，Oracle 只声明 table 的 create/alter/drop；ClickHouse Phase 5C 保持 `schemaMutator=false` 与 `as_schema_mutator()=None`，同时通过 native extension 精确声明 database create/drop、table create/alter/drop、column clear/materialize，并把三项保护设施全部设为 true。
 
-ClickHouse `list_containers` 允许根级同时返回 databases 与 `groupType=functions,database=null` 的 asset group；function 使用 connection-scoped `objectName`。database 下返回 tables/views/materialized_views/dictionaries，table 下返回 columns/indexes/projections/partitions，View/MV 只返回 columns。权限拒绝返回 `SYSTEM_INTERNAL + runtimeImpact=businessOnly`，不得伪装为空数组；network timeout 仍为 `retryable`，authentication failure 仍为 `terminal`。
+ClickHouse `list_containers` 允许根级同时返回 databases 与 `groupType=functions,database=null` 的 asset group；function 使用 connection-scoped `objectName`。database 下返回 tables/views/materialized_views/dictionaries，table 下返回 columns/indexes/projections/partitions，View/MV 只返回 columns。权限拒绝返回 `PERMISSION_DENIED + runtimeImpact=businessOnly`，不得伪装为空数组；network timeout 仍为 `retryable`，authentication failure 仍为 `terminal`。
 
 ClickHouse direct HTTPS 保留原始 hostname，由 rustls 和系统原生根证书执行正常 SNI/hostname 验证；不提供 skip verification。HTTP + SSH 使用 resolved loopback endpoint 并由 driver 持有 tunnel。HTTPS + SSH 在当前 tunnel 无法保留原始 ClickHouse hostname 的情况下，于 endpoint resolution 前返回 `VALIDATION_FAILED`。
 

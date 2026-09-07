@@ -16,13 +16,13 @@
 
 例如：
 ```typescript
-// src/types/explorer.ts
+// src/features/workbench/explorer/types.ts
 
-export type ExplorerNodeType =
+export type ExplorerTreeNodeType =
     // ==========================================
     // 域 A：本地配置空间 (来自本地 SQLite 存储)
     // ==========================================
-    | 'profile_folder'      // 📁 用户自己建的连接分类文件夹 (如 "生产环境", "阿里云")
+    | 'group'               // 📁 用户自己建的连接分类文件夹 (如 "生产环境", "阿里云")
     | 'connection'          // 🔌 具体的数据库连接实例 (Profile)
     | 'saved_query_group'   // 📁 本地保存查询分组：按 context 注入 database/schema，或作为 connection 兜底组
     | 'saved_query'         // 📄 本地保存查询
@@ -170,7 +170,7 @@ Explorer 节点视觉由 `explorer-node-visual-registry` 收口：普通节点�
 | `event` | B | `Timer` | 是 | MySQL |
 | `column` | B | `Columns2` | 是 | `isLeaf=true` |
 | `redis_database` | B | `Database` | 是 | Redis 逻辑库；可在 trailing slot 展示 DB 内 key 总数 |
-| `redis_key_prefix` | B | `Folder` / `FolderOpen` | 是 | Redis key 前缀；Explorer 不统计前缀总数，前缀数量由 Redis 内容标签页展示 |
+| `redis_key_prefix` | B | `KeyRound` | 是 | Redis key 前缀；Explorer 不统计前缀总数，前缀数量由 Redis 内容标签页展示 |
 | `redis_key` | B | `KeyRound` | 是 | Redis key；`isLeaf=true` |
 | `collection` / `document` / `field` | B | `Box` / `FileJson` / `Columns2` | 预留 | 文档数据库 |
 | `vector_collection` | B | `Sigma` | 预留 | 向量数据库 |
@@ -238,9 +238,9 @@ export interface RemoteNodeMetadata {
 
 1. 在 `types.ts` 的 `ExplorerTreeNodeType` 联合中追加新类型字符串
 2. 若需要新字段，扩展 `RemoteNodeMetadata`；否则复用现有结构体
-3. 选择对应节点结构体（`ExplorerTreeDatabaseNode` / `ExplorerTreeVirtualFolderNode` / `ExplorerTreeRemoteEntityNode`）或新建
+3. 选择对应节点结构体（`ExplorerTreeGroupNode` / `ExplorerTreeConnectionNode` / `ExplorerTreeSavedQueryGroupNode` / `ExplorerTreeSavedQueryNode` / `ExplorerTreeDatabaseNode` / `ExplorerTreeRemoteEntityNode`）或新建
 4. 在 `explorer-node-visual-registry.tsx` 中注册节点视觉；若是新驱动连接图标，则在对应 `ExplorerDriverConfig.treeVisual` 中注册
-5. 在 `useExplorerMetadataStore.ts` 的 `loadChildren` switch 中追加 case
+5. 新的远程节点类型通常无需修改 `useExplorerMetadataStore.ts`：`loadChildren` 只特判 `connection`，其余节点在 `metadata.container` 存在时走通用加载
 6. 在 `buildRemoteNodes.ts` 中实现对应的工厂函数
 7. 更新本文件的枚举表格（6.2 节）
 8. 在 `remoteActionContributors.ts` 注册该节点族需要的右键菜单和 primary action；若动作只属于某个驱动，则在对应 `ExplorerDriverConfig.remoteActionContributors` 注册贡献器

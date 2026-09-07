@@ -216,7 +216,7 @@ export const DRIVER_CONFIGS: DriverConfigRegistry = {
 
 **文件：** `src-tauri/src/repository/connection_repository.rs`
 
-`ConnectionDriver` 枚举中所有 16 种驱动均已预先声明。如果新驱动尚未在枚举中，仿照格式追加：
+`ConnectionDriver` 枚举中所有 17 种驱动均已预先声明。如果新驱动尚未在枚举中，仿照格式追加：
 
 ```rust
 pub enum ConnectionDriver {

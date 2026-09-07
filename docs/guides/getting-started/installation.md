@@ -32,7 +32,7 @@ description: 在 Windows 或 macOS 上安装 NexusPilot、确认版本并安全�
 
 ## 安装后确认
 
-启动应用后，确认工作台能够正常打开。接下来可以继续阅读[5 分钟快速开始](/getting-started/quick-start/)，完成一次连接、对象浏览和查询。
+启动应用后，确认工作台能够正常打开。接下来可以继续阅读[快速开始](/getting-started/quick-start/)，完成一次连接、对象浏览和查询。
 
 如果应用无法启动，或操作系统阻止安装，请先查看[故障排查](/help/troubleshooting/)。
 

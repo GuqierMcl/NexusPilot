@@ -13,7 +13,7 @@ NexusPilot treats SQLite as a local-file database, not as a network connection.
 - SQL editor execution uses the file context and has no schema selector;
 - writable ordinary tables can use DataTable insert, update, and delete when a complete explicit primary key is available;
 - DataTable tab runtimes support transactions;
-- the structured SQLite Table Designer baseline creates new tables.
+- the structured Table Designer is not available for SQLite; schema changes go through the SQL editor.
 
 ## Safety model
 

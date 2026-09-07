@@ -177,7 +177,7 @@ Workbench 底部状态栏是 active work surface 的低干扰摘要层，不是�
 - 具体 `sql_editor`、`table_data`、`key_value`、`table_design` 等状态展示规则必须放在 focused contributor 中，不要写进公共状态栏 shell 或公共 hook。
 - 状态栏区域只允许 `left` / `right`，不允许 `center`。动作、上下文、当前 tab 风险放左侧；数字、页码、选区、全局摘要和全局异常放右侧。
 - 没有 active tab 且没有更强状态时，左侧显示中文心跳状态 `已就绪`，不要让整条状态栏空白。
-- 状态栏文案统一使用中文，例如 `已就绪`、`正在查询`、`查询失败`、`2 个连接在线`、`AI 离线`。
+- 状态栏文案统一使用中文，例如 `已就绪`、`正在查询`、`查询失败`、`2 个连接在线`、`AI 暂不可用`。
 - 当前对象路径，例如 database / schema / table / Redis Key，属于左侧上下文状态，并应使用 elastic 宽度，避免过早被固定 `max-width` 截断。
 - AI 状态默认不常驻展示 `AI Ready` 或 `No model selected`。只有 AI Runtime 离线、不可用，或未来 Agent Panel 折叠后需要补位时，才通过 warning contributor 进入右侧区域。
 - 状态栏 item 可以提供跳转或聚焦入口，但不能直接执行连接、SQL、保存、提交、回滚或 LLM 发送等核心业务动作。

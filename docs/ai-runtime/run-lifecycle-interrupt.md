@@ -10,7 +10,6 @@
 - [Runtime domain](./domain.md)
 - [Live EventBus and SSE](./live-eventbus-sse.md)
 - [AI Runtime overview](./README.md)
-- [Runner Core](./runner-core.md)
 
 ## 决策摘要
 

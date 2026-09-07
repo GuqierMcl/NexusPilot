@@ -219,9 +219,6 @@ export const neo4jDriverConfig: ExplorerDriverConfig<"neo4j"> = {
     treeVisual: {
         icon: Neo4jIcon,
         iconClassName: "text-sky-500",
-        badgeLabel: "N4",
-        badgeClassName:
-            "bg-sky-500/12 text-sky-700 ring-1 ring-sky-500/20 dark:text-sky-300",
     },
     // ...
 };
@@ -231,7 +228,7 @@ export const neo4jDriverConfig: ExplorerDriverConfig<"neo4j"> = {
 
 - `iconClassName` 用于尺寸、状态或文本色等外层样式；不要依赖它修复品牌图形内部填充。
 - 如果图标本身已经带品牌色，多数情况下 `iconClassName` 的颜色类不会影响内部 path，这是预期行为。
-- `treeVisual.badgeLabel` 仍由 driver config 维护，不属于图标 adapter。
+- `treeVisual` 只包含 `icon` 与 `iconClassName`；driver abbreviation badge 已移除，不应恢复（见 `workbench-registry-constraints.md` §3.2）。
 
 ---
 
@@ -300,7 +297,7 @@ bun run build
 人工检查：
 
 - 数据库类型选择窗口中，已实现和未实现数据库都显示正确品牌图标。
-- 连接树中，已实现驱动的连接节点显示正确品牌图标和 badge。
+- 连接树中，已实现驱动的连接节点显示正确品牌图标。
 - 亮色主题下 MySQL 图标可见。
 - 暗色主题下 MySQL 图标可见。
 - 禁用态数据库卡片的 opacity 不会让图标完全不可辨认。

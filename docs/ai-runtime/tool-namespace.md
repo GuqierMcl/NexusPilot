@@ -706,7 +706,7 @@ Tool description 是模型在每次可用 Tool 集合中都会看到的常驻上
 
 ## 11. 第一批真实工具
 
-当前 Backend 业务工具注册四个 Namespace、七个专用只读 Tool 和一个可逆连接状态 Tool：
+当前 Backend 业务工具注册五个 Namespace、十四个 Tool——七个专用只读 Tool、一个可逆连接状态 Tool、五个 Redis 单 Key mutation Tool 和受控 `sql.execute`：
 
 ~~~text
 connection.list
@@ -715,6 +715,7 @@ connection.open
 metadata.list_children
 metadata.describe_table
 table.query
+sql.execute
 key_value.scan
 key_value.get
 key_value.create

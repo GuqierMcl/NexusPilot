@@ -34,7 +34,7 @@ Status: **Current**
 | [provider-model.md](./provider-model.md) | models.dev catalog, provider configuration, credentials, and model resolution. |
 | [attachment-storage.md](./attachment-storage.md) | Current Runtime-owned chat attachment storage, upload, lifecycle, and multimodal model-input contract. |
 | [composer-references.md](./composer-references.md) | Typed composer references, local commands, extension registries, persistence, projections, and failure recovery. |
-| [Context-compaction specification](../comet/changes/ai-runtime-context-compaction/specs/agent-context-compaction/spec.md) | Binding current behavior for branch-aware context planning, checkpoints, Safety State, and overflow recovery. |
+| [Context-compaction specification](../comet/specs/agent-context-compaction/spec.md) | Binding current behavior for branch-aware context planning, checkpoints, Safety State, and overflow recovery. |
 | [live-eventbus-sse.md](./live-eventbus-sse.md) | Live-only EventBus and scoped SSE. |
 | [communication-boundaries.md](./communication-boundaries.md) | Frontend HTTP/SSE, backend bridge, and health responsibilities. |
 | [backend-bridge.md](./backend-bridge.md) | Authenticated WebSocket transport and Rust Gateway. |
@@ -46,16 +46,19 @@ The sidecar is a focused local service and does not use an `/api` prefix:
 
 - process health: `GET /health`;
 - versioned runtime resources: `/v1/**`;
-- run creation: `POST /v1/runs`;
+- run creation and control: `POST /v1/runs`, `POST /v1/runs/:runId/continue`, and `POST /v1/runs/:runId/interrupt`;
+- conversations: `/v1/conversations/**`, including messages, per-conversation runs, and manual compaction operations (`/v1/conversations/:conversationId/compactions`);
+- provider and model configuration: `/v1/providers/**`, `/v1/models/available`, `/v1/custom-providers/**`, and `/v1/catalog/**`;
+- agent modes and Runtime settings: `GET /v1/agent-modes` and `GET/PUT /v1/settings`;
 - attachment upload: `POST/PUT/GET/DELETE /v1/attachment-uploads`;
 - attachment metadata and authenticated content: `GET/DELETE /v1/attachments/:attachmentId` and `GET /v1/attachments/:attachmentId/content`;
-- history and recovery: Snapshot Read APIs under `/v1/**`;
+- history and recovery: Snapshot Read APIs under `/v1/**` (runs, run events, run traces, permissions, and tool approvals);
 - live invalidation events: `GET /v1/events`;
 - backend capability transport: authenticated WebSocket bridge.
 
 Run requests select a model and agent mode, and provide typed input parts. They do not accept caller-controlled system prompts, tool registries, execution limits, or provider credentials.
 
-The message-history endpoint defaults to the active lineage and includes the active head/revision. `view=transcript` is the explicit audit/diagnostic view and includes sanitized Run DAG relationships. The Runtime currently exposes no branch-browsing interface and no user-facing manual compaction endpoint; its internal `manual` service trigger exists only to keep future entry points on the same safe orchestration path.
+The message-history endpoint defaults to the active lineage and includes the active head/revision. `view=transcript` is the explicit audit/diagnostic view and includes sanitized Run DAG relationships. The Runtime currently exposes no branch-browsing interface. Manual `/compact` is a user-facing conversation operation served by dedicated endpoints (`POST/GET /v1/conversations/:conversationId/compactions` and `POST /v1/conversations/:conversationId/compactions/:operationId/cancel`); they drive the same checkpoint service through the internal `manual` trigger so every entry point stays on the same safe orchestration path. See [composer-references.md](./composer-references.md).
 
 ## AI SDK documentation rule
 

@@ -22,12 +22,14 @@ ai-runtime/src/runtime/
 ├── store/
 │   └── sqlite-store.ts        # SQLite-backed runtime store
 ├── projection/
-│   └── ui-projection.ts       # assistant-ui / AI SDK friendly projection helpers
+│   ├── ui-projection.ts       # assistant-ui / AI SDK friendly projection helpers
+│   ├── ai-sdk-projection.ts   # AI SDK 7 UIMessage snapshot projection
+│   ├── history-projection.ts  # conversation history snapshot projection
+│   └── model-history-projection.ts # raw Message -> AI SDK ModelMessage[] projection
 ├── agents/
 │   ├── agent-definition.ts    # built-in ask / query / agent definitions
 │   ├── agent-resolver.ts      # public agent intent -> execution policy
 │   ├── prompt-assembler.ts    # structured system prompt assembly
-│   ├── tool-policy.ts         # executable tool policy resolution
 │   └── prompts/
 │       ├── ask.ts             # Chinese ask system prompt
 │       ├── query.ts           # Chinese query system prompt
@@ -37,13 +39,23 @@ ai-runtime/src/runtime/
 │   ├── runner.ts              # Run lifecycle state machine
 │   ├── run-interrupt.ts       # Store-level interrupt finalizer and stale active run repair
 │   ├── active-run-registry.ts # process-local active run interrupt registry
+│   ├── run-continuation-registry.ts # process-local Run continuation conflict registry
+│   ├── model-error.ts         # model execution error normalization and redaction
 │   └── text-runner.ts         # AI SDK streamText runner with Runtime tool callbacks
 ├── tools/
-│   ├── index.ts               # default Runtime tool registry factory
-│   ├── tool-registry.ts       # executable Runtime tool registry
-│   ├── tool-adapter.ts        # Runtime tools -> AI SDK ToolSet adapter
+│   ├── index.ts               # tools barrel export
+│   ├── ai-sdk-adapter.ts      # Runtime tools -> AI SDK ToolSet adapter
+│   ├── backend-bridge-executor.ts # Backend Tool -> authenticated backend bridge executor
+│   ├── backend-read-contracts.ts # backend read/tool Zod contracts
+│   ├── sql-contracts.ts       # sql.* Zod contracts
+│   ├── key-value-contracts.ts # key_value.* Zod contracts
 │   ├── web-fetch.ts           # Runtime-local web.fetch executor
-│   └── web-ping.ts            # Runtime-local web.ping executor
+│   ├── web-ping.ts            # Runtime-local web.ping executor
+│   ├── contracts/             # tool context/result/risk/permission/prepared contracts
+│   ├── core/                  # Runtime Tool Core + prepared invocation registry
+│   ├── kernel/                # namespace, provider-name codec, runtime-tool-registry
+│   ├── namespaces/            # connection/metadata/sql/table/key_value/system/web
+│   └── resolution/            # executable tool policy resolution + per-Run tool snapshot
 └── index.ts           # runtime barrel export
 
 ai-runtime/src/runtime/context/
@@ -51,7 +63,13 @@ ai-runtime/src/runtime/context/
 ├── model-context-manager.ts # request preparation, replan and projection
 ├── compaction-service.ts    # single checkpoint generation/CAS seam
 ├── manual-compaction-service.ts # durable conversation operation, idempotency and cancellation
+├── overflow-recovery.ts     # context-overflow single-retry recovery
+├── boundary-validation.ts   # checkpoint coverage boundary validation
+├── policy.ts                # compaction thresholds and budget policy
+├── summary-prompt.ts        # checkpoint summary prompt construction
+├── token-estimator.ts       # provider/model token estimation
 ├── safety-state.ts          # structured cross-branch effect projection
+├── index.ts                 # context barrel export
 └── types.ts                 # checkpoint, plan, budget, usage and claim contracts
 
 ai-runtime/src/storage/
@@ -188,6 +206,7 @@ Runtime SQLite schema 由 `runtime_schema_migrations` 表记录版本化迁移�
 - `0010_runtime_tool_call_authorization_snapshot`、`0011_runtime_context_preparation_claims` 与 `0012_runtime_context_preparation_fencing`：补足 Safety State 所需事实、checkpoint CAS claim 与 fencing。
 - `0013_runtime_context_diagnostics`：增加 append-only、脱敏且可去重的 checkpoint/CAS/启动完整性诊断。
 - `0014_runtime_context_compaction_activities`：增加独立、可恢复并可按 request boundary 排序的压缩生命周期 Activity。
+- `0015_runtime_manual_compactions`：增加独立手动压缩操作表，持久化 operation ID、幂等 request key、terminal head（run_id + request_index）身份、分配的上下文请求槽位与可恢复生命周期；不创建合成 Run 或聊天消息。
 
 已发布 migration 不会重写旧 SQL。升级会把可证明的既有线性 history 回填为初始 DAG，但不会也不能恢复升级前旧版本已经物理删除的 edited tail；append-only 保证从 `0008_runtime_run_dag` 起生效。后续 schema 演进仍必须追加新的 `RUNTIME_MIGRATIONS` 版本。
 
@@ -279,13 +298,13 @@ interrupt command API 会修改 Runtime Store 中的 Run、Assistant Message、T
 
 ## 当前不公开的扩展缝
 
-当前实现保留 `ContextCompactionService(trigger: "manual")` 作为与自动流程相同的内部/service-test seam，复用 ancestry、Safety State、planner、CAS/fencing 和 event 契约；没有用户可见的立即压缩按钮，也没有面向用户的 manual HTTP endpoint。当前默认界面也不提供分支浏览、比较、恢复或切换 UI，尽管 transcript/DAG 事实可被显式审计读取。
+`ContextCompactionService(trigger: "manual")` 复用与自动流程相同的 ancestry、Safety State、planner、CAS/fencing 和 event 契约；手动入口已实现为面向用户的 `/compact` 会话操作，由 `GET/POST /v1/conversations/:conversationId/compactions` 与 `POST /v1/conversations/:conversationId/compactions/:operationId/cancel` 承载，持久化独立 operation 并支持幂等与取消。当前默认界面也不提供分支浏览、比较、恢复或切换 UI，尽管 transcript/DAG 事实可被显式审计读取。
 
 前端通过 Runtime HTTP/AI SDK-compatible stream 与 Snapshot API 使用这一领域层，而非直接调用模型。需要数据库或工作台能力的 ToolCall 通过受认证的 Rust/Tauri Backend WebSocket Bridge 执行，复用 Rust connection runtime；AI Runtime 不建立第二套数据库 pool。已实现的受控能力包括 `connection.open`、读取类工具和经 Permission/prepared plan 保护的 `sql.execute`，它们仍不能绕过 Rust 领域边界。
 
 尚未实现：
 
 - resumable stream、durable SSE replay 或后台 Run 恢复继续执行。
-- 面向用户的 branch 浏览、比较、恢复或切换 UI，以及公开 manual compaction endpoint。
+- 面向用户的 branch 浏览、比较、恢复或切换 UI。
 
 后续能力必须继续通过 Runtime runner、tool registry、permission/audit、Snapshot Read API 和前端确认协议逐层接入，不能直接堆进 route、store 或 projection helper。

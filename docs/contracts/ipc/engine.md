@@ -11,8 +11,9 @@ Engine failures use a stable error object:
 ```ts
 interface IpcError {
   code: string;
+  runtimeImpact: "businessOnly" | "retryable" | "terminal";
   message: string;
-  details?: unknown;
+  details?: string;
 }
 ```
 

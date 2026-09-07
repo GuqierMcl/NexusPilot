@@ -10,7 +10,7 @@
 | --- | --- |
 | 产品 Identifier | 继续使用 `NexusPilot`，不迁移现有安装与数据目录 |
 | 桌面自定义 Scheme | 已配置 `dev.nexuspilot`，与产品 Identifier 解耦 |
-| single-instance 协作 | 已启用 `deep-link` feature，且保持首插件顺序 |
+| single-instance 协作 | 已启用 `deep-link` feature；顺序约束为 single-instance 早于 deep-link（notification/fs 在其之前注册） |
 | 通用 Rust Router | 已支持精确路由注册、Handler trait、晚绑定和有界暂存 |
 | 冷启动 URL 获取 | 已通过 Rust `get_current` 接入 |
 | 运行中 URL 监听 | 已通过 Rust `on_open_url` 接入 |
@@ -167,7 +167,8 @@ URL、Authorization Code、state 和 Provider 错误不会写入通用日志。�
 Windows/Linux 上 Deep Link 会以新进程参数进入应用，因此插件初始化保持：
 
 ```text
-tauri-plugin-single-instance（必须第一）
+tauri-plugin-notification / tauri-plugin-fs
+  -> tauri-plugin-single-instance（必须早于 deep-link）
   -> tauri-plugin-deep-link
   -> 其他插件
 ```
@@ -316,7 +317,7 @@ Keychain 失败时不回退读取
 
 旧 Vault 留在磁盘意味着认证会话不保证安全回退：用户若手动安装仍支持文件 Vault 的旧版本，旧版可能读取其中尚未失效的 Refresh Token；新版本退出也只清理 Keychain，不修改旧 Vault。该行为是明确的不支持场景，不为版本回退增加兼容或清理逻辑。
 
-当前运行链路已经删除 `EncryptedFileAuthVault`、旧 Vault 加解密代码及 `chacha20poly1305` 专用依赖，没有保留不可达的 fallback adapter。
+当前运行链路已经删除 `EncryptedFileAuthVault` 与旧 Vault 加解密代码，没有保留不可达的 fallback adapter；`chacha20poly1305` crate 仍然保留，由 Cloud 同步加密（XChaCha20Poly1305 recovery envelope 与 HPKE ChaCha20Poly1305）使用。
 
 ### 10.3 登录与回调提交顺序
 
@@ -411,7 +412,7 @@ event: auth-session-changed
 
 `AuthSessionSnapshot` 只包含 phase、operation、Provider 可用性、Provider 摘要、最小公开用户资料及可选 `avatarRevision`、是否存在可用 Access Token、过期/恢复时间和 `AuthPublicError`。事件 payload 与 command 返回结构完全相同。`get_auth_avatar(revision)` 是独立只读二进制窄口：只在 revision 与当前已登录用户和本地文件内容同时匹配时返回 PNG，否则返回空数据；React 对预期的 `ArrayBuffer` 和异常桥接形态统一执行 `Uint8Array` 复制。React 启动时先订阅事件再读取 Snapshot，读取期间若收到事件则保留较新状态；Zustand Auth Store 不持久化，也不解析 JWT。
 
-账号入口位于标题栏主题按钮与窗口控制之间，不进入 NavigationRail，也没有 `/login` 或 callback React Route。Hover 只显示 Tooltip，点击/键盘打开 Popover。卡片应明确这是 NIEEX Account，而不是 NexusPilot 专属账号；未登录明确说明本地工作台始终无需登录，并以醒目但无交互入口的提示预告“登录后可使用 NexusPilot Cloud 同步资产，敬请期待”。已登录优先展示 Rust 本地净化头像，没有头像或任何头像处理失败时展示本地首字母，并展示昵称、稳定 Handle、邮箱、账户中心外链和退出；“账户中心”通过系统默认浏览器固定打开 `https://auth.nieex.com/account/profile`。WebView 不加载远程头像。该预告不得宣称 Cloud 已可用，也不得提供同步、云备份或团队功能入口。
+账号入口位于标题栏主题按钮与窗口控制之间，不进入 NavigationRail，也没有 `/login` 或 callback React Route。Hover 只显示 Tooltip，点击/键盘打开 Popover。卡片应明确这是 NIEEX Account，而不是 NexusPilot 专属账号；未登录明确说明本地工作台始终无需登录，并展示 Cloud 提示“登录后可查看订阅和 Cloud 使用情况”。已登录优先展示 Rust 本地净化头像，没有头像或任何头像处理失败时展示本地首字母，并展示昵称、稳定 Handle、邮箱、账户中心外链和退出；“账户中心”通过系统默认浏览器固定打开 `https://auth.nieex.com/account/profile`。WebView 不加载远程头像。账号卡片消费 `useCloudDesktopState()` 并提供交互式 Cloud 设置入口；完整同步 UI 由 `CloudSyncPanel.tsx`、`SyncSecurityPanel.tsx` 与 `enable-cloud-sync-dialog.tsx` 承载。
 
 ## 13. Windows 正式安装包手动验证
 
@@ -525,6 +526,6 @@ open command：<可隐藏用户名，但保留安装目录结构>
 
 ## 15. 当前验收边界
 
-代码与自动化验证已经覆盖 Provider 配置、Discovery 能力过滤、回调解析、Pending Login、state、Provider fingerprint、Refresh Rotation、临时离线、Refresh 拒绝、Keychain 分条 Schema 与容量边界、generation/identity 绑定、写后复读、损坏记录失败关闭、Rotation 持久化失败、Tombstone-first 退出、Tombstone 写失败时的删除复读兜底、物理删除失败后凭据仍不可恢复、Keychain 不可用时禁止打开浏览器、纯本地退出且零 Provider/Browser 调用、标准 `picture` 映射、头像 URL/地址过滤、格式/尺寸净化、身份/revision 缓存绑定、Tauri 二进制 payload 归一化、头像失败隔离和退出清理，以及 Cloud Token 当前复用、并发单飞刷新与退出失效。当前自动化测试不会读写真实用户 Keychain，而是通过与生产 `SystemAuthCredentialStore` 相同的事务逻辑注入内存后端；Windows Credential Manager、macOS Keychain 与 Linux Secret Service 仍需要相应平台的发布包手工验收。2026-07-18 用户已完成第 13、14 节所覆盖的 Windows NSIS、真实 Logto 与真实头像基础闭环验收，该验收发生在 Keychain cutover 之前；2026-08-05 用户进一步确认 Windows 开发环境在 Keychain cutover 后能够完成真实 NIEEX Account 登录，并使用旧 Third-party App 完成真实 Cloud Bootstrap：连续两次调用均成功、返回同一内部账户，账户为 `active`、初始订阅为 `free/active`、连接同步为 `not_entitled`、`policyVersion = 1`，且验收未输出 JWT 或外部身份。同日嵌入式 Provider 已切换到新的第一方 Native App，用户确认新应用真实登录正常，第一方 Client cutover 可以收尾并进入下一阶段；尚未据此宣称迁移前后 `account.id` 对比、正式安装包 Keychain 条目、重启恢复、本地退出和重启后匿名已经复验，这些项目保留为后续真实联调与发布回归项。受 Fake-IP DNS 影响时头像按设计降级，切换到可提供公网解析的 VPN 后验证显示正常。账号卡片可以展示 NexusPilot Cloud 的“即将开放”预告；当前只新增 Rust-only Bootstrap 与脱敏 Cloud IPC，不代表资产同步、团队、订阅购买、移动端或 React Access Token IPC 已可用。
+代码与自动化验证已经覆盖 Provider 配置、Discovery 能力过滤、回调解析、Pending Login、state、Provider fingerprint、Refresh Rotation、临时离线、Refresh 拒绝、Keychain 分条 Schema 与容量边界、generation/identity 绑定、写后复读、损坏记录失败关闭、Rotation 持久化失败、Tombstone-first 退出、Tombstone 写失败时的删除复读兜底、物理删除失败后凭据仍不可恢复、Keychain 不可用时禁止打开浏览器、纯本地退出且零 Provider/Browser 调用、标准 `picture` 映射、头像 URL/地址过滤、格式/尺寸净化、身份/revision 缓存绑定、Tauri 二进制 payload 归一化、头像失败隔离和退出清理，以及 Cloud Token 当前复用、并发单飞刷新与退出失效。当前自动化测试不会读写真实用户 Keychain，而是通过与生产 `SystemAuthCredentialStore` 相同的事务逻辑注入内存后端；Windows Credential Manager、macOS Keychain 与 Linux Secret Service 仍需要相应平台的发布包手工验收。2026-07-18 用户已完成第 13、14 节所覆盖的 Windows NSIS、真实 Logto 与真实头像基础闭环验收，该验收发生在 Keychain cutover 之前；2026-08-05 用户进一步确认 Windows 开发环境在 Keychain cutover 后能够完成真实 NIEEX Account 登录，并使用旧 Third-party App 完成真实 Cloud Bootstrap：连续两次调用均成功、返回同一内部账户，账户为 `active`、初始订阅为 `free/active`、连接同步为 `not_entitled`、`policyVersion = 1`，且验收未输出 JWT 或外部身份。同日嵌入式 Provider 已切换到新的第一方 Native App，用户确认新应用真实登录正常，第一方 Client cutover 可以收尾并进入下一阶段；尚未据此宣称迁移前后 `account.id` 对比、正式安装包 Keychain 条目、重启恢复、本地退出和重启后匿名已经复验，这些项目保留为后续真实联调与发布回归项。受 Fake-IP DNS 影响时头像按设计降级，切换到可提供公网解析的 VPN 后验证显示正常。连接资产同步已端到端实现：`src-tauri/src/cloud/` 的 `sync_upload.rs`、`sync_pull.rs`、`sync_apply.rs` 与 `sync_scheduler.rs` 覆盖上传、拉取、应用与调度，IPC 命令包括 `sync_cloud_now`、`list_cloud_sync_conflicts` 与 `resolve_cloud_sync_conflict`；团队、订阅购买、移动端与 React Access Token IPC 仍不可用。
 
 配置和平台行为依据 [Tauri v2 Deep Linking 官方文档](https://v2.tauri.app/zh-cn/plugin/deep-linking/)；当前第一方 Logto Native/Public Client、Rotation 与 TTL 依据 [Logto Application data structure](https://docs.logto.io/integrate-logto/application-data-structure)，旧应用迁移历史中的第三方 scope allowlist 与 Consent 依据 [Logto Third-party Application Permission Management](https://docs.logto.io/integrate-logto/third-party-applications/permission-management)，用户名到 `preferred_username` 的回退及 `avatar` 到标准 `picture` Claim 的映射依据 [Logto User data structure](https://docs.logto.io/user-management/user-data)；Provider 运行时行为以标准 OIDC Discovery 和真实 Logto 元数据为准。

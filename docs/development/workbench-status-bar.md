@@ -227,10 +227,13 @@ src/features/workbench/status-bar/
 ├── contributors/
 │   ├── active-context-status-contributor.tsx
 │   ├── ai-runtime-warning-status-contributor.tsx
+│   ├── cloud-status-contributor.tsx
+│   ├── cloud-sync-status-contributor.tsx
 │   ├── connection-status-contributor.tsx
 │   ├── connection-summary-status-contributor.tsx
 │   ├── key-value-status-contributor.tsx
 │   ├── readiness-status-contributor.tsx
+│   ├── schema-design-status-contributor.tsx
 │   ├── sql-editor-status-contributor.tsx
 │   ├── table-data-status-contributor.tsx
 │   └── table-design-status-contributor.tsx
@@ -275,6 +278,7 @@ export type WorkbenchStatusItemTone =
     | "default"
     | "muted"
     | "success"
+    | "info"
     | "warning"
     | "error";
 
@@ -284,7 +288,7 @@ export interface WorkbenchStatusContext {
     activeTab: WorkbenchTab | null;
     tabs: WorkbenchTab[];
     connectionSessions: Record<string, ISessionState>;
-    tabRuntimeState: TabRuntimeStateSnapshot;
+    tabRuntimeState: WorkbenchStatusRuntimeStateSnapshot;
     layout: {
         leftSidebarCollapsed: boolean;
         rightSidebarCollapsed: boolean;
@@ -297,6 +301,7 @@ export interface WorkbenchStatusContext {
     agent: {
         composerSendBlocker: AgentComposerSendBlocker | null;
     };
+    cloud: CloudDesktopStateProjection | null;
     nowMs: number;
     actions: {
         focusTab(tabId: string): void;

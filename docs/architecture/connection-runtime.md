@@ -110,7 +110,7 @@ SSL/TLS 仍由各驱动映射：
 
 ## 3. Capability Traits
 
-`src-tauri/src/engine/driver.rs` 定义统一能力接口：
+`src-tauri/src/engine/driver.rs` 定义统一能力接口（`NativeSchemaExtension` 位于 `src-tauri/src/engine/native_schema.rs`）：
 
 | Trait | 职责 | 首批驱动 |
 |-------|------|----------|
@@ -274,11 +274,11 @@ Snapshot 只恢复连接 runtime 事实，不携带某个 WebView 已加载的 E
 
 | Tab | Payload | 数据入口 |
 |-----|---------|----------|
-| `table_data` | `{ profileId, container }` | `useTableData` -> `browse_table_data`，仅 table/view/materialized_view |
+| `table_data` | `{ profileId, tabRuntimeId, runtime, container }` | `useTableData` -> `browse_table_data`，仅 table/view/materialized_view |
 | `key_value` | `{ profileId, dbIndex, pattern?, selectedKey? }` | `useKeyTree` / `useKeyValue` |
-| `sql_editor` | `{ profileId, tabRuntimeId, savedQueryId?, initialContext? }` | focused 与脚本 statement 都按可选 `sqlExecution.managedLifecycle` 选择 managed lifecycle 或同一 adapter 内的 legacy `execute_sql`；保存查询走本地 Storage IPC |
+| `sql_editor` | `{ profileId, tabRuntimeId, runtime, savedQueryId?, initialContext? }` | focused 与脚本 statement 都按可选 `sqlExecution.managedLifecycle` 选择 managed lifecycle 或同一 adapter 内的 legacy `execute_sql`；保存查询走本地 Storage IPC |
 | `clickhouse_table_design` | `{ profileId, tabRuntimeId, mode, container?, parentContainer? }` | ClickHouse Table/Object native schema Describe/Create/Change；tab 自己拥有后端 runtime |
-| `clickhouse_view_design` | `{ profileId, mode, family, container?, parentContainer?, ownerTabRuntimeId? }` | persistent View/MV 使用 shared runtime；Temporary 复用 owner SQL tab runtime，designer 本身不单独 open/close runtime |
+| `clickhouse_view_design` | `{ profileId, tabRuntimeId, mode, container?, parentContainer?, ownerTabRuntimeId? }` | persistent View/MV 使用 shared runtime；Temporary 复用 owner SQL tab runtime，designer 本身不单独 open/close runtime |
 
 Redis key-value tab 仍以 `browse_key_tree` 作为完整 key 树数据源，但前端会将已加载树节点展开为扁平可见行模型，并通过虚拟列表渲染这些行。该优化只减少大前缀展开后的 DOM、layout 与 paint 压力，不改变 Redis scan 语义、前缀计数口径或 IPC 契约。
 
