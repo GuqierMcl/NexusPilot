@@ -3,6 +3,7 @@ import {
     type PrepareSendMessagesRequest,
     type UIMessage,
 } from "ai";
+import { readComposerReferenceMetadata, splitReferencedText, validateReferenceMessage, validateTextReferences } from "../../../../../shared/composer-references";
 
 import type {
     RunAgentMode,
@@ -265,6 +266,10 @@ function findLastUserMessage(messages: UIMessage[]): UIMessage | null {
 
 function extractRunInputParts(message: UIMessage): RunCreateInputPart[] {
     const result: RunCreateInputPart[] = [];
+    const annotated = readComposerReferenceMetadata(message.metadata);
+    const textParts = message.parts.filter((part) => part.type === "text").map((part) => part.text);
+    const annotations = annotated?.text === textParts.join("\n\n") ? splitReferencedText(annotated, textParts) : [];
+    let textIndex = 0;
 
     for (const part of message.parts) {
         if (!isRecord(part)) {
@@ -304,9 +309,15 @@ function extractRunInputParts(message: UIMessage): RunCreateInputPart[] {
         }
 
         const partText = partRecord.text;
-        const text = typeof partText === "string" ? partText.trim() : "";
+        const rawText = typeof partText === "string" ? partText : "";
+        const references = "references" in partRecord && partRecord.references !== undefined
+            ? validateTextReferences(rawText, partRecord.references)
+            : annotations[textIndex]?.references;
+        const command = annotations[textIndex]?.command;
+        textIndex++;
+        const text = references || command ? rawText : rawText.trim();
         if (text.length > 0) {
-            result.push({ type: "text", text });
+            result.push({ type: "text", text, ...(references ? { references } : {}), ...(command ? { command } : {}) });
         }
     }
 
@@ -317,6 +328,7 @@ function extractRunInputParts(message: UIMessage): RunCreateInputPart[] {
         );
     }
 
+    validateReferenceMessage(result.filter((part) => part.type === "text"));
     return result;
 }
 

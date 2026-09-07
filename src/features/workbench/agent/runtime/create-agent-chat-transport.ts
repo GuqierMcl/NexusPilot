@@ -1,4 +1,5 @@
 import type { HttpChatTransportInitOptions, UIMessage } from "ai";
+import { useComposerRecovery } from "../composer/composer-recovery";
 
 import {
     AI_RUNTIME_RUNS_PATH,
@@ -49,24 +50,30 @@ export function buildAgentRuntimeApiUrl(baseUrl: string): string {
 export function createAgentRuntimeTransportOptions(
     input: CreateAgentRuntimeTransportOptionsInput,
 ): HttpChatTransportInitOptions<UIMessage> {
-    const prepareRunSendMessagesRequest = createPrepareRunSendMessagesRequest({
-        baseUrl: input.baseUrl,
-        getSelectedModel: input.getSelectedModel,
-        getSelectedAgentMode: input.getSelectedAgentMode,
-        getConversationId: input.getConversationId,
-        consumeReplacementMessageId: input.consumeReplacementMessageId,
-        getActiveRunId: input.getActiveRunId,
-    });
-
     return {
         api: buildAgentRuntimeApiUrl(input.baseUrl),
-        ...(input.fetch || input.onRuntimeResponse || input.accessToken
-            ? { fetch: createRuntimeHeaderAwareFetch(input) }
-            : {}),
+        fetch: createRuntimeHeaderAwareFetch(input),
         prepareSendMessagesRequest: async (request) => {
+            let replacementId: string | undefined;
+            const userMessage = request.messages.at(-1);
+            const prepareRunSendMessagesRequest = createPrepareRunSendMessagesRequest({
+                ...input,
+                consumeReplacementMessageId: () => {
+                    replacementId = input.consumeReplacementMessageId?.() ?? undefined;
+                    return replacementId;
+                },
+            });
+            const stage = (failed: boolean): void => {
+                if (userMessage?.role === "user") useComposerRecovery.getState().stage(request.id, {
+                    message: userMessage, replaceFromMessageId: replacementId, failed,
+                });
+            };
             try {
-                return await prepareRunSendMessagesRequest(request);
+                const prepared = await prepareRunSendMessagesRequest(request);
+                stage(false);
+                return prepared;
             } catch (error) {
+                stage(true);
                 const message = formatRunRequestAdapterError(error);
                 if (message) {
                     input.onRequestAdapterError?.(message);
@@ -103,12 +110,17 @@ function createRuntimeHeaderAwareFetch(
                 headers: appendAiRuntimeAuthorization(init?.headers, input.accessToken ?? null),
             });
         } catch (error) {
+            if (clientThreadId) useComposerRecovery.getState().fail(clientThreadId);
             if (isAiRuntimeTransportError(error)) {
                 throw new Error(getAiRuntimeUserFacingErrorMessage(error));
             }
             throw error;
         }
 
+        if (clientThreadId) {
+            if (response.ok) useComposerRecovery.getState().clear(clientThreadId);
+            else useComposerRecovery.getState().fail(clientThreadId);
+        }
         input.onRuntimeResponse?.({
             conversationId: response.headers.get("x-nexus-conversation-id"),
             runId: response.headers.get("x-nexus-run-id"),

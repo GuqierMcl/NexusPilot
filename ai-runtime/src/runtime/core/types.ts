@@ -302,6 +302,9 @@ export interface BasePart {
 export interface TextPart extends BasePart {
   type: "text";
   text: string;
+  references?: import("../../../../shared/composer-references").TextReferences;
+  command?: import("../../../../shared/composer-commands").CommandBinding;
+  commandPrompt?: string;
   synthetic?: boolean;
   ignored?: boolean;
 }

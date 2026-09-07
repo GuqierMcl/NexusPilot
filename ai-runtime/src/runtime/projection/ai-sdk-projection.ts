@@ -1,3 +1,4 @@
+import { combineReferencedTexts } from "../../../../shared/composer-references";
 import type {
   InterruptReason,
   Message,
@@ -281,6 +282,8 @@ function buildMessageMetadata(
     nexus,
     custom: {
       nexus,
+      ...(message.role === "user" && message.parts.some((part) => part.type === "text" && (part.references || part.command))
+        ? { composerReferences: combineReferencedTexts(message.parts.filter((part) => part.type === "text")) } : {}),
       ...(aiSdkUsage ? { usage: aiSdkUsage } : {}),
     },
     ...(aiSdkUsage ? { usage: aiSdkUsage } : {}),

@@ -1,5 +1,6 @@
 "use client";
 
+import { createComposerMessage } from "./composer-message-adapter";
 import {
     AssistantRuntimeProvider,
     RuntimeAdapterProvider,
@@ -225,6 +226,7 @@ export function AgentAssistantRuntimeProvider({
         runtimeHook: () =>
             useChatRuntime({
                 transport,
+                toCreateMessage: createComposerMessage,
                 adapters: { attachments: attachmentAdapter },
                 sendAutomaticallyWhen:
                     lastAssistantMessageIsCompleteWithApprovalResponses,

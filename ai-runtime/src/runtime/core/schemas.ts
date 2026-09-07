@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { commandBindingSchema } from "../../../../shared/composer-commands";
+import { textReferencesSchema, validateReferenceMessage } from "../../../../shared/composer-references";
 import { DEFAULT_CONTEXT_COMPACTION_POLICY } from "../context/policy";
 
 const unknownRecordSchema = z.record(z.string(), z.unknown());
@@ -420,6 +422,15 @@ export const partSchema = z.discriminatedUnion("type", [
     text: z.string(),
     synthetic: z.boolean().optional(),
     ignored: z.boolean().optional(),
+    references: textReferencesSchema.optional(),
+    command: commandBindingSchema.optional(),
+    commandPrompt: z.string().min(1).max(32768).optional(),
+  }).superRefine((part, ctx) => {
+    try {
+      validateReferenceMessage([part]);
+      if (Boolean(part.command) !== (part.commandPrompt !== undefined)) throw new Error("Missing command snapshot");
+    }
+    catch { ctx.addIssue({ code: "custom", message: "Invalid text references", path: ["references"] }); }
   }),
   z.object({
     ...basePartShape,

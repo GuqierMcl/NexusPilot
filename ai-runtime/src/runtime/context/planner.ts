@@ -335,12 +335,16 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
         && cursor.runId === input.runId
         && cursor.throughRequestIndex < input.requestIndex;
     });
+  const rawWithinBudget = rawContentTokens <= (rawBudget.hardInputBudget ?? Number.NEGATIVE_INFINITY)
+    && rawContentTokens < (rawBudget.softTriggerTokens ?? Number.NEGATIVE_INFINITY);
   if (
     input.trigger !== "provider_overflow"
+    && input.trigger !== "manual"
+    && !input.snapshot.checkpoints.some((checkpoint) => checkpoint.trigger === "manual"
+      && (input.contextWindow ?? Infinity) <= (checkpoint.budget.contextWindow ?? 0)
+      && lineageRunIds.includes(checkpoint.coverageThroughRunId))
     && !hasCurrentRunSealedCheckpoint
-    &&
-    rawContentTokens <= (rawBudget.hardInputBudget ?? Number.NEGATIVE_INFINITY)
-    && rawContentTokens < (rawBudget.softTriggerTokens ?? Number.NEGATIVE_INFINITY)
+    && rawWithinBudget
   ) {
     return createPlan(input, {
       lineageRunIds,
@@ -398,7 +402,7 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
     );
   const selected = candidates[0];
   const checkpointRejections = evaluatedRejections;
-  if (selected) {
+  if (selected && (input.trigger !== "manual" || selected.coverageIndex === safeCoverageIndices.at(-1))) {
     return createPlan(input, {
       lineageRunIds,
       rawRuns: selected.rawRuns,
@@ -418,6 +422,11 @@ export function planContextWindow(input: ContextPlannerInput): ContextPlan {
     });
   }
 
+  // A stale or incompatible manual checkpoint must not force an otherwise
+  // unnecessary automatic compaction. Only a validated candidate may win.
+  if (input.trigger !== "manual" && input.trigger !== "provider_overflow" && !hasCurrentRunSealedCheckpoint && rawWithinBudget) {
+    return createPlan(input, { lineageRunIds, rawRuns: lineage.runs, view: "raw", reason: "raw_within_budget", safetyState, budget: rawBudget, checkpointRejections });
+  }
   const eligibleCoverageIndex = safeCoverageIndices.at(-1);
   const eligibleCoverageCursor: ContextCoverageCursor | undefined =
     safeSealedStepCursor

@@ -13,6 +13,9 @@ import { useSettingsStore } from "@/store/slices/settings-slice";
 import { AgentComposerControls } from "./AgentComposerControls";
 import { AgentContextCompactionActivity } from "./AgentContextCompactionActivity";
 import { AgentRuntimeMessageStatus } from "./AgentRuntimeMessageStatus";
+import { WorkbenchComposerProvider } from "../composer/composer-context";
+import { WorkbenchComposerOperations } from "../composer/composer-operations";
+import { AgentComposerInput, AgentComposerSend, AgentUserMessageContent } from "../composer/AgentComposerInput";
 
 interface AgentConversationProps {
   onModelSettingsRequested?: () => void;
@@ -43,12 +46,16 @@ export function AgentConversation({
 
   return (
     <AgentModelSettingsRequestContext.Provider value={onModelSettingsRequested}>
+      <WorkbenchComposerOperations><WorkbenchComposerProvider>
       <div className="min-h-0 flex-1 overflow-hidden">
         <ConversationThread
           variant="workbench"
           onUserMessageEditStart={messageEditController?.beginEdit}
           onUserMessageEditCancel={messageEditController?.cancelEdit}
           components={{
+            ComposerInput: AgentComposerInput,
+            ComposerSendAction: AgentComposerSend,
+            UserMessageContent: AgentUserMessageContent,
             AssistantMessageStatus: AgentRuntimeMessageStatus,
             DataPart: AgentContextCompactionActivity,
             ComposerFooterStart: AgentComposerControlsWithSettings,
@@ -56,6 +63,7 @@ export function AgentConversation({
           }}
         />
       </div>
+      </WorkbenchComposerProvider></WorkbenchComposerOperations>
     </AgentModelSettingsRequestContext.Provider>
   );
 }

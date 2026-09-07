@@ -61,6 +61,7 @@ import {
   useRef,
   useState,
   type ComponentType,
+  type ComponentProps,
   type FC,
   type PropsWithChildren,
   type ReactNode,
@@ -82,6 +83,9 @@ export interface ThreadDataPartProps {
  * `ToolFallback`.
  */
 export type ThreadComponents = {
+  ComposerInput?: ComponentType<ComponentProps<typeof ComposerPrimitive.Input> & { editing?: boolean }>;
+  ComposerSendAction?: ComponentType;
+  UserMessageContent?: ComponentType;
   AssistantMessage?: ComponentType | undefined;
   AssistantMessageStatus?: ComponentType | undefined;
   ComposerCancelAction?: ComponentType | undefined;
@@ -609,6 +613,7 @@ const ThreadWelcome: FC = () => {
 };
 
 const Composer: FC<{ variant: ThreadVariant }> = ({ variant }) => {
+  const { ComposerInput = ComposerPrimitive.Input } = useContext(ThreadComponentsContext);
   const isWorkbench = variant === "workbench";
 
   return (
@@ -622,7 +627,7 @@ const Composer: FC<{ variant: ThreadVariant }> = ({ variant }) => {
           )}
         >
           <ComposerAttachments />
-          <ComposerPrimitive.Input
+          <ComposerInput
             placeholder="尽管说，什么都可以..."
             className={cn(
               "aui-composer-input placeholder:text-muted-foreground/80 w-full resize-none bg-transparent outline-none",
@@ -642,7 +647,7 @@ const Composer: FC<{ variant: ThreadVariant }> = ({ variant }) => {
 };
 
 const ComposerAction: FC = () => {
-  const { ComposerCancelAction, ComposerFooterStart, ComposerFooterStatus } =
+  const { ComposerCancelAction, ComposerFooterStart, ComposerFooterStatus, ComposerSendAction } =
     useContext(ThreadComponentsContext);
 
   return (
@@ -690,7 +695,7 @@ const ComposerAction: FC = () => {
           </AuiIf>
         </AuiIf>
         <AuiIf condition={(s) => !s.thread.isRunning}>
-          <ComposerPrimitive.Send asChild>
+          {ComposerSendAction ? <ComposerSendAction /> : <ComposerPrimitive.Send asChild>
             <TooltipIconButton
               tooltip="发送"
               side="bottom"
@@ -702,7 +707,7 @@ const ComposerAction: FC = () => {
             >
               <ArrowUpIcon className="aui-composer-send-icon size-4.5" />
             </TooltipIconButton>
-          </ComposerPrimitive.Send>
+          </ComposerPrimitive.Send>}
         </AuiIf>
         <AuiIf condition={(s) => s.thread.isRunning}>
           {ComposerCancelAction ? (
@@ -1016,6 +1021,7 @@ const AssistantActionBar: FC = () => {
 };
 
 const UserMessage: FC = () => {
+  const { UserMessageContent } = useContext(ThreadComponentsContext);
   return (
     <MessagePrimitive.Root
       data-slot="aui_user-message-root"
@@ -1026,7 +1032,7 @@ const UserMessage: FC = () => {
 
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
         <div className="aui-user-message-content peer bg-muted text-foreground rounded-xl px-4 py-2 wrap-break-word empty:hidden">
-          <MessagePrimitive.Parts />
+          {UserMessageContent ? <UserMessageContent /> : <MessagePrimitive.Parts />}
         </div>
         <div className="aui-user-action-bar-wrapper absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 peer-empty:hidden rtl:translate-x-full">
           <UserActionBar />
@@ -1074,6 +1080,8 @@ const UserActionBar: FC = () => {
 };
 
 const EditComposer: FC = () => {
+  const { ComposerInput } = useContext(ThreadComponentsContext);
+  const Input = ComposerInput ?? ComposerPrimitive.Input;
   const aui = useAui();
   const { onUserMessageEditCancel } = useContext(ThreadEditCallbacksContext);
   const removedMessageCount = useAuiState((state) => {
@@ -1099,8 +1107,10 @@ const EditComposer: FC = () => {
       data-slot="aui_edit-composer-wrapper"
       className="flex flex-col px-2"
     >
-      <ComposerPrimitive.Root className="aui-edit-composer-root bg-background border-border/60 dark:border-muted-foreground/15 dark:bg-muted/30 ms-auto flex w-full max-w-[85%] flex-col rounded-3xl border shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] dark:shadow-none">
-        <ComposerPrimitive.Input
+      <ComposerPrimitive.Root onSubmit={ComposerInput ? (event) => { event.preventDefault(); if (!isSendDisabled) sendEditedMessage(); } : undefined} className="aui-edit-composer-root bg-background border-border/60 dark:border-muted-foreground/15 dark:bg-muted/30 ms-auto flex w-full max-w-[85%] flex-col rounded-3xl border shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] dark:shadow-none">
+        <Input
+          {...(ComposerInput ? { editing: true } : {})}
+          aria-label="编辑消息"
           className="aui-edit-composer-input text-foreground min-h-14 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm outline-none"
           autoFocus
           onKeyDown={(event) => {
@@ -1126,11 +1136,11 @@ const EditComposer: FC = () => {
             </Button>
           </ComposerPrimitive.Cancel>
           <Button
-            type="button"
+            type={ComposerInput ? "submit" : "button"}
             size="sm"
             className="h-8 rounded-full px-3.5"
             disabled={isSendDisabled}
-            onClick={sendEditedMessage}
+            onClick={ComposerInput ? undefined : sendEditedMessage}
           >
             发送
           </Button>

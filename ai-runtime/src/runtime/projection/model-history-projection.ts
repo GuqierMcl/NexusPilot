@@ -1,3 +1,4 @@
+import { projectReferencedText } from "../../../../shared/composer-references";
 import type {
   AssistantContent,
   ModelMessage,
@@ -76,7 +77,7 @@ export async function projectModelHistory(
       const content: UserContent = [];
       for (const part of message.parts) {
         if (isPromptTextPart(part) && part.text.trim().length > 0) {
-          content.push({ type: "text", text: part.text });
+          content.push({ type: "text", text: projectReferencedText(part) });
           continue;
         }
         if (isPromptFilePart(part)) {

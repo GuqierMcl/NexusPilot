@@ -335,6 +335,7 @@ export class ContextCompactionService {
       usage: checkpointUsage,
       time: { created: checkpointCreatedAt },
     };
+      input.abortSignal?.throwIfAborted();
       this.renewPreparationClaim(input.preparationClaim);
       const committed = this.store.commitContextCheckpoint({
         checkpoint,
@@ -399,6 +400,8 @@ export class ContextCompactionService {
     status: "failed" | "interrupted",
   ): void {
     try {
+      const current = this.store.listContextCompactionActivitiesByRun(input.runId).find((item) => item.id === activity.id);
+      if (current && current.status !== "preparing") return;
       this.store.finishContextCompactionActivity({
         activityId: activity.id,
         status,

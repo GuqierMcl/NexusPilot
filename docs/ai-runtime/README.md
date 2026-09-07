@@ -16,6 +16,7 @@ Status: **Current**
 - Conversation history is append-only: the Audit Transcript retains every branch, while the default UI and model history use the Conversation's active Run lineage.
 - Context planning is a derived, request-scoped view evaluated before every model request: deterministic Safety State plus either full raw active history or a compatible Run/sealed-step checkpoint and exact raw suffix. Checkpoints never replace audit history.
 - Compaction lifecycle is a durable, independently ordered `ContextCompactionActivity`; `preparing/created/failed/recovered/interrupted` appears at the real request boundary and never enters the Provider prompt.
+- Manual `/compact` uses a persisted conversation operation and the same checkpoint service; it allocates an unused context slot on a terminal head without creating chat messages. `/explain` persists a short command binding and a Runtime-owned prompt snapshot; only the model projection expands that snapshot. See [composer-references.md](./composer-references.md).
 - `Run.usage` is cumulative billing usage. Request-scoped `ContextUsage` retains each request estimate and Provider observation, while its durable `nextTurnForecast` powers the primary context-window display after a run finishes.
 
 ## Documentation map
@@ -32,6 +33,7 @@ Status: **Current**
 | [settings.md](./settings.md) | Runtime-owned settings and per-run freezing. |
 | [provider-model.md](./provider-model.md) | models.dev catalog, provider configuration, credentials, and model resolution. |
 | [attachment-storage.md](./attachment-storage.md) | Current Runtime-owned chat attachment storage, upload, lifecycle, and multimodal model-input contract. |
+| [composer-references.md](./composer-references.md) | Typed composer references, local commands, extension registries, persistence, projections, and failure recovery. |
 | [Context-compaction specification](../comet/changes/ai-runtime-context-compaction/specs/agent-context-compaction/spec.md) | Binding current behavior for branch-aware context planning, checkpoints, Safety State, and overflow recovery. |
 | [live-eventbus-sse.md](./live-eventbus-sse.md) | Live-only EventBus and scoped SSE. |
 | [communication-boundaries.md](./communication-boundaries.md) | Frontend HTTP/SSE, backend bridge, and health responsibilities. |

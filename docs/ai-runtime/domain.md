@@ -50,6 +50,7 @@ ai-runtime/src/runtime/context/
 ├── planner.ts               # deterministic active-lineage context plans
 ├── model-context-manager.ts # request preparation, replan and projection
 ├── compaction-service.ts    # single checkpoint generation/CAS seam
+├── manual-compaction-service.ts # durable conversation operation, idempotency and cancellation
 ├── safety-state.ts          # structured cross-branch effect projection
 └── types.ts                 # checkpoint, plan, budget, usage and claim contracts
 
@@ -157,6 +158,8 @@ AI SDK UIMessage Snapshot 把该状态投影到 `metadata.custom.nexus.status.er
 - `runtime_context_usage`
 - `runtime_context_preparation_claims`
 - `runtime_context_diagnostics`
+- `runtime_context_compaction_activities`
+- `runtime_manual_compactions`：独立手动压缩操作、幂等键、来源 head、分配的上下文请求槽位与可恢复生命周期；不创建合成 Run 或聊天消息。具体契约见 [composer-references.md](./composer-references.md)。
 
 ### Runtime Migration Manager
 

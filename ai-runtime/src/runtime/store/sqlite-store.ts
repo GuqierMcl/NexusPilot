@@ -368,6 +368,9 @@ export class RuntimeSqliteStore {
         }
         this.insertConversation(conversation);
       } else {
+        if (this.getConversation(conversation.id)?.time.compacting !== undefined) {
+          throw new Error("Conversation is being compacted");
+        }
         if (conversation.revision !== input.expectedConversationRevision + 1) {
           throw new Error(
             `Run start must advance Conversation revision exactly once from ` +

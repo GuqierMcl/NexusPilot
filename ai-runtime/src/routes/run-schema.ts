@@ -1,4 +1,7 @@
 import { z } from "zod";
+import { commandBindingSchema } from "../../../shared/composer-commands";
+import { messageCommands } from "../runtime/commands/message-commands";
+import { textReferencesSchema, validateReferenceMessage } from "../../../shared/composer-references";
 import type {
   AttachmentId,
   RuntimePermissionResponseInput,
@@ -22,7 +25,9 @@ export interface ParsedRunContinueRequest {
 const textInputPartSchema = z
   .object({
     type: z.literal("text"),
-    text: z.string().trim().min(1),
+    text: z.string().refine((value) => value.trim().length > 0),
+    references: textReferencesSchema.optional(),
+    command: commandBindingSchema.optional(),
   })
   .strict();
 
@@ -98,12 +103,16 @@ export function parseRunCreateRequestBody(body: unknown): ParsedRunCreateRequest
 
   const parts = result.data.input.parts.map((part) =>
     part.type === "text"
-      ? { type: "text" as const, text: part.text }
+      ? { type: "text" as const, text: part.references || part.command ? part.text : part.text.trim(), ...(part.references ? { references: part.references } : {}), ...(part.command ? { command: part.command } : {}) }
       : {
           type: "file" as const,
           attachmentId: part.attachment_id as AttachmentId,
         },
   );
+  try {
+    validateReferenceMessage(parts.filter((part) => part.type === "text"));
+    for (const part of parts) if (part.type === "text" && part.command) messageCommands.resolve(part.command);
+  } catch { return null; }
   const text = parts
     .filter((part) => part.type === "text")
     .map((part) => part.text)

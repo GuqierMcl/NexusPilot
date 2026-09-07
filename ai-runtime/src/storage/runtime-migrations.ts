@@ -865,4 +865,24 @@ export const RUNTIME_MIGRATIONS: RuntimeMigration[] = [
         );
     `,
   },
+  {
+    id: "0015_runtime_manual_compactions",
+    description: "Persist idempotent manual context operations without creating chat Runs",
+    sql: `
+      CREATE TABLE runtime_manual_compactions (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES runtime_conversations(id) ON DELETE CASCADE,
+        request_key TEXT NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runtime_runs(id) ON DELETE CASCADE,
+        request_index INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(conversation_id, request_key),
+        UNIQUE(run_id, request_index)
+      );
+      CREATE UNIQUE INDEX idx_manual_compaction_active
+        ON runtime_manual_compactions(conversation_id) WHERE status = 'preparing';
+    `,
+  },
 ];

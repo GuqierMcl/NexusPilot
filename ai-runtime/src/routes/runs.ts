@@ -1,4 +1,6 @@
 import { Elysia } from "elysia";
+import { commandBindingOpenApiSchema } from "../../../shared/composer-commands";
+import { textReferencesOpenApiSchema } from "../../../shared/composer-references";
 import { detailError } from "../core/errors";
 import {
   ProviderLanguageModelError,
@@ -85,6 +87,10 @@ export function runRoutes(deps: RunRouteDeps) {
       const body = await parseJsonBody(request);
       const parsed = parseRunCreateRequestBody(body);
       if (!parsed) {
+        if (isRecord(body) && isRecord(body.input) && Array.isArray(body.input.parts)
+          && body.input.parts.some((part) => isRecord(part) && ("references" in part || "command" in part))) {
+          return Response.json({ code: "INVALID_RUN_INPUT", message: "消息输入或引用格式无效，请检查类型、正文范围和数量限制。" }, { status: 422 });
+        }
         if (containsFileInputPart(body)) {
           return Response.json(
             {
@@ -429,6 +435,11 @@ const runInputTextPartSchema: OpenApiSchema = {
     text: {
       ...stringSchema,
       description: "用户输入文本。",
+    },
+    command: commandBindingOpenApiSchema() as OpenApiSchema,
+    references: {
+      ...textReferencesOpenApiSchema() as OpenApiSchema,
+      description: "显式引用标注；范围使用 UTF-16，消息最多 32 处引用、16 个目标和 32 KiB。业务载荷还须通过已注册类型的严格校验。",
     },
   },
 };

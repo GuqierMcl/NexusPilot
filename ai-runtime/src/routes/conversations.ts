@@ -670,6 +670,7 @@ function updateConversation(input: {
 
 function hasActiveRun(conversation: Conversation): boolean {
   return (
+    conversation.time.compacting !== undefined ||
     conversation.status.type === "busy" ||
     conversation.status.type === "waiting_for_permission"
   );

@@ -1,3 +1,5 @@
+import type { TextReferences } from "../../../shared/composer-references";
+
 export const AI_RUNTIME_RUNS_PATH = "/v1/runs";
 
 export function buildRunContinuePath(runId: string): string {
@@ -29,6 +31,8 @@ export interface RunCreateRequestModel {
 export interface RunCreateTextInputPart {
     type: "text";
     text: string;
+    references?: TextReferences;
+    command?: import("../../../shared/composer-commands").CommandBinding;
 }
 
 export interface RunCreateFileInputPart {

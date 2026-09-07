@@ -1,4 +1,6 @@
 import type { RuntimeId, RuntimeIdPrefix } from "../core/ids";
+import { messageCommands } from "../commands/message-commands";
+import { validateReferenceMessage } from "../../../../shared/composer-references";
 import type {
   AgentMode,
   AttachmentId,
@@ -90,7 +92,7 @@ export interface RunRequest {
 }
 
 export type RunRequestInputPart =
-  | { type: "text"; text: string }
+  | { type: "text"; text: string; command?: import("../../../../shared/composer-commands").CommandBinding; commandPrompt?: string; references?: import("../../../../shared/composer-references").TextReferences }
   | { type: "file"; attachmentId: AttachmentId };
 
 export interface NormalizedRunRequest {
@@ -290,6 +292,7 @@ export type RunExecutionResult =
 
 export function normalizeRunRequest(request: RunRequest): NormalizedRunRequest {
   const parts = normalizeRunInputParts(request);
+  validateReferenceMessage(parts.filter((part) => part.type === "text"));
   const text = parts
     .filter((part): part is Extract<RunRequestInputPart, { type: "text" }> =>
       part.type === "text",
@@ -331,11 +334,11 @@ function normalizeRunInputParts(request: RunRequest): RunRequestInputPart[] {
     if (part.type === "file") {
       return part;
     }
-    const text = part.text.trim();
+    const text = part.references || part.command ? part.text : part.text.trim();
     if (!text) {
       throw new Error("RunRequest text parts must not be empty");
     }
-    return { type: "text", text };
+    return { type: "text", text, ...(part.references ? { references: part.references } : {}), ...(part.command ? { command: part.command, commandPrompt: messageCommands.resolve(part.command) } : {}) };
   });
 }
 

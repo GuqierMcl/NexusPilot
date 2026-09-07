@@ -1,4 +1,5 @@
 import type { DiffArtifact, DiffLine, Message, Part } from "../core/types";
+import { combineReferencedTexts } from "../../../../shared/composer-references";
 
 export interface UiMessageLike {
   id: string;
@@ -30,6 +31,8 @@ export function projectMessageToUiMessage(message: Message): UiMessageLike {
     role: message.role,
     parts: message.parts.flatMap(projectPartToUiParts),
     metadata: {
+      ...(message.role === "user" && message.parts.some((part) => part.type === "text" && (part.references || part.command))
+        ? { custom: { composerReferences: combineReferencedTexts(message.parts.filter((part) => part.type === "text")) } } : {}),
       nexus: {
         conversationId: message.conversationId,
         messageMetadata: message.metadata,

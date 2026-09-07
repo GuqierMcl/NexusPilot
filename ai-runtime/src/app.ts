@@ -16,6 +16,10 @@ import { ProviderService } from "./provider/service";
 import { agentModeRoutes } from "./routes/agent-modes";
 import { attachmentRoutes } from "./routes/attachments";
 import { conversationRoutes } from "./routes/conversations";
+import { manualCompactionRoutes } from "./routes/manual-compactions";
+import { ManualCompactionService } from "./runtime/context/manual-compaction-service";
+import { resolveProviderLanguageModel } from "./provider/language-model";
+import { resolveAgentExecutionPolicy } from "./runtime/agents/agent-resolver";
 import { eventRoutes } from "./routes/events";
 import { healthRoutes } from "./routes/health";
 import { providerRoutes } from "./routes/providers";
@@ -204,6 +208,21 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
       })
     : undefined;
 
+  const manualCompactions = runtimeDatabase && runtimeStore && contextCompactionService && contextManager
+    ? new ManualCompactionService({
+        db: runtimeDatabase, store: runtimeStore, compactor: contextCompactionService, manager: contextManager,
+        resolvePolicy: (runId, resolved) => resolveAgentExecutionPolicy({
+          runId, agentMode: runtimeStore.getRun(runId)?.agentMode, provider: resolved.runtimeContext.provider,
+          toolRegistry, backendBridgeState: backendBridge.snapshot().state,
+          approvalPolicy: runtimeSettingsService.snapshot().toolPolicy, networkPolicy: runtimeSettingsService.snapshot().networkPolicy,
+        }),
+        resolveModel: deps.resolveLanguageModel ?? ((input) => {
+          if (!providerService) throw new Error("Provider service unavailable");
+          return resolveProviderLanguageModel(providerService, input);
+        }),
+      }) : undefined;
+  manualCompactions?.repair();
+
   return new Elysia({
     serve: {
       // Long-running model requests, context compaction, tool execution, and
@@ -314,8 +333,9 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
       }
     })
     .decorate("runtimeStore", runtimeStore)
-    .onStop(() => {
+    .onStop(async () => {
       backendBridge.shutdown();
+      await manualCompactions?.stop();
       preparedInvocations.clearAll();
       attachmentService?.dispose();
       if (ownsRuntimeDatabase) {
@@ -340,6 +360,7 @@ export async function createApp(config: AppRuntimeConfig, deps: AppFactoryDeps =
       preparedInvocations,
     }))
     .use(runHistoryRoutes({ runtimeStore }))
+    .use(manualCompactionRoutes(manualCompactions))
     .use(eventRoutes({ eventBus: runtimeEventBus }))
     .use(
       runRoutes({

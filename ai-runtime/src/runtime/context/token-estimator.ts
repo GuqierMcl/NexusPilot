@@ -1,4 +1,5 @@
 import type { Message, Part, ToolPart } from "../core/types";
+import { projectReferencedText } from "../../../../shared/composer-references";
 
 export const CONTEXT_ESTIMATOR_OVERHEAD = Object.freeze({
   /** Model-message role/framing allowance. */
@@ -50,7 +51,7 @@ function estimateProjectedPartTokens(role: Message["role"], part: Part): number 
       return 0;
     }
     return CONTEXT_ESTIMATOR_OVERHEAD.part
-      + estimateTextTokens(part.text)
+      + estimateTextTokens(role === "user" ? projectReferencedText(part) : part.text)
       + estimateOptionalMetadata(part.metadata);
   }
   if (part.type === "reasoning" && role === "assistant") {

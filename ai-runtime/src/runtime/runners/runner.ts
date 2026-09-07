@@ -161,7 +161,15 @@ export class RuntimeRunner {
           time: { created },
         };
         if (part.type === "text") {
-          return { ...base, type: "text" as const, text: part.text };
+          const original = replacementTarget?.parentMessageId
+            ? this.deps.store.getMessage(replacementTarget.parentMessageId)?.parts.find((candidate): candidate is TextPart =>
+                candidate.type === "text" && !!candidate.command && !!part.command
+                && candidate.command.id === part.command.id
+                && candidate.command.commandId === part.command.commandId
+                && candidate.command.version === part.command.version
+                && candidate.command.name === part.command.name)
+            : undefined;
+          return { ...base, type: "text" as const, text: part.text, ...(part.references ? { references: part.references } : {}), ...(part.command ? { command: part.command, commandPrompt: original?.commandPrompt ?? part.commandPrompt } : {}) };
         }
         return createFilePart(
           base,
@@ -528,6 +536,7 @@ export class RuntimeMessageNotEditableError extends Error {
 
 function hasActiveRun(conversation: Conversation): boolean {
   return (
+    conversation.time.compacting !== undefined ||
     conversation.status.type === "busy" ||
     conversation.status.type === "waiting_for_permission"
   );
