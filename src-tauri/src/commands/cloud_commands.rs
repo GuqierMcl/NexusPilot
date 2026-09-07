@@ -140,11 +140,13 @@ pub async fn cancel_device_authorization(
 #[tauri::command]
 pub async fn claim_device_authorization(
     state: State<'_, CloudAccountService>,
+    database: State<'_, DatabaseState>,
     scheduler: State<'_, CloudSyncScheduler>,
 ) -> Result<CloudDeviceAuthorizationClaimResult, CloudPublicError> {
-    let result = state.claim_device_authorization().await?;
+    let _run_guard = scheduler.suspend().await;
+    let result = state.claim_device_authorization(&database.pool).await;
     scheduler.set_paused(false);
-    Ok(result)
+    result
 }
 
 #[tauri::command]
@@ -174,13 +176,15 @@ pub async fn recover_cloud_device_with_recovery_key(
     recovery_key: String,
     device_name: String,
     state: State<'_, CloudAccountService>,
+    database: State<'_, DatabaseState>,
     scheduler: State<'_, CloudSyncScheduler>,
 ) -> Result<CloudSyncDeviceActionResult, CloudPublicError> {
+    let _run_guard = scheduler.suspend().await;
     let result = state
-        .recover_with_recovery_key(&recovery_key, &device_name)
-        .await?;
+        .recover_with_recovery_key(&database.pool, &recovery_key, &device_name)
+        .await;
     scheduler.set_paused(false);
-    Ok(result)
+    result
 }
 
 #[tauri::command]
@@ -251,11 +255,17 @@ pub fn save_rotated_recovery_key<R: Runtime>(
 #[tauri::command]
 pub async fn delete_cloud_sync_data(
     state: State<'_, CloudAccountService>,
+    database: State<'_, DatabaseState>,
     scheduler: State<'_, CloudSyncScheduler>,
 ) -> Result<String, CloudPublicError> {
-    let evaluated_at = state.delete_cloud_sync_data().await?;
-    scheduler.shutdown();
-    Ok(evaluated_at)
+    let _run_guard = scheduler.suspend().await;
+    let result = state.delete_cloud_sync_data(&database.pool).await;
+    if result.is_ok() {
+        scheduler.shutdown();
+    } else {
+        scheduler.set_paused(false);
+    }
+    result
 }
 
 #[tauri::command]
@@ -279,11 +289,13 @@ pub fn save_recovery_key<R: Runtime>(
 pub async fn finalize_sync_setup(
     setup_id: String,
     state: State<'_, CloudAccountService>,
+    database: State<'_, DatabaseState>,
     scheduler: State<'_, CloudSyncScheduler>,
 ) -> Result<CloudSyncStateProjection, CloudPublicError> {
-    let result = state.finalize_sync_setup(&setup_id).await?;
+    let _run_guard = scheduler.suspend().await;
+    let result = state.finalize_sync_setup(&database.pool, &setup_id).await;
     scheduler.set_paused(false);
-    Ok(result)
+    result
 }
 
 #[tauri::command]

@@ -29,6 +29,8 @@ const PRODUCTION_CLOUD_API_BASE_URL: &str = "https://api.nexuspilot.dev/v1/";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(7);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+// A 16 MiB ciphertext expands to ~22 MiB in base64url. Cloud pages target 24 MiB.
+const MAX_ASSET_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BASE_URL_BYTES: usize = 2_048;
 
 #[derive(Clone)]
@@ -603,7 +605,7 @@ impl CloudApiClient {
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(is_json_content_type);
-        let body = read_bounded_body(response, self.max_response_bytes)
+        let body = read_bounded_body(response, MAX_ASSET_RESPONSE_BYTES)
             .await
             .map_err(CloudAssetPutError::Client)?;
         if status == StatusCode::OK {
@@ -678,7 +680,7 @@ impl CloudApiClient {
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(is_json_content_type);
-        let body = read_bounded_body(response, self.max_response_bytes)
+        let body = read_bounded_body(response, MAX_ASSET_RESPONSE_BYTES)
             .await
             .map_err(CloudAssetPutError::Client)?;
         if status == StatusCode::OK {
@@ -778,7 +780,12 @@ impl CloudApiClient {
             .and_then(|value| value.to_str().ok())
             .is_some_and(is_json_content_type);
         let response_type = std::any::type_name::<T>();
-        let bytes = read_bounded_body(response, self.max_response_bytes).await.map_err(|error| {
+        let response_limit = if path.starts_with("sync/connection-assets?") {
+            MAX_ASSET_RESPONSE_BYTES
+        } else {
+            self.max_response_bytes
+        };
+        let bytes = read_bounded_body(response, response_limit).await.map_err(|error| {
             tauri_plugin_log::log::warn!(
                 "Cloud response rejected: type={response_type} status={} stage=body reason={error:?}", status.as_u16()
             );
@@ -838,7 +845,7 @@ impl CloudApiClient {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         source: &str,
         total_timeout: Duration,
         max_response_bytes: usize,
@@ -1010,7 +1017,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        validate_cloud_api_base_url, CloudApiClient, CloudAssetPutError, CloudClientError, Duration,
+        validate_cloud_api_base_url, CloudApiClient, CloudAssetPutError, CloudClientError,
+        Duration, MAX_ASSET_RESPONSE_BYTES, MAX_RESPONSE_BYTES,
     };
     use crate::auth::SecretString;
     use crate::cloud::sync_key_store::CommittedSyncKeyBundle;
@@ -1423,6 +1431,47 @@ mod tests {
         }
         assert!(!captured.contains(&URL_SAFE_NO_PAD.encode(keys.amk)));
         assert!(!captured.contains(&URL_SAFE_NO_PAD.encode(keys.signing_private_key)));
+    }
+
+    #[tokio::test]
+    async fn asset_responses_accept_the_maximum_supported_ciphertext() {
+        let mut body: serde_json::Value = serde_json::from_str(ASSET_LIST_JSON).unwrap();
+        body["items"][0]["asset"]["encryption"] = serde_json::json!({
+            "suite": "XCHACHA20-POLY1305",
+            "nonce": URL_SAFE_NO_PAD.encode([0; 24]),
+            "ciphertext": URL_SAFE_NO_PAD.encode(vec![0; 16 * 1024 * 1024]),
+        });
+        body["items"][0]["asset"]["tombstone"] = serde_json::json!(false);
+        body["items"][0]["asset"]["deletedAt"] = serde_json::Value::Null;
+        body["items"][0]["asset"]["encryptedBytes"] = serde_json::json!(16 * 1024 * 1024);
+        let body = body.to_string();
+        assert!(body.len() > MAX_RESPONSE_BYTES);
+        assert!(body.len() < MAX_ASSET_RESPONSE_BYTES);
+        let (base_url, _, server) =
+            serve_once("200 OK", "application/json", body, Duration::ZERO).await;
+        let client =
+            CloudApiClient::for_test(&base_url, Duration::from_secs(10), MAX_RESPONSE_BYTES)
+                .unwrap();
+        let keys = CommittedSyncKeyBundle {
+            cloud_account_id: "account-1".into(),
+            device_id: "0198f5dc-0000-7000-8000-000000000002".into(),
+            key_generation: 1,
+            amk: [1; 32],
+            encryption_private_key: [2; 32],
+            signing_private_key: [3; 32],
+        };
+        let response = client
+            .list_connection_assets(
+                &SecretString::new("test-token".into()),
+                "account-1",
+                0,
+                1,
+                &keys,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.items[0].asset.encrypted_bytes, 16 * 1024 * 1024);
     }
 
     #[tokio::test]

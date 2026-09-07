@@ -81,6 +81,7 @@ function baseContext(activeTab: WorkbenchTab | null): WorkbenchStatusContext {
             focusTab: () => undefined,
             openSqlExecutionDetails: () => undefined,
             openExecutionOverview: () => undefined,
+            refreshCloudConnection: () => undefined,
         },
     };
 }
@@ -92,6 +93,7 @@ function attachRecordingActions(context: WorkbenchStatusContext) {
         openExecutionOverview: [] as string[][],
     };
     context.actions = {
+        refreshCloudConnection: () => undefined,
         focusTab: (tabId) => actionCalls.focusTab.push(tabId),
         openSqlExecutionDetails: (tabId) =>
             actionCalls.openSqlExecutionDetails.push(tabId),

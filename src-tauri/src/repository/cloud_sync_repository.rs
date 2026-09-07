@@ -263,6 +263,64 @@ impl TryFrom<CloudSyncConflictMetadataRow> for CloudSyncConflictMetadata {
 pub struct CloudSyncRepository;
 
 impl CloudSyncRepository {
+    pub async fn bind_key(
+        pool: &SqlitePool,
+        account_id: &str,
+        fingerprint: &str,
+        reset_unbound: bool,
+    ) -> AppResult<()> {
+        let mut tx = pool.begin().await?;
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT key_fingerprint FROM cloud_sync_key_bindings WHERE cloud_account_id = ?1",
+        )
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if previous
+            .as_deref()
+            .is_some_and(|value| value != fingerprint)
+            || (previous.is_none() && reset_unbound)
+        {
+            Self::clear_sync_rows(&mut tx, account_id).await?;
+        }
+        sqlx::query("INSERT INTO cloud_sync_key_bindings (cloud_account_id, key_fingerprint) VALUES (?1, ?2) ON CONFLICT (cloud_account_id) DO UPDATE SET key_fingerprint = excluded.key_fingerprint")
+            .bind(account_id).bind(fingerprint).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn reset_account(pool: &SqlitePool, account_id: &str) -> AppResult<()> {
+        let mut tx = pool.begin().await?;
+        Self::clear_sync_rows(&mut tx, account_id).await?;
+        sqlx::query("DELETE FROM cloud_sync_key_bindings WHERE cloud_account_id = ?1")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn clear_sync_rows(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        account_id: &str,
+    ) -> AppResult<()> {
+        // Local connections and folders are intentionally outside this reset.
+        for table in [
+            "cloud_sync_assets",
+            "cloud_sync_conflicts",
+            "cloud_sync_operations",
+            "cloud_sync_cursors",
+            "cloud_sync_pull_staging",
+            "cloud_sync_pull_batches",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE cloud_account_id = ?1"))
+                .bind(account_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn get_cursor(pool: &SqlitePool, cloud_account_id: &str) -> AppResult<u64> {
         let value = sqlx::query_scalar::<_, i64>(
             "SELECT cursor FROM cloud_sync_cursors WHERE cloud_account_id = ?1",

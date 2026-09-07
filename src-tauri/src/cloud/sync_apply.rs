@@ -91,97 +91,233 @@ struct LocalCandidate {
     operation_id: Option<String>,
 }
 
-/// Applies a fully validated Cloud page and advances its cursor in the same SQLite transaction.
-/// A conflict is considered a successfully persisted outcome for that asset and therefore does not
-/// block unrelated assets or cursor progress.
-pub(crate) async fn apply_validated_page(
+#[cfg(test)]
+async fn clear_pull_staging(pool: &SqlitePool, account_id: &str) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM cloud_sync_pull_staging WHERE cloud_account_id = ?1")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cloud_sync_pull_batches WHERE cloud_account_id = ?1")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn begin_staged_pull(
+    pool: &SqlitePool,
+    account_id: &str,
+) -> AppResult<(u64, u64)> {
+    let mut tx = pool.begin().await?;
+    let durable = read_cursor(&mut tx, account_id).await?;
+    let batch: Option<(i64, i64)> = sqlx::query_as("SELECT requested_cursor, next_cursor FROM cloud_sync_pull_batches WHERE cloud_account_id = ?1")
+        .bind(account_id).fetch_optional(&mut *tx).await?;
+    if let Some((initial, next)) = batch {
+        if initial == durable as i64 && next >= initial {
+            tx.commit().await?;
+            return Ok((durable, next as u64));
+        }
+    }
+    sqlx::query("DELETE FROM cloud_sync_pull_staging WHERE cloud_account_id = ?1")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO cloud_sync_pull_batches (cloud_account_id, requested_cursor, next_cursor) VALUES (?1, ?2, ?2) ON CONFLICT (cloud_account_id) DO UPDATE SET requested_cursor = excluded.requested_cursor, next_cursor = excluded.next_cursor")
+        .bind(account_id).bind(durable as i64).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok((durable, durable))
+}
+
+pub(crate) async fn stage_validated_page(
     pool: &SqlitePool,
     account_id: &str,
     page: ValidatedSyncPage,
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    let expected: i64 = sqlx::query_scalar(
+        "SELECT next_cursor FROM cloud_sync_pull_batches WHERE cloud_account_id = ?1",
+    )
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if expected != to_i64(page.requested_cursor, "requested cursor")? {
+        return Err(AppError::validation("Cloud sync staged cursor changed"));
+    }
+    for change in page.items {
+        let parent_id = match &change.projection {
+            Some(DecryptedSyncProjection::ConnectionFolder(folder)) => folder.parent_id.as_deref(),
+            Some(DecryptedSyncProjection::Connection(connection)) => {
+                connection.folder_id.as_deref()
+            }
+            None => None,
+        };
+        let raw = super::types::CloudConnectionAssetChange {
+            change_cursor: change.change_cursor.to_string(),
+            asset: change.asset.clone(),
+        };
+        sqlx::query("INSERT INTO cloud_sync_pull_staging (cloud_account_id, asset_id, revision, asset_type, tombstone, parent_id, change_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (cloud_account_id, asset_id) DO UPDATE SET revision = excluded.revision, asset_type = excluded.asset_type, tombstone = excluded.tombstone, parent_id = excluded.parent_id, change_json = excluded.change_json WHERE excluded.revision >= cloud_sync_pull_staging.revision")
+            .bind(account_id).bind(&change.asset.id)
+            .bind(to_i64(parse_positive(&change.asset.revision, "remote revision")?, "remote revision")?)
+            .bind(&change.asset.asset_type).bind(change.asset.tombstone).bind(parent_id)
+            .bind(serde_json::to_string(&raw)?).execute(&mut *tx).await?;
+    }
+    sqlx::query("UPDATE cloud_sync_pull_batches SET next_cursor = ?2 WHERE cloud_account_id = ?1")
+        .bind(account_id)
+        .bind(to_i64(page.next_cursor, "next cursor")?)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct StagedAssetOrder {
+    asset_id: String,
+    asset_type: String,
+    tombstone: bool,
+    parent_id: Option<String>,
+}
+
+pub(crate) async fn apply_staged_pull(
+    pool: &SqlitePool,
+    account_id: &str,
+    requested_cursor: u64,
+    next_cursor: u64,
     keys: &CommittedSyncKeyBundle,
+    guard: &super::sync_coordinator::SyncRunGuard,
 ) -> AppResult<SyncApplySummary> {
     if account_id != keys.cloud_account_id {
         return Err(AppError::validation(
             "Cloud sync account does not match the committed key bundle",
         ));
     }
-    let mut transaction = pool.begin().await?;
-    let durable_cursor = read_cursor(&mut transaction, account_id).await?;
-    if durable_cursor != page.requested_cursor {
+    let mut tx = pool.begin().await?;
+    if read_cursor(&mut tx, account_id).await? != requested_cursor {
         return Err(AppError::validation(
             "Cloud sync page no longer starts at the durable cursor",
         ));
     }
-
-    let changes = order_changes(deduplicate_current_assets(page.items)?)?;
-    let mut summary = SyncApplySummary {
-        next_cursor: page.next_cursor,
-        ..SyncApplySummary::default()
-    };
-    for change in changes {
-        apply_change(&mut transaction, account_id, change, keys, &mut summary).await?;
+    let batch: (i64, i64) = sqlx::query_as("SELECT requested_cursor, next_cursor FROM cloud_sync_pull_batches WHERE cloud_account_id = ?1")
+        .bind(account_id).fetch_one(&mut *tx).await?;
+    if batch
+        != (
+            to_i64(requested_cursor, "requested cursor")?,
+            to_i64(next_cursor, "next cursor")?,
+        )
+    {
+        return Err(AppError::validation("Cloud sync staged cursor changed"));
     }
-    write_cursor(&mut transaction, account_id, page.next_cursor).await?;
-    transaction.commit().await?;
+    // Only IDs are loaded together; decrypt one asset at a time to bound memory usage.
+    let rows = sqlx::query_as::<_, StagedAssetOrder>("SELECT asset_id, asset_type, tombstone, parent_id FROM cloud_sync_pull_staging WHERE cloud_account_id = ?1 ORDER BY asset_id")
+        .bind(account_id).fetch_all(&mut *tx).await?;
+    let (folders, mut other): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|row| row.asset_type == "connection_folder" && !row.tombstone);
+    let folder_ids: HashSet<_> = folders.iter().map(|row| row.asset_id.clone()).collect();
+    let mut children = std::collections::HashMap::<String, Vec<String>>::new();
+    let mut ordered = Vec::new();
+    for folder in folders {
+        if let Some(parent) = folder
+            .parent_id
+            .filter(|parent| folder_ids.contains(parent))
+        {
+            children.entry(parent).or_default().push(folder.asset_id);
+        } else {
+            ordered.push(folder.asset_id);
+        }
+    }
+    let mut index = 0;
+    while index < ordered.len() {
+        if let Some(dependents) = children.remove(&ordered[index]) {
+            ordered.extend(dependents);
+        }
+        index += 1;
+    }
+    if ordered.len() != folder_ids.len() {
+        return Err(AppError::validation(
+            "Cloud sync folders contain a parent cycle",
+        ));
+    }
+    other.sort_by_key(|row| (row.tombstone, row.asset_type == "connection_folder"));
+    ordered.extend(other.into_iter().map(|row| row.asset_id));
+    let mut summary = SyncApplySummary {
+        next_cursor,
+        ..Default::default()
+    };
+    for id in ordered {
+        if !guard() {
+            return Err(AppError::validation("Cloud sync run was canceled"));
+        }
+        let json: String = sqlx::query_scalar("SELECT change_json FROM cloud_sync_pull_staging WHERE cloud_account_id = ?1 AND asset_id = ?2")
+            .bind(account_id).bind(id).fetch_one(&mut *tx).await?;
+        let raw = serde_json::from_str(&json)?;
+        let change = super::sync_pull::validate_and_decrypt_change(account_id, raw, keys)
+            .map_err(|_| AppError::validation("Cloud sync staged projection is invalid"))?;
+        apply_change(&mut tx, account_id, change, keys, &mut summary).await?;
+    }
+    if !guard() {
+        return Err(AppError::validation("Cloud sync run was canceled"));
+    }
+    write_cursor(&mut tx, account_id, next_cursor).await?;
+    sqlx::query("DELETE FROM cloud_sync_pull_staging WHERE cloud_account_id = ?1")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cloud_sync_pull_batches WHERE cloud_account_id = ?1")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(summary)
 }
 
-fn deduplicate_current_assets(
-    changes: Vec<ValidatedSyncChange>,
-) -> AppResult<Vec<ValidatedSyncChange>> {
-    let mut seen = HashSet::new();
-    let mut deduplicated = Vec::new();
-    for change in changes.into_iter().rev() {
-        let key = format!("{}:{}", change.asset.id, change.asset.revision);
-        if seen.insert(key) {
-            deduplicated.push(change);
-        }
+#[cfg(test)]
+fn encrypt_test_page(
+    mut page: ValidatedSyncPage,
+    keys: &CommittedSyncKeyBundle,
+) -> ValidatedSyncPage {
+    for change in &mut page.items {
+        let plaintext = match &change.projection {
+            Some(DecryptedSyncProjection::Connection(value)) => serde_json::to_vec(value).unwrap(),
+            Some(DecryptedSyncProjection::ConnectionFolder(value)) => {
+                serde_json::to_vec(value).unwrap()
+            }
+            None => continue,
+        };
+        change.asset.encryption = Some(
+            encrypt_connection_asset(
+                &keys.cloud_account_id,
+                &change.asset.id,
+                &change.asset.asset_type,
+                change.asset.revision.parse().unwrap(),
+                change.asset.schema_version,
+                change.asset.key_generation,
+                &plaintext,
+                &keys.amk,
+            )
+            .unwrap(),
+        );
+        change.asset.encrypted_bytes = (plaintext.len() + 16) as u64;
     }
-    deduplicated.reverse();
-    Ok(deduplicated)
+    page
 }
 
-fn apply_order(change: &ValidatedSyncChange) -> u8 {
-    match (change.asset.tombstone, change.asset.asset_type.as_str()) {
-        (false, "connection_folder") => 0,
-        (false, "connection") => 1,
-        (true, "connection") => 2,
-        (true, "connection_folder") => 3,
-        _ => 4,
-    }
-}
-
-fn order_changes(changes: Vec<ValidatedSyncChange>) -> AppResult<Vec<ValidatedSyncChange>> {
-    let (mut folders, mut other): (Vec<_>, Vec<_>) = changes
-        .into_iter()
-        .partition(|change| apply_order(change) == 0);
-    let mut ordered = Vec::new();
-    while !folders.is_empty() {
-        let pending_ids: HashSet<_> = folders
-            .iter()
-            .map(|change| change.asset.id.clone())
-            .collect();
-        let (ready, pending): (Vec<_>, Vec<_>) =
-            folders
-                .into_iter()
-                .partition(|change| match &change.projection {
-                    Some(DecryptedSyncProjection::ConnectionFolder(folder)) => folder
-                        .parent_id
-                        .as_ref()
-                        .is_none_or(|parent| !pending_ids.contains(parent)),
-                    _ => true,
-                });
-        if ready.is_empty() {
-            return Err(AppError::validation(
-                "Cloud sync folders contain a parent cycle",
-            ));
-        }
-        ordered.extend(ready);
-        folders = pending;
-    }
-    other.sort_by_key(apply_order);
-    ordered.extend(other);
-    Ok(ordered)
+#[cfg(test)]
+async fn apply_validated_page(
+    pool: &SqlitePool,
+    account_id: &str,
+    page: ValidatedSyncPage,
+    keys: &CommittedSyncKeyBundle,
+) -> AppResult<SyncApplySummary> {
+    let initial = page.requested_cursor;
+    let next = page.next_cursor;
+    clear_pull_staging(pool, account_id).await?;
+    begin_staged_pull(pool, account_id).await?;
+    stage_validated_page(pool, account_id, encrypt_test_page(page, keys)).await?;
+    let guard: super::sync_coordinator::SyncRunGuard = std::sync::Arc::new(|| true);
+    apply_staged_pull(pool, account_id, initial, next, keys, &guard).await
 }
 
 async fn apply_change(
@@ -1199,6 +1335,48 @@ mod tests {
             projection: Some(DecryptedSyncProjection::ConnectionFolder(projection)),
             payload_hash: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(plaintext))),
         }
+    }
+
+    #[tokio::test]
+    async fn canceled_staged_apply_rolls_back_assets_and_retains_the_batch_for_retry() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let pool = pool().await;
+        begin_staged_pull(&pool, "account-1").await.unwrap();
+        let batch = page(
+            vec![
+                folder_change("0198f5dc-0000-7000-8000-000000000020", None, "1"),
+                folder_change("0198f5dc-0000-7000-8000-000000000021", None, "2"),
+            ],
+            2,
+        );
+        stage_validated_page(&pool, "account-1", encrypt_test_page(batch, &keys()))
+            .await
+            .unwrap();
+        let checks = AtomicUsize::new(0);
+        let guard: super::super::sync_coordinator::SyncRunGuard =
+            Arc::new(move || checks.fetch_add(1, Ordering::SeqCst) == 0);
+        assert!(apply_staged_pull(&pool, "account-1", 0, 2, &keys(), &guard)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM connection_folders")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(begin_staged_pull(&pool, "account-1").await.unwrap(), (0, 2));
+        let guard: super::super::sync_coordinator::SyncRunGuard = Arc::new(|| true);
+        assert_eq!(
+            apply_staged_pull(&pool, "account-1", 0, 2, &keys(), &guard)
+                .await
+                .unwrap()
+                .applied,
+            2
+        );
     }
 
     #[tokio::test]

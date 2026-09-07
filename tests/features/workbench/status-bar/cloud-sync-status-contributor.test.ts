@@ -68,6 +68,7 @@ function context(
             focusTab: () => undefined,
             openSqlExecutionDetails: () => undefined,
             openExecutionOverview: () => undefined,
+            refreshCloudConnection: () => undefined,
         },
     };
 }

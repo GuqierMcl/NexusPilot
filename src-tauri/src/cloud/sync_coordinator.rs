@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use super::{
     client::CloudAssetPutError,
     public_client_error,
-    sync_apply::apply_validated_page,
+    sync_apply::{apply_staged_pull, begin_staged_pull, stage_validated_page},
     sync_key_store::CommittedSyncKeyBundle,
     sync_projection::{connection_projection, folder_projection, SYNC_SCHEMA_VERSION},
     sync_pull::validate_and_decrypt_page,
@@ -149,6 +149,7 @@ pub(crate) async fn run_execution(
         });
     };
 
+    bind_sync_key(pool, &account_id, &keys.amk, false).await?;
     let mut result = CloudSyncRunResult {
         uploaded: 0,
         deleted: 0,
@@ -224,6 +225,23 @@ pub(crate) async fn run_execution(
         account_id,
         access,
     })
+}
+
+pub(crate) async fn bind_sync_key(
+    pool: &SqlitePool,
+    account_id: &str,
+    amk: &[u8; 32],
+    reset_unbound: bool,
+) -> Result<(), CloudPublicError> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"NexusPilot cloud sync local key binding v1");
+    digest.update(account_id.as_bytes());
+    digest.update(amk);
+    let fingerprint = format!("{:x}", digest.finalize());
+    CloudSyncRepository::bind_key(pool, account_id, &fingerprint, reset_unbound)
+        .await
+        .map_err(|_| CloudPublicError::from_code(super::CloudErrorCode::ProtocolError))
 }
 
 async fn reconcile_local_assets(
@@ -306,7 +324,10 @@ async fn reconcile_local_assets(
         let Some(remote_revision) = value.remote_revision else {
             continue;
         };
-        if matches!(value.sync_status, CloudSyncAssetStatus::RemoteDeleted) {
+        if matches!(
+            value.sync_status,
+            CloudSyncAssetStatus::RemoteDeleted | CloudSyncAssetStatus::Conflicted
+        ) {
             continue;
         }
         let operation = prepare_connection_delete(
@@ -608,24 +629,37 @@ async fn pull_pages(
     allow_repair: bool,
 ) -> Result<(), CloudPublicError> {
     let mut repaired_cursors = HashSet::new();
+    let (initial_cursor, mut cursor) =
+        begin_staged_pull(pool, account_id).await.map_err(|error| {
+            tauri_plugin_log::log::warn!(
+                "Cloud sync failed: stage=pull.resume reason={}",
+                local_sync_error_reason(&error)
+            );
+            CloudPublicError::from_code(super::CloudErrorCode::ProtocolError)
+        })?;
+    let mut page_size = PAGE_SIZE;
     for _ in 0..MAX_PAGES_PER_RUN {
         if !guard() {
             return Err(CloudPublicError::from_code(
                 super::CloudErrorCode::Unauthenticated,
             ));
         }
-        let cursor = CloudSyncRepository::get_cursor(pool, account_id)
+        let response = match client
+            .list_connection_assets(access_token, account_id, cursor, page_size, keys)
             .await
-            .map_err(|_| CloudPublicError::from_code(super::CloudErrorCode::ProtocolError))?;
-        let response = client
-            .list_connection_assets(access_token, account_id, cursor, PAGE_SIZE, keys)
-            .await
-            .map_err(|error| {
+        {
+            Ok(response) => response,
+            Err(super::client::CloudClientError::ResponseTooLarge) if page_size > 1 => {
+                page_size = (page_size / 2).max(1);
+                continue;
+            }
+            Err(error) => {
                 tauri_plugin_log::log::warn!(
                     "Cloud sync failed: stage=pull.request cursor={cursor} reason={error:?}"
                 );
-                public_client_error(error)
-            })?;
+                return Err(public_client_error(error));
+            }
+        };
         let page = match validate_and_decrypt_page(account_id, cursor, response.clone(), keys) {
             Ok(page) => page,
             Err(super::sync_pull::SyncPullError::DecryptionFailed)
@@ -707,7 +741,21 @@ async fn pull_pages(
             ));
         }
         let has_more = page.has_more;
-        let summary = apply_validated_page(pool, account_id, page, keys)
+        let next_cursor = page.next_cursor;
+        stage_validated_page(pool, account_id, page)
+            .await
+            .map_err(|error| {
+                tauri_plugin_log::log::warn!(
+                    "Cloud sync failed: stage=pull.stage cursor={cursor} reason={}",
+                    local_sync_error_reason(&error)
+                );
+                CloudPublicError::from_code(super::CloudErrorCode::ProtocolError)
+            })?;
+        cursor = next_cursor;
+        if has_more {
+            continue;
+        }
+        let summary = apply_staged_pull(pool, account_id, initial_cursor, cursor, keys, guard)
             .await
             .map_err(|error| {
                 tauri_plugin_log::log::warn!(
@@ -720,12 +768,11 @@ async fn pull_pages(
         result.conflicted += summary.conflicted as u64;
         result.ignored += summary.ignored as u64;
         result.cursor = summary.next_cursor;
-        if !has_more {
-            return Ok(());
-        }
+        return Ok(());
     }
+    // Persisted ciphertext and its fetch cursor allow the next bounded run to continue.
     Err(CloudPublicError::from_code(
-        super::CloudErrorCode::ProtocolError,
+        super::CloudErrorCode::TemporarilyUnavailable,
     ))
 }
 
@@ -905,6 +952,313 @@ mod tests {
                 .await
                 .unwrap(),
             "pending_delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_reconciliation_preserves_an_unresolved_local_delete() {
+        let pool = pool().await;
+        let id = "0198f5dc-0000-7000-8000-000000000004";
+        sqlx::query("INSERT INTO cloud_sync_assets (cloud_account_id, asset_id, asset_type, local_entity_id, remote_revision, base_revision, sync_status, tombstone) VALUES ('account-1', ?1, 'connection', ?1, 5, 4, 'conflicted', 1)")
+            .bind(id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO cloud_sync_operations (operation_id, cloud_account_id, asset_id, asset_type, action, expected_revision, status) VALUES ('old-delete', 'account-1', ?1, 'connection', 'delete', 4, 'conflicted')")
+            .bind(id).execute(&pool).await.unwrap();
+        let guard: SyncRunGuard = Arc::new(|| true);
+        for _ in 0..3 {
+            reconcile_local_assets(&pool, "account-1", &keys(), &guard)
+                .await
+                .unwrap();
+        }
+        assert!(
+            CloudSyncRepository::list_pending_operations(&pool, "account-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT sync_status FROM cloud_sync_assets WHERE asset_id = ?1"
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "conflicted"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cloud_sync_operations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    fn remote_folder(id: &str, parent: Option<&str>, cursor: u64) -> serde_json::Value {
+        let projection = serde_json::json!({"schemaVersion": 1, "assetType": "connection_folder", "id": id, "name": "Remote folder", "parentId": parent, "sortOrder": 0});
+        let plaintext = serde_json::to_vec(&projection).unwrap();
+        let encryption = super::super::sync_crypto::encrypt_connection_asset(
+            "account-1",
+            id,
+            "connection_folder",
+            1,
+            1,
+            1,
+            &plaintext,
+            &keys().amk,
+        )
+        .unwrap();
+        serde_json::json!({"changeCursor": cursor.to_string(), "asset": {
+            "id": id, "assetType": "connection_folder", "revision": "1", "parentRevision": null,
+            "changeCursor": cursor.to_string(), "schemaVersion": 1, "keyGeneration": 1,
+            "encryption": encryption, "encryptedBytes": plaintext.len()+16, "tombstone": false,
+            "updatedByDeviceId": keys().device_id, "createdAt": "2026-09-07T00:00:00Z", "updatedAt": "2026-09-07T00:00:00Z", "deletedAt": null
+        }})
+    }
+
+    async fn pull_from_mock(
+        pool: &SqlitePool,
+        responses: Vec<Option<serde_json::Value>>,
+    ) -> (Result<(), CloudPublicError>, Vec<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut targets = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                targets.push(
+                    String::from_utf8(request)
+                        .unwrap()
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_string(),
+                );
+                let wire = match response {
+                    Some(body) => { let body = body.to_string(); format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()) },
+                    None => "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33554433\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                stream.write_all(wire.as_bytes()).await.unwrap();
+            }
+            targets
+        });
+        let client = super::super::client::CloudApiClient::for_test(
+            &base,
+            std::time::Duration::from_secs(2),
+            256 * 1024,
+        )
+        .unwrap();
+        let mut summary = CloudSyncRunResult {
+            uploaded: 0,
+            deleted: 0,
+            pulled: 0,
+            conflicted: 0,
+            ignored: 0,
+            cursor: 0,
+        };
+        let guard: SyncRunGuard = Arc::new(|| true);
+        let result = pull_pages(
+            pool,
+            &client,
+            &crate::auth::SecretString::new("test-token".into()),
+            "account-1",
+            &keys(),
+            &mut summary,
+            &guard,
+            false,
+        )
+        .await;
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        (result, requests)
+    }
+
+    #[tokio::test]
+    async fn pull_fetches_later_parent_pages_and_retries_oversized_pages_without_skipping() {
+        let pool = pool().await;
+        let parent = "0198f5dc-0000-7000-8000-000000000020";
+        let child = "0198f5dc-0000-7000-8000-000000000021";
+        let first = serde_json::json!({"evaluatedAt":"2026-09-07T00:00:00Z", "cursor":{"requested":"0","next":"1","hasMore":true}, "items":[remote_folder(child, Some(parent), 1)]});
+        let second = serde_json::json!({"evaluatedAt":"2026-09-07T00:00:00Z", "cursor":{"requested":"1","next":"2","hasMore":false}, "items":[remote_folder(parent, None, 2)]});
+        let (result, requests) = pull_from_mock(&pool, vec![None, Some(first), Some(second)]).await;
+        result.unwrap();
+        assert!(requests[0].contains("cursor=0&limit=100"));
+        assert!(requests[1].contains("cursor=0&limit=50"));
+        assert!(requests[2].contains("cursor=1&limit=50"));
+        assert_eq!(
+            CloudSyncRepository::get_cursor(&pool, "account-1")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT parent_id FROM connection_folders WHERE id = ?1"
+            )
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            parent
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cloud_sync_pull_staging")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_on_later_page_preserves_the_durable_cursor_and_local_data() {
+        let pool = pool().await;
+        let parent = "0198f5dc-0000-7000-8000-000000000020";
+        let child = "0198f5dc-0000-7000-8000-000000000021";
+        let first = serde_json::json!({"evaluatedAt":"2026-09-07T00:00:00Z", "cursor":{"requested":"0","next":"1","hasMore":true}, "items":[remote_folder(child, Some(parent), 1)]});
+        let mut invalid = remote_folder(parent, None, 2);
+        invalid["asset"]["revision"] = serde_json::json!("2"); // Ciphertext still binds revision 1.
+        invalid["asset"]["parentRevision"] = serde_json::json!("1");
+        let second = serde_json::json!({"evaluatedAt":"2026-09-07T00:00:00Z", "cursor":{"requested":"1","next":"2","hasMore":false}, "items":[invalid]});
+        assert!(pull_from_mock(&pool, vec![Some(first), Some(second)])
+            .await
+            .0
+            .is_err());
+        assert_eq!(
+            CloudSyncRepository::get_cursor(&pool, "account-1")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM connection_folders")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let staged: String = sqlx::query_scalar("SELECT change_json FROM cloud_sync_pull_staging")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!staged.contains("Remote folder"));
+        // Restarting resumes only after the validated first page; the failed page is retried.
+        let repaired = serde_json::json!({"evaluatedAt":"2026-09-07T00:00:00Z", "cursor":{"requested":"1","next":"2","hasMore":false}, "items":[remote_folder(parent, None, 2)]});
+        let (result, requests) = pull_from_mock(&pool, vec![Some(repaired)]).await;
+        result.unwrap();
+        assert!(requests[0].contains("cursor=1&limit=100"));
+        assert_eq!(
+            CloudSyncRepository::get_cursor(&pool, "account-1")
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_master_key_resets_only_cloud_state_and_requeues_local_assets() {
+        let pool = pool().await;
+        let guard: SyncRunGuard = Arc::new(|| true);
+        sqlx::query("INSERT INTO connections (id, name, driver, payload) VALUES ('0198f5dc-0000-7000-8000-000000000004', 'Local', 'postgres', '{}')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO connection_folders (id, name) VALUES ('0198f5dc-0000-7000-8000-000000000005', 'Local folder')").execute(&pool).await.unwrap();
+        reconcile_local_assets(&pool, "account-1", &keys(), &guard)
+            .await
+            .unwrap();
+        CloudSyncRepository::set_cursor(&pool, "account-1", 33)
+            .await
+            .unwrap();
+        CloudSyncRepository::set_cursor(&pool, "other-account", 9)
+            .await
+            .unwrap();
+        // Adopting a legacy installation and reusing the same AMK preserve existing work.
+        bind_sync_key(&pool, "account-1", &keys().amk, false)
+            .await
+            .unwrap();
+        bind_sync_key(&pool, "account-1", &keys().amk, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            CloudSyncRepository::get_cursor(&pool, "account-1")
+                .await
+                .unwrap(),
+            33
+        );
+        assert_eq!(
+            CloudSyncRepository::list_pending_operations(&pool, "account-1")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        sqlx::query("INSERT INTO cloud_sync_conflicts (id, cloud_account_id, asset_id, asset_type, remote_revision, local_ciphertext, remote_ciphertext, local_payload_hash, remote_payload_hash) VALUES ('conflict', 'account-1', 'asset', 'connection', 2, 'old', 'old', 'hash', 'hash')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO cloud_sync_pull_staging VALUES ('account-1', 'asset', 1, 'connection', 0, NULL, 'old encrypted page')").execute(&pool).await.unwrap();
+        let mut new_keys = keys();
+        new_keys.amk = [8; 32];
+        bind_sync_key(&pool, "account-1", &new_keys.amk, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            CloudSyncRepository::get_cursor(&pool, "account-1")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            CloudSyncRepository::get_cursor(&pool, "other-account")
+                .await
+                .unwrap(),
+            9
+        );
+        for table in [
+            "cloud_sync_assets",
+            "cloud_sync_operations",
+            "cloud_sync_conflicts",
+            "cloud_sync_pull_staging",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE cloud_account_id = 'account-1'"
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                0
+            );
+        }
+        reconcile_local_assets(&pool, "account-1", &new_keys, &guard)
+            .await
+            .unwrap();
+        let queued = CloudSyncRepository::list_pending_operations(&pool, "account-1")
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.iter().all(|op| op.expected_revision.is_none()));
+        CloudSyncRepository::reset_account(&pool, "account-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM connections")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM connection_folders")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
         );
     }
 }

@@ -41,6 +41,7 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                     title: "正在连接 NexusPilot Cloud",
                     tone: "info",
                     width: "compact",
+                    onClick: context.actions.refreshCloudConnection,
                 },
             ];
         }
@@ -54,9 +55,10 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                         priority: 90,
                         icon: CloudCheckIcon,
                         label: "Cloud",
-                        title: "NexusPilot Cloud 已连接",
+                        title: "NexusPilot Cloud 已连接；点击刷新连接",
                         tone: "success",
                         width: "compact",
+                        onClick: context.actions.refreshCloudConnection,
                     },
                 ];
             case "cached":
@@ -68,9 +70,10 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                         priority: 90,
                         icon: CloudOffIcon,
                         label: "Cloud 暂时离线",
-                        title: "当前显示最近一次 Cloud 状态",
+                        title: "当前显示最近一次 Cloud 状态；点击刷新连接",
                         tone: "warning",
                         width: "compact",
+                        onClick: context.actions.refreshCloudConnection,
                     },
                 ];
             case "permission_denied":
@@ -81,9 +84,10 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                         priority: 90,
                         icon: AlertCircleIcon,
                         label: "Cloud 无访问权限",
-                        title: "当前账号没有 NexusPilot Cloud 访问权限",
+                        title: "当前账号没有 NexusPilot Cloud 访问权限；点击刷新连接",
                         tone: "error",
                         width: "compact",
+                        onClick: context.actions.refreshCloudConnection,
                     },
                 ];
             case "reauthentication_required":
@@ -94,9 +98,10 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                         priority: 90,
                         icon: AlertCircleIcon,
                         label: "Cloud 需要重新登录",
-                        title: "请重新登录 NIEEX Account",
+                        title: "请重新登录 NIEEX Account；点击刷新连接",
                         tone: "error",
                         width: "compact",
+                        onClick: context.actions.refreshCloudConnection,
                     },
                 ];
             case "needs_refresh":
@@ -107,9 +112,10 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                         priority: 90,
                         icon: RefreshCwIcon,
                         label: "Cloud 待更新",
-                        title: "Cloud 状态等待更新",
+                        title: "Cloud 状态等待更新；点击刷新连接",
                         tone: "warning",
                         width: "compact",
+                        onClick: context.actions.refreshCloudConnection,
                     },
                 ];
             case "refreshing":
@@ -123,6 +129,7 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                         title: "Cloud 状态仍在更新，请稍候",
                         tone: "warning",
                         width: "compact",
+                        onClick: context.actions.refreshCloudConnection,
                     },
                 ];
             case "unavailable":
@@ -134,9 +141,10 @@ export const cloudStatusContributor: WorkbenchStatusContributor = {
                         priority: 90,
                         icon: AlertCircleIcon,
                         label: "Cloud 暂不可用",
-                        title: "NexusPilot Cloud 暂时不可用",
+                        title: "NexusPilot Cloud 暂时不可用；点击刷新连接",
                         tone: "error",
                         width: "compact",
+                        onClick: context.actions.refreshCloudConnection,
                     },
                 ];
         }

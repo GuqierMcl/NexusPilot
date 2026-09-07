@@ -49,6 +49,7 @@ export interface WorkbenchStatusRuntimeStateSnapshot {
 }
 
 export interface WorkbenchStatusActions {
+    refreshCloudConnection(): void;
     focusTab(tabId: string): void;
     openSqlExecutionDetails(tabId: string): void;
     openExecutionOverview(tabIds: string[]): void;

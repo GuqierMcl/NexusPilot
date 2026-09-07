@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAgentStatusSnapshotStore } from "@/features/workbench/agent/state";
 import { useCloudDesktopState } from "@/features/settings/cloud-context";
@@ -28,7 +28,19 @@ function useStatusNow(): number {
 }
 
 export function useWorkbenchStatusItems(): WorkbenchStatusItemAreas {
-    const { state: cloud } = useCloudDesktopState();
+    const { state: cloud, refresh: refreshCloud } = useCloudDesktopState();
+    const cloudRefreshPending = useRef(false);
+    const refreshCloudConnection = useCallback((): void => {
+        if (cloudRefreshPending.current || cloud?.refresh.inFlight) return;
+        cloudRefreshPending.current = true;
+        void refreshCloud(true)
+            .catch((error: unknown) => {
+                console.error("[status-bar] failed to refresh Cloud connection", error);
+            })
+            .finally(() => {
+                cloudRefreshPending.current = false;
+            });
+    }, [cloud?.refresh.inFlight, refreshCloud]);
     const tabs = useWorkbenchTabsStore((state) => state.tabs);
     const activeTabId = useWorkbenchTabsStore((state) => state.activeTabId);
     const activateTab = useWorkbenchTabsStore((state) => state.activateTab);
@@ -89,8 +101,9 @@ export function useWorkbenchStatusItems(): WorkbenchStatusItemAreas {
             focusTab,
             openSqlExecutionDetails,
             openExecutionOverview,
+            refreshCloudConnection,
         }),
-        [focusTab, openExecutionOverview, openSqlExecutionDetails],
+        [focusTab, openExecutionOverview, openSqlExecutionDetails, refreshCloudConnection],
     );
 
     return useMemo(() => {

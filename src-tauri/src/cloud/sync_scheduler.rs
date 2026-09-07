@@ -287,6 +287,12 @@ impl CloudSyncScheduler {
         );
     }
 
+    // Cancel the active generation and wait for its database work before replacing sync keys.
+    pub(crate) async fn suspend(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.set_paused(true);
+        self.inner.run_lock.lock().await
+    }
+
     pub(crate) fn set_paused(&self, paused: bool) {
         if paused {
             self.cancel_scheduled_runs();
@@ -678,6 +684,25 @@ mod tests {
         });
 
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn suspension_invalidates_the_active_generation_and_waits_for_its_lock() {
+        let fake = FakeExecutor::new(vec![]);
+        let scheduler = CloudSyncScheduler::for_test(fake, fast_delays());
+        let generation = scheduler.inner.generation.load(Ordering::SeqCst);
+        let active_run = scheduler.inner.run_lock.lock().await;
+        let mut suspension = Box::pin(scheduler.suspend());
+        assert!(futures_util::poll!(suspension.as_mut()).is_pending());
+        assert_ne!(
+            scheduler.inner.generation.load(Ordering::SeqCst),
+            generation
+        );
+        drop(active_run);
+        let held = suspension.await;
+        assert!(scheduler.inner.run_lock.try_lock().is_err());
+        drop(held);
+        assert!(scheduler.inner.run_lock.try_lock().is_ok());
     }
 
     #[tokio::test]

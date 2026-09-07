@@ -40,6 +40,7 @@ function context(): WorkbenchStatusContext {
             focusTab: () => undefined,
             openSqlExecutionDetails: () => undefined,
             openExecutionOverview: () => undefined,
+            refreshCloudConnection: () => undefined,
         },
     };
 }

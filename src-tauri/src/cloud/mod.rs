@@ -854,6 +854,7 @@ impl CloudAccountService {
 
     pub async fn claim_device_authorization(
         &self,
+        pool: &sqlx::SqlitePool,
     ) -> Result<CloudDeviceAuthorizationClaimResult, CloudPublicError> {
         let client = self.client()?;
         let access_token = self.access_token().await?;
@@ -897,6 +898,8 @@ impl CloudAccountService {
             &response.device_envelope,
         )
         .map_err(|_| CloudPublicError::from_code(CloudErrorCode::ProtocolError))?;
+        self.bind_replacement_sync_key(pool, &pending.cloud_account_id, &amk)
+            .await?;
         self.sync_key_store
             .commit_device_authorization(&pending, amk)
             .map_err(|_| CloudPublicError::from_code(CloudErrorCode::SecureStorageUnavailable))?;
@@ -973,6 +976,7 @@ impl CloudAccountService {
 
     pub async fn recover_with_recovery_key(
         &self,
+        pool: &sqlx::SqlitePool,
         recovery_key: &str,
         device_name: &str,
     ) -> Result<CloudSyncDeviceActionResult, CloudPublicError> {
@@ -1094,6 +1098,8 @@ impl CloudAccountService {
             .await;
         match response {
             Ok(response) => {
+                self.bind_replacement_sync_key(pool, &bootstrap.account.id, &keys.amk)
+                    .await?;
                 self.sync_key_store
                     .commit_pending(SyncKeyBundleInput {
                         cloud_account_id: &bootstrap.account.id,
@@ -1176,7 +1182,10 @@ impl CloudAccountService {
         })
     }
 
-    pub async fn delete_cloud_sync_data(&self) -> Result<String, CloudPublicError> {
+    pub async fn delete_cloud_sync_data(
+        &self,
+        pool: &sqlx::SqlitePool,
+    ) -> Result<String, CloudPublicError> {
         let client = self.client()?;
         let access_token = self.access_token().await?;
         let bootstrap = client
@@ -1196,6 +1205,12 @@ impl CloudAccountService {
             .delete_sync_data(&access_token, &bootstrap.account.id, &request, &keys)
             .await
             .map_err(public_client_error)?;
+        crate::repository::cloud_sync_repository::CloudSyncRepository::reset_account(
+            pool,
+            &bootstrap.account.id,
+        )
+        .await
+        .map_err(|_| CloudPublicError::from_code(CloudErrorCode::ProtocolError))?;
         self.sync_key_store
             .discard_committed(&bootstrap.account.id)
             .map_err(|_| CloudPublicError::from_code(CloudErrorCode::SecureStorageUnavailable))?;
@@ -1307,8 +1322,24 @@ impl CloudAccountService {
         Ok(RecoveryKeyExportResult { completed: true })
     }
 
+    async fn bind_replacement_sync_key(
+        &self,
+        pool: &sqlx::SqlitePool,
+        account_id: &str,
+        amk: &[u8; 32],
+    ) -> Result<(), CloudPublicError> {
+        let old_keys = self
+            .sync_key_store
+            .read_committed(account_id)
+            .map_err(|_| CloudPublicError::from_code(CloudErrorCode::SecureStorageUnavailable))?;
+        // A legacy installation can keep its conflict evidence when re-enrolling with the same AMK.
+        let reset_unbound = old_keys.as_ref().is_none_or(|old| &old.amk != amk);
+        sync_coordinator::bind_sync_key(pool, account_id, amk, reset_unbound).await
+    }
+
     pub async fn finalize_sync_setup(
         &self,
+        pool: &sqlx::SqlitePool,
         setup_id: &str,
     ) -> Result<CloudSyncStateProjection, CloudPublicError> {
         let pending = self
@@ -1354,6 +1385,17 @@ impl CloudAccountService {
             .await
         {
             Ok(state) => {
+                if let Err(error) = self
+                    .bind_replacement_sync_key(
+                        pool,
+                        &pending.cloud_account_id,
+                        &pending.prepared.keys.amk,
+                    )
+                    .await
+                {
+                    self.sync_setups.put_back(pending);
+                    return Err(error);
+                }
                 if let Err(_error) = self.sync_key_store.commit_pending(SyncKeyBundleInput {
                     cloud_account_id: &pending.cloud_account_id,
                     device_id: &pending.device_id,
