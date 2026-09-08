@@ -1,6 +1,6 @@
 [package]
 name = "NexusPilot"
-version = "0.10.2"
+version = "0.10.3"
 description = "Rust backend for NexusPilot database management workbench"
 authors = ["GuqierMcl <support@nexuspilot.dev>"]
 license = "Apache-2.0"
