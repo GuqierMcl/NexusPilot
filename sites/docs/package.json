@@ -22,7 +22,7 @@
     "@astrojs/react": "6.0.2",
     "@astrojs/starlight": "0.41.6",
     "@tailwindcss/vite": "^4.1.0",
-    "astro": "7.1.6",
+    "astro": "7.2.8",
     "lucide-react": "^1.22.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
