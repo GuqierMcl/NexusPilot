@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { activeTabContextSchema } from "../../../shared/active-tab-context";
 import { commandBindingSchema } from "../../../shared/composer-commands";
 import { messageCommands } from "../runtime/commands/message-commands";
 import { textReferencesSchema, validateReferenceMessage } from "../../../shared/composer-references";
@@ -57,6 +58,7 @@ const runCreateRequestSchema = z
       })
       .strict(),
     agent_mode: z.enum(["ask", "query", "agent"]).optional(),
+    activeTabContext: activeTabContextSchema.optional(),
     input: z
       .object({
         parts: z.array(runInputPartSchema).min(1),
@@ -128,6 +130,7 @@ export function parseRunCreateRequestBody(body: unknown): ParsedRunCreateRequest
       text,
       parts,
       agentMode: result.data.agent_mode,
+      activeTabContext: result.data.activeTabContext,
       metadata: result.data.metadata,
     },
   };

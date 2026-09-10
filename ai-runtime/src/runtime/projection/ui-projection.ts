@@ -9,6 +9,7 @@ export interface UiMessageLike {
 }
 
 export type UiPartLike =
+  | { type: "data"; name: "active-tab-context"; data: import("../../../../shared/active-tab-context").ActiveTabContext }
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "source"; sourceType: "url"; id?: string; url: string; title?: string }
@@ -29,7 +30,11 @@ export function projectMessageToUiMessage(message: Message): UiMessageLike {
   return {
     id: message.id,
     role: message.role,
-    parts: message.parts.flatMap(projectPartToUiParts),
+    parts: [
+      ...message.parts.flatMap(projectPartToUiParts),
+      ...(message.role === "user" && message.activeTabContext
+        ? [{ type: "data" as const, name: "active-tab-context" as const, data: message.activeTabContext }] : []),
+    ],
     metadata: {
       ...(message.role === "user" && message.parts.some((part) => part.type === "text" && (part.references || part.command))
         ? { custom: { composerReferences: combineReferencedTexts(message.parts.filter((part) => part.type === "text")) } } : {}),

@@ -4,6 +4,7 @@ import {
     type UIMessage,
 } from "ai";
 import { readComposerReferenceMetadata, splitReferencedText, validateReferenceMessage, validateTextReferences } from "../../../../../shared/composer-references";
+import { ACTIVE_TAB_PART, readActiveTabPart } from "../../../../../shared/active-tab-context";
 
 import type {
     RunAgentMode,
@@ -95,6 +96,7 @@ export function buildRunCreateRequestFromAiSdkMessages(
     }
 
     const parts = extractRunInputParts(userMessage);
+    const activeTabContext = readActiveTabPart(userMessage.parts);
     const metadata = buildMetadata({
         clientThreadId: input.clientThreadId,
         clientUserMessageId: userMessage.id,
@@ -118,6 +120,7 @@ export function buildRunCreateRequestFromAiSdkMessages(
         },
         agent_mode: input.selectedAgentMode ?? ("ask" satisfies RunAgentMode),
         input: { parts },
+        ...(activeTabContext ? { activeTabContext } : {}),
         ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
     };
 }
@@ -283,6 +286,7 @@ function extractRunInputParts(message: UIMessage): RunCreateInputPart[] {
         const partRecord: Record<string, unknown> = part;
         const partType =
             typeof partRecord.type === "string" ? partRecord.type : "unknown";
+        if (partType === ACTIVE_TAB_PART) continue;
         if (partType === "file") {
             const value = typeof partRecord.url === "string"
                 ? partRecord.url

@@ -56,6 +56,7 @@ export interface RunCreateRequestMetadata {
 }
 
 export interface RunCreateRequest {
+    activeTabContext?: import("../../../shared/active-tab-context").ActiveTabContext;
     response_mode: RunResponseMode;
     conversation_id?: string;
     replace_from_message_id?: string;

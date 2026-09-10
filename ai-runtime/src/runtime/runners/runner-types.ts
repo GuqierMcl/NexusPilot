@@ -1,5 +1,6 @@
 import type { RuntimeId, RuntimeIdPrefix } from "../core/ids";
 import { messageCommands } from "../commands/message-commands";
+import { parseActiveTabContext } from "../../../../shared/active-tab-context";
 import { validateReferenceMessage } from "../../../../shared/composer-references";
 import type {
   AgentMode,
@@ -76,6 +77,7 @@ export interface RunExecutionPolicySnapshot {
 }
 
 export interface RunRequest {
+  activeTabContext?: import("../../../../shared/active-tab-context").ActiveTabContext;
   runId?: Run["id"];
   conversationId?: ConversationId;
   userMessageId?: MessageId;
@@ -96,6 +98,7 @@ export type RunRequestInputPart =
   | { type: "file"; attachmentId: AttachmentId };
 
 export interface NormalizedRunRequest {
+  activeTabContext?: import("../../../../shared/active-tab-context").ActiveTabContext;
   runId?: Run["id"];
   conversationId?: ConversationId;
   userMessageId?: MessageId;
@@ -319,6 +322,7 @@ export function normalizeRunRequest(request: RunRequest): NormalizedRunRequest {
     limits: executionPolicy.limits,
     executionPolicy,
     metadata: request.metadata,
+    activeTabContext: request.activeTabContext === undefined ? undefined : parseActiveTabContext(request.activeTabContext),
   };
 }
 

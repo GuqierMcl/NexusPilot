@@ -1,5 +1,6 @@
 import type { Message, Part, ToolPart } from "../core/types";
 import { projectReferencedText } from "../../../../shared/composer-references";
+import { projectActiveTabContext } from "../../../../shared/active-tab-context";
 
 export const CONTEXT_ESTIMATOR_OVERHEAD = Object.freeze({
   /** Model-message role/framing allowance. */
@@ -31,6 +32,9 @@ export function estimateMessageTokens(message: Message): number {
   const partTokens = message.parts
     .map((part) => estimateProjectedPartTokens(message.role, part))
     .filter((tokens) => tokens > 0);
+  if (message.role === "user" && message.activeTabContext) {
+    partTokens.push(CONTEXT_ESTIMATOR_OVERHEAD.part + estimateTextTokens(projectActiveTabContext(message.activeTabContext)));
+  }
   if (partTokens.length === 0) {
     return 0;
   }

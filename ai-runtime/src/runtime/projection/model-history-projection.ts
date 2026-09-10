@@ -1,4 +1,5 @@
 import { projectReferencedText } from "../../../../shared/composer-references";
+import { projectActiveTabContext } from "../../../../shared/active-tab-context";
 import type {
   AssistantContent,
   ModelMessage,
@@ -96,6 +97,9 @@ export async function projectModelHistory(
             data: { type: "data", data },
           });
         }
+      }
+      if (message.activeTabContext) {
+        content.push({ type: "text", text: projectActiveTabContext(message.activeTabContext) });
       }
       if (content.length > 0) {
         projected.push({ role: "user", content });

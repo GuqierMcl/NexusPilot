@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { activeTabContextSchema } from "../../../../shared/active-tab-context";
 import { commandBindingSchema } from "../../../../shared/composer-commands";
 import { textReferencesSchema, validateReferenceMessage } from "../../../../shared/composer-references";
 import { DEFAULT_CONTEXT_COMPACTION_POLICY } from "../context/policy";
@@ -509,6 +510,7 @@ export const messageSchema = z.discriminatedUnion("role", [
       id: z.string(),
       conversationId: z.string(),
       role: z.literal("user"),
+      activeTabContext: activeTabContextSchema.optional(),
       agentMode: agentModeSchema,
       model: z.object({ providerId: z.string(), modelId: z.string() }).optional(),
       summary: z.object({ title: z.string().optional(), body: z.string().optional() }).optional(),

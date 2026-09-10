@@ -223,6 +223,7 @@ export interface BaseMessage {
 }
 
 export interface UserMessage extends BaseMessage {
+  activeTabContext?: import("../../../../shared/active-tab-context").ActiveTabContext;
   role: "user";
   agentMode: AgentMode;
   model?: ModelSelection;

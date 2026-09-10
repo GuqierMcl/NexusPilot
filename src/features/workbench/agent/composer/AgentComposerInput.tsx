@@ -1,4 +1,4 @@
-import { ComposerPrimitive, useAui, useAuiState } from "@assistant-ui/react";
+import { ComposerPrimitive, MessagePrimitive, useAui, useAuiState } from "@assistant-ui/react";
 import { flushTapSync } from "@assistant-ui/tap";
 import {
   useCallback,
@@ -11,6 +11,9 @@ import {
   type FC,
 } from "react";
 import { cn } from "@/lib/utils";
+import { readActiveTabPart, parseActiveTabContext, type ActiveTabContext } from "../../../../../shared/active-tab-context";
+import { useActiveTabDraft } from "./active-tab-context";
+import { ActiveTabChip } from "./ActiveTabChip";
 import {
   readComposerReferenceMetadata,
   validateTextReferences,
@@ -53,18 +56,20 @@ export const AgentComposerInput: FC<AgentComposerInputProps> = (props) => {
 const EditInput: FC<AgentComposerInputProps> = (props) => {
   const id = useAuiState((state) => state.message.id);
   const metadata = useAuiState((state) => state.message.metadata);
+  const content = useAuiState((state) => state.message.content);
   return (
     <BoundInput
       key={id}
       {...props}
       initial={readComposerReferenceMetadata(metadata) ?? undefined}
+      initialActiveTab={readActiveTabPart(content)}
     />
   );
 };
 
 const BoundInput: FC<
-  AgentComposerInputProps & { initial?: ReferencedText }
-> = ({ className, onKeyDown, editing: _editing, initial, ...props }) => {
+  AgentComposerInputProps & { initial?: ReferencedText; initialActiveTab?: ActiveTabContext }
+> = ({ className, onKeyDown, editing: _editing, initial, initialActiveTab, ...props }) => {
   const aui = useAui();
   const threadId = useAuiState((state) => state.threadListItem.id);
   const recovery = useComposerRecovery((state) => state.drafts[threadId]);
@@ -75,6 +80,7 @@ const BoundInput: FC<
   const { sources, commands } = useComposerRegistries();
   const operations = useComposerOperations();
   const text = useAuiState((state) => state.composer.text);
+  const activeTab = useActiveTabDraft({ editing: _editing, initial: initialActiveTab, text, attachmentCount });
   const [history] = useState(() => {
     const stored = _editing
       ? initial
@@ -182,6 +188,7 @@ const BoundInput: FC<
       const annotated = readComposerReferenceMetadata(
         recovery.message.metadata,
       );
+      const restoredActiveTab = readActiveTabPart(recovery.message.parts);
       for (const part of recovery.message.parts) {
         if (part.type === "file")
           await aui.composer().addAttachment({
@@ -217,6 +224,7 @@ const BoundInput: FC<
         }),
       );
       useComposerRecovery.getState().clear(threadId);
+      activeTab.restore(restoredActiveTab);
     } catch (cause) {
       console.error("[composer] recovery failed", cause);
       setError("恢复草稿失败，请重试");
@@ -377,6 +385,7 @@ const BoundInput: FC<
           current.references?.targets ?? [],
         );
         if (errors.length) throw new Error(errors.join("\n"));
+        const submittedActiveTabContext = activeTab.capture() ?? null;
         const recoveredEditMessageId = aui.composer().getState().runConfig
           .custom?.recoveredEditMessageId;
         publish(current);
@@ -391,6 +400,7 @@ const BoundInput: FC<
                 references: current.references,
                 command: current.command,
               },
+              submittedActiveTabContext,
               recoveredEditMessageId: undefined,
             },
           }),
@@ -416,6 +426,7 @@ const BoundInput: FC<
     operations,
     _editing,
     editController,
+    activeTab.capture,
   ]);
 
   const items: ComposerMenuItem[] =
@@ -527,6 +538,15 @@ const BoundInput: FC<
 
   return (
     <div className="relative min-w-0" data-slot="agent-composer-input">
+      {activeTab.snapshot && (
+        <div className="px-2 pt-1" data-slot="composer-active-tab">
+          <ActiveTabChip snapshot={activeTab.snapshot} onRemove={activeTab.remove} />
+        </div>
+      )}
+      {activeTab.error && <div role="alert" className="px-2 text-xs text-destructive">
+        无法附加标签页信息
+        <button type="button" className="ml-2 underline" onClick={activeTab.remove}>本条消息不附加</button>
+      </div>}
       {!_editing &&
         operations &&
         (operations.busy ||
@@ -858,6 +878,11 @@ export const AgentUserMessageContent: FC = () => {
         references={references}
         command={annotated?.text === text ? annotated.command : undefined}
       />
+      <MessagePrimitive.Parts>
+        {({ part }) => part.type === "data" && part.name === "active-tab-context"
+          ? <span className="mt-1 block leading-none" data-slot="message-active-tab"><ActiveTabChip snapshot={parseActiveTabContext(part.data)} historical /></span>
+          : null}
+      </MessagePrimitive.Parts>
     </div>
   );
 };

@@ -8,6 +8,7 @@ import {
 import { useExplorerStore } from "@/store/slices/explorer-slice";
 import { createWorkbenchComposerRegistry } from "./workbench-composer-registry";
 import type { CommandRegistry, SourceRegistry } from "./composer-registry";
+import { WorkbenchActiveTabProvider } from "./active-tab-context";
 
 export interface ComposerRegistries {
     sources: SourceRegistry;
@@ -44,7 +45,7 @@ export const WorkbenchComposerProvider: FC<PropsWithChildren> = ({
     );
     return (
         <RegistryContext.Provider value={registry}>
-            {children}
+            <WorkbenchActiveTabProvider>{children}</WorkbenchActiveTabProvider>
         </RegistryContext.Provider>
     );
 };

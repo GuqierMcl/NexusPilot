@@ -69,6 +69,7 @@ export interface AiSdkUIMessageLike {
 }
 
 export type AiSdkUIPartLike =
+  | { type: "data-active-tab-context"; data: import("../../../../shared/active-tab-context").ActiveTabContext }
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "source-url"; sourceId: string; url: string; title?: string }
@@ -123,7 +124,11 @@ export function projectMessageToAiSdkUIMessage(
           message.parts,
           derived.compactionActivities,
         )
-      : message.parts.flatMap(projectPartToAiSdkUIParts),
+      : [
+          ...message.parts.flatMap(projectPartToAiSdkUIParts),
+          ...(message.role === "user" && message.activeTabContext
+            ? [{ type: "data-active-tab-context" as const, data: message.activeTabContext }] : []),
+        ],
     metadata: buildMessageMetadata(message, derived),
   };
 }

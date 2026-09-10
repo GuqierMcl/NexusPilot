@@ -10,6 +10,7 @@ import type {
   UserMessage,
 } from "../core/types";
 import { stableStringifyJson } from "./token-estimator";
+import { projectActiveTabContext } from "../../../../shared/active-tab-context";
 
 export const CONTEXT_SUMMARY_SYSTEM_PROMPT = [
   "Create a provider-neutral conversation checkpoint for a later model request.",
@@ -42,6 +43,7 @@ export function buildContextSummaryRequestMessage(): ModelMessage {
 }
 
 interface CanonicalContextSummaryMessage {
+  activeTabContext?: string;
   messageId: Message["id"];
   role: "user" | "assistant";
   parts: Array<{
@@ -107,7 +109,7 @@ export function projectCanonicalContextSummarySource(
       if (message.parts.length === 0) return [];
       return [{
         role: message.role,
-        content: message.parts.map((part) => part.content).join("\n"),
+        content: [...message.parts.map((part) => part.content), ...(message.activeTabContext ? [message.activeTabContext] : [])].join("\n"),
       } satisfies ModelMessage];
     }),
   );
@@ -145,7 +147,7 @@ export function buildContextSummarySourceMessages(
     if (canonical.parts.length === 0) return [];
     return [{
       role: canonical.role,
-      content: canonical.parts.map((part) => part.content).join("\n"),
+      content: [...canonical.parts.map((part) => part.content), ...(canonical.activeTabContext ? [canonical.activeTabContext] : [])].join("\n"),
     } satisfies ModelMessage];
   });
 }
@@ -200,6 +202,7 @@ function canonicalizeMessage(
   message: UserMessage | AssistantMessage,
 ): CanonicalContextSummaryMessage {
   return {
+    ...(message.role === "user" && message.activeTabContext ? { activeTabContext: sanitizeContextSummaryText(projectActiveTabContext(message.activeTabContext)) } : {}),
     messageId: message.id,
     role: message.role,
     parts: message.parts.flatMap((part) => {

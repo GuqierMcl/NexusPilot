@@ -1,6 +1,7 @@
 import { Elysia } from "elysia";
 import { commandBindingOpenApiSchema } from "../../../shared/composer-commands";
 import { textReferencesOpenApiSchema } from "../../../shared/composer-references";
+import { activeTabContextOpenApiSchema } from "../../../shared/active-tab-context";
 import { detailError } from "../core/errors";
 import {
   ProviderLanguageModelError,
@@ -87,6 +88,9 @@ export function runRoutes(deps: RunRouteDeps) {
       const body = await parseJsonBody(request);
       const parsed = parseRunCreateRequestBody(body);
       if (!parsed) {
+        if (isRecord(body) && "activeTabContext" in body) {
+          return Response.json({ code: "INVALID_RUN_INPUT", message: "消息输入或标签页上下文格式无效，请检查类型、版本和大小。" }, { status: 422 });
+        }
         if (isRecord(body) && isRecord(body.input) && Array.isArray(body.input.parts)
           && body.input.parts.some((part) => isRecord(part) && ("references" in part || "command" in part))) {
           return Response.json({ code: "INVALID_RUN_INPUT", message: "消息输入或引用格式无效，请检查类型、正文范围和数量限制。" }, { status: 422 });
@@ -506,6 +510,7 @@ const runCreateRequestSchema: OpenApiSchema = {
     },
     model: runModelSelectionSchema,
     agent_mode: agentModeSchema,
+    activeTabContext: activeTabContextOpenApiSchema() as OpenApiSchema,
     input: runInputSchema,
     metadata: {
       ...unknownRecordSchema,

@@ -1,6 +1,7 @@
 import type { AppendMessage } from "@assistant-ui/react";
 import type { CreateUIMessage, UIMessage } from "ai";
 import { readComposerReferenceMetadata } from "../../../../../shared/composer-references";
+import { ACTIVE_TAB_PART, parseActiveTabContext } from "../../../../../shared/active-tab-context";
 
 /** Keep annotations on the optimistic user message as well as its HTTP input. */
 export function createComposerMessage<T extends UIMessage = UIMessage>(
@@ -59,6 +60,16 @@ export function createComposerMessage<T extends UIMessage = UIMessage>(
     .map((part) => part.text)
     .join("\n\n");
   const annotated = submitted?.text === text ? submitted : current;
+  // The form captures this before assistant-ui awaits uploads or clears the composer.
+  const custom = message.runConfig?.custom;
+  if (custom && "submittedActiveTabContext" in custom) {
+    for (let index = parts.length - 1; index >= 0; index--) {
+      if (parts[index]?.type === ACTIVE_TAB_PART) parts.splice(index, 1);
+    }
+    if (custom.submittedActiveTabContext != null) {
+      parts.push({ type: ACTIVE_TAB_PART, data: parseActiveTabContext(custom.submittedActiveTabContext) });
+    }
+  }
   return {
     role: message.role,
     parts,

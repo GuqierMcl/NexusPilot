@@ -12,6 +12,8 @@ import {
 import { Thread, VirtualizedThread } from "@/components/assistant-ui/thread";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerRegistryProvider } from "@/features/workbench/agent/composer/composer-context";
+import { WorkbenchActiveTabProvider } from "@/features/workbench/agent/composer/active-tab-context";
+import { useWorkbenchTabsStore } from "@/store/slices/workbench-tabs-slice";
 import {
   ComposerOperationsProvider,
   type ComposerOperationState,
@@ -28,6 +30,7 @@ import { AgentMessageEditProvider } from "@/features/workbench/agent/runtime/age
 import "@/index.css";
 
 const state = window as any;
+state.tabsStore = useWorkbenchTabsStore;
 state.requests = [];
 state.fail = false;
 state.compactions = 0;
@@ -171,6 +174,7 @@ function App() {
         <AgentMessageEditProvider controller={editController}>
           <ComposerOperationsProvider value={operations}>
             <ComposerRegistryProvider value={registry}>
+              <WorkbenchActiveTabProvider>
               <Observe />
               <div className="flex h-screen flex-col bg-background text-foreground">
                 <div className="flex gap-4 p-2">
@@ -197,6 +201,7 @@ function App() {
                   />
                 </div>
               </div>
+              </WorkbenchActiveTabProvider>
             </ComposerRegistryProvider>
           </ComposerOperationsProvider>
         </AgentMessageEditProvider>
