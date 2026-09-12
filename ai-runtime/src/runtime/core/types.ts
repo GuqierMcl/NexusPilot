@@ -223,7 +223,8 @@ export interface BaseMessage {
 }
 
 export interface UserMessage extends BaseMessage {
-  activeTabContext?: import("../../../../shared/active-tab-context").ActiveTabContext;
+  activeTabContext?: import("@contracts/active-tab-context").ActiveTabContext;
+  activeTabContent?: import("@contracts/sql-editor-content-context").SqlEditorContentContext;
   role: "user";
   agentMode: AgentMode;
   model?: ModelSelection;
@@ -303,8 +304,8 @@ export interface BasePart {
 export interface TextPart extends BasePart {
   type: "text";
   text: string;
-  references?: import("../../../../shared/composer-references").TextReferences;
-  command?: import("../../../../shared/composer-commands").CommandBinding;
+  references?: import("@contracts/composer-references").TextReferences;
+  command?: import("@contracts/composer-commands").CommandBinding;
   commandPrompt?: string;
   synthetic?: boolean;
   ignored?: boolean;

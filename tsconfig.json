@@ -23,7 +23,8 @@
     "ignoreDeprecations": "6.0",// 忽略 TypeScript 6.0 中的弃用警告
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@contracts/*": ["contracts/ai-runtime/*"]
     }
   },
   "include": ["src"],

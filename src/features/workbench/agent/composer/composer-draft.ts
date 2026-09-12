@@ -3,7 +3,7 @@ import {
   type ReferencedText,
   type ReferenceTarget,
   type TextReferences,
-} from "../../../../../shared/composer-references";
+} from "@contracts/composer-references";
 
 export interface ComposerDraft extends ReferencedText {
   caret: number;

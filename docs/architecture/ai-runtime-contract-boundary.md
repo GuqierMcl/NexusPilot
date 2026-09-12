@@ -1,6 +1,6 @@
 # AI Runtime contract source boundary
 
-Status: **Proposed**
+Status: **Current**
 
 ## Decision summary
 

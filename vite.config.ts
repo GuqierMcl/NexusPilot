@@ -5,6 +5,35 @@ import tailwindcss from "@tailwindcss/vite"
 import svgr from 'vite-plugin-svgr';
 
 const host = process.env.TAURI_DEV_HOST;
+const frontendWatchRoots = [
+  path.resolve(__dirname, "src"),
+  path.resolve(__dirname, "contracts/ai-runtime"),
+  path.resolve(__dirname, "public"),
+];
+const frontendWatchFiles = [
+  path.resolve(__dirname, "index.html"),
+  path.resolve(__dirname, "vite.config.ts"),
+  path.resolve(__dirname, "tsconfig.json"),
+  path.resolve(__dirname, "tsconfig.node.json"),
+];
+
+function isWithinOrEqual(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function isParentOrEqual(candidate: string, child: string): boolean {
+  const relative = path.relative(candidate, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function shouldIgnoreVitePath(filePath: string): boolean {
+  const normalized = path.resolve(filePath);
+  const watchedFile = frontendWatchFiles.some((file) => normalized === file);
+  const watchedRoot = frontendWatchRoots.some((root) => isWithinOrEqual(normalized, root));
+  const traversalParent = frontendWatchRoots.some((root) => isParentOrEqual(normalized, root));
+  return !(watchedFile || watchedRoot || traversalParent);
+}
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -12,6 +41,7 @@ export default defineConfig(async () => ({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "@contracts": path.resolve(__dirname, "./contracts/ai-runtime"),
     },
   },
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
@@ -36,19 +66,12 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore non-frontend and generated project trees
-      ignored: [
-        "**/src-tauri/**",
-        "**/node_modules/**",
-        "**/dist/**",
-        "**/.cursor/**",
-        "**/.git/**",
-        "**/.github/**",
-        "**/.vscode/**",
-        "**/scripts/**",
-        "**/sites/**",
-        "**/docs/**",
-      ],
+      // 3. watch only frontend inputs and the AI Runtime contract source.
+      // The parent directories of allowed roots remain traversable; every
+      // other repository path is ignored before chokidar descends into it.
+      ignored: shouldIgnoreVitePath,
     },
   },
 }));
+
+export { shouldIgnoreVitePath };

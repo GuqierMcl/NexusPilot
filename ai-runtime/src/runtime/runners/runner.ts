@@ -146,6 +146,7 @@ export class RuntimeRunner {
 
     const userMessage: UserMessage = {
       ...(normalized.activeTabContext ? { activeTabContext: normalized.activeTabContext } : {}),
+      ...(normalized.activeTabContent ? { activeTabContent: normalized.activeTabContent } : {}),
       id: userMessageId,
       conversationId,
       role: "user",

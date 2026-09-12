@@ -1,4 +1,4 @@
-import type { TextReferences } from "../../../shared/composer-references";
+import type { TextReferences } from "@contracts/composer-references";
 
 export const AI_RUNTIME_RUNS_PATH = "/v1/runs";
 
@@ -32,7 +32,7 @@ export interface RunCreateTextInputPart {
     type: "text";
     text: string;
     references?: TextReferences;
-    command?: import("../../../shared/composer-commands").CommandBinding;
+    command?: import("@contracts/composer-commands").CommandBinding;
 }
 
 export interface RunCreateFileInputPart {
@@ -56,7 +56,8 @@ export interface RunCreateRequestMetadata {
 }
 
 export interface RunCreateRequest {
-    activeTabContext?: import("../../../shared/active-tab-context").ActiveTabContext;
+    activeTabContext?: import("@contracts/active-tab-context").ActiveTabContext;
+    activeTabContent?: import("@contracts/sql-editor-content-context").SqlEditorContentContext;
     response_mode: RunResponseMode;
     conversation_id?: string;
     replace_from_message_id?: string;

@@ -4,7 +4,7 @@ import {
   type ReferencedText,
   type TextReferences,
   type ReferenceTarget,
-} from "../../../../../shared/composer-references";
+} from "@contracts/composer-references";
 import type { SourceAvailability } from "./composer-registry";
 
 export const ReferenceText: FC<ReferencedText> = ({

@@ -7,7 +7,7 @@ import { useComposerRecovery } from "../../src/features/workbench/agent/composer
 import {
     combineReferencedTexts,
     referenceKey,
-} from "../../shared/composer-references";
+} from "@contracts/composer-references";
 
 const target = {
     sourceId: "connections",

@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { validateCommandBinding } from "../shared/composer-commands";
+import { validateCommandBinding } from "@contracts/composer-commands";
 import {
   combineReferencedTexts,
-  splitReferencedText,
-  projectReferencedText,
   validateReferenceMessage,
-} from "../shared/composer-references";
+} from "@contracts/composer-references";
+import { splitReferencedText } from "../src/features/workbench/agent/runtime/composer-reference-adapter";
+import { projectReferencedText } from "../ai-runtime/src/runtime/context/reference-projection";
 import {
   editDraft,
   ComposerDraftHistory,

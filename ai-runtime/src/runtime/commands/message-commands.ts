@@ -1,4 +1,4 @@
-import type { CommandBinding } from "../../../../shared/composer-commands";
+import type { CommandBinding } from "@contracts/composer-commands";
 
 export interface MessageCommandDefinition {
   id: string;

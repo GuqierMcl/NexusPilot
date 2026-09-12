@@ -34,7 +34,8 @@ describe("agent composer context display", () => {
     const source = await readSource(displayPath);
 
     expect(source).toContain("useSelectedAiRuntimeModel");
-    expect(source).toContain("modelContextWindow={contextLength}");
+    expect(source).toContain("selectedModelContextLength");
+    expect(source).toContain("modelContextWindow={legacyContextLength}");
     expect(source).toContain("<ContextDisplay.Ring");
   });
 });

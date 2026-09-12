@@ -1,8 +1,9 @@
 import { z } from "zod";
-import { activeTabContextSchema } from "../../../shared/active-tab-context";
-import { commandBindingSchema } from "../../../shared/composer-commands";
+import { activeTabContextSchema } from "@contracts/active-tab-context";
+import { sqlEditorContentContextSchema } from "@contracts/sql-editor-content-context";
+import { commandBindingSchema } from "@contracts/composer-commands";
 import { messageCommands } from "../runtime/commands/message-commands";
-import { textReferencesSchema, validateReferenceMessage } from "../../../shared/composer-references";
+import { textReferencesSchema, validateReferenceMessage } from "@contracts/composer-references";
 import type {
   AttachmentId,
   RuntimePermissionResponseInput,
@@ -59,6 +60,7 @@ const runCreateRequestSchema = z
       .strict(),
     agent_mode: z.enum(["ask", "query", "agent"]).optional(),
     activeTabContext: activeTabContextSchema.optional(),
+    activeTabContent: sqlEditorContentContextSchema.optional(),
     input: z
       .object({
         parts: z.array(runInputPartSchema).min(1),
@@ -131,6 +133,7 @@ export function parseRunCreateRequestBody(body: unknown): ParsedRunCreateRequest
       parts,
       agentMode: result.data.agent_mode,
       activeTabContext: result.data.activeTabContext,
+      activeTabContent: result.data.activeTabContent,
       metadata: result.data.metadata,
     },
   };

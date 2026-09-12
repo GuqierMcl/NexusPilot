@@ -1,7 +1,8 @@
 import { z } from "zod";
-import { activeTabContextSchema } from "../../../../shared/active-tab-context";
-import { commandBindingSchema } from "../../../../shared/composer-commands";
-import { textReferencesSchema, validateReferenceMessage } from "../../../../shared/composer-references";
+import { activeTabContextSchema } from "@contracts/active-tab-context";
+import { sqlEditorContentContextSchema } from "@contracts/sql-editor-content-context";
+import { commandBindingSchema } from "@contracts/composer-commands";
+import { textReferencesSchema, validateReferenceMessage } from "@contracts/composer-references";
 import { DEFAULT_CONTEXT_COMPACTION_POLICY } from "../context/policy";
 
 const unknownRecordSchema = z.record(z.string(), z.unknown());
@@ -511,6 +512,7 @@ export const messageSchema = z.discriminatedUnion("role", [
       conversationId: z.string(),
       role: z.literal("user"),
       activeTabContext: activeTabContextSchema.optional(),
+      activeTabContent: sqlEditorContentContextSchema.optional(),
       agentMode: agentModeSchema,
       model: z.object({ providerId: z.string(), modelId: z.string() }).optional(),
       summary: z.object({ title: z.string().optional(), body: z.string().optional() }).optional(),

@@ -14,6 +14,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerRegistryProvider } from "@/features/workbench/agent/composer/composer-context";
 import { WorkbenchActiveTabProvider } from "@/features/workbench/agent/composer/active-tab-context";
 import { useWorkbenchTabsStore } from "@/store/slices/workbench-tabs-slice";
+import { useTabRuntimeStateStore } from "@/store/slices/tab-runtime-state-slice";
 import {
   ComposerOperationsProvider,
   type ComposerOperationState,
@@ -31,6 +32,7 @@ import "@/index.css";
 
 const state = window as any;
 state.tabsStore = useWorkbenchTabsStore;
+state.tabRuntimeStore = useTabRuntimeStateStore;
 state.requests = [];
 state.fail = false;
 state.compactions = 0;
