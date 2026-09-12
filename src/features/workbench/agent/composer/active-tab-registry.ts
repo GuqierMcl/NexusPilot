@@ -1,15 +1,19 @@
 import type { TabType, WorkbenchTab } from "@/store/slices/workbench-tabs-slice";
 import type { SqlExecutionContext } from "@/types/saved-queries";
-import { parseActiveTabContext, type ActiveTabContext } from "../../../../../shared/active-tab-context";
+import { parseActiveTabContext, type ActiveTabContext } from "@contracts/active-tab-context";
+import { type SqlEditorContentCapture } from "./sql-editor-content-capture";
+import { buildSqlEditorContentCapture } from "./sql-editor-content-capture";
 
 export interface TabMetadataInput {
   connections: readonly { id: string; driver: string }[];
   sqlContexts: Readonly<Record<string, SqlExecutionContext>>;
+  sqlEditors?: Readonly<Record<string, { sqlText: string; editorSelection?: { text: string; start: number; end: number } | null }>>;
 }
 export interface AiTabRegistration {
   type: TabType;
   capabilities: ActiveTabContext["capabilities"];
   describe: (tab: WorkbenchTab, input: TabMetadataInput) => ActiveTabContext["connection"];
+  captureContent?: (tab: WorkbenchTab, input: TabMetadataInput) => SqlEditorContentCapture | undefined;
 }
 
 function connection(tab: WorkbenchTab, input: TabMetadataInput): ActiveTabContext["connection"] {
@@ -49,6 +53,10 @@ export function createAiTabRegistry(definitions: readonly AiTabRegistration[]) {
       for (const char of JSON.stringify(metadata)) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
       return parseActiveTabContext({ ...metadata, revision: `metadata-v1-${(hash >>> 0).toString(16)}` });
     },
+    captureContent(tab: WorkbenchTab | undefined, input: TabMetadataInput): SqlEditorContentCapture | undefined {
+      if (!tab) return undefined;
+      return registry.get(tab.type)?.captureContent?.(tab, input);
+    },
   });
 }
 
@@ -59,6 +67,15 @@ const metadataRegistrations: Omit<AiTabRegistration, "capabilities">[] = [
     const base = connection(tab, input);
     const context = input.sqlContexts[tab.id] ?? (tab.type === "sql_editor" ? tab.payload.initialContext : null);
     return base ? { ...base, database: context?.database ?? null, schema: context?.schema ?? null } : undefined;
+  }, captureContent: (tab, input) => {
+    if (tab.type !== "sql_editor") return undefined;
+    const state = input.sqlEditors?.[tab.id];
+    return buildSqlEditorContentCapture({
+      sqlText: state?.sqlText ?? "",
+      selectedText: state?.editorSelection?.text,
+      selectionStart: state?.editorSelection?.start,
+      selectionEnd: state?.editorSelection?.end,
+    });
   } },
   { type: "table_data", describe: containerContext },
   { type: "table_design", describe: containerContext },

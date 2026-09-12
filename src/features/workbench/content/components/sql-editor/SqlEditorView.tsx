@@ -99,6 +99,7 @@ function createSqlEditorRuntimeFallback(
 ): SqlEditorRuntimeState {
     return {
         sqlText: "",
+        editorSelection: null,
         context,
         savedSnapshot: null,
         result: null,
@@ -1113,6 +1114,15 @@ export function SqlEditorView({
                 position && model ? model.getOffsetAt(position) : 0;
             editorSelectionRef.current = selectedText;
             editorCursorOffsetRef.current = cursorOffset;
+            patchState(tabId, {
+                editorSelection: selection && model
+                    ? {
+                        text: selectedText,
+                        start: model.getOffsetAt(selection.getStartPosition()),
+                        end: model.getOffsetAt(selection.getEndPosition()),
+                    }
+                    : null,
+            });
             setEditorTargetState({ selectedText, cursorOffset });
         };
 

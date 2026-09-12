@@ -6,9 +6,9 @@ import {
     referenceKey,
     validateTextReferences,
     validateReferenceMessage,
-    projectReferencedText,
     type TextReferences,
-} from "../shared/composer-references";
+} from "@contracts/composer-references";
+import { projectReferencedText } from "../ai-runtime/src/runtime/context/reference-projection";
 
 const target = {
     sourceId: "connections",

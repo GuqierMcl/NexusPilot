@@ -1,7 +1,8 @@
 import type { RuntimeId, RuntimeIdPrefix } from "../core/ids";
 import { messageCommands } from "../commands/message-commands";
-import { parseActiveTabContext } from "../../../../shared/active-tab-context";
-import { validateReferenceMessage } from "../../../../shared/composer-references";
+import { parseActiveTabContext } from "@contracts/active-tab-context";
+import { parseSqlEditorContentContext } from "@contracts/sql-editor-content-context";
+import { validateReferenceMessage } from "@contracts/composer-references";
 import type {
   AgentMode,
   AttachmentId,
@@ -77,7 +78,8 @@ export interface RunExecutionPolicySnapshot {
 }
 
 export interface RunRequest {
-  activeTabContext?: import("../../../../shared/active-tab-context").ActiveTabContext;
+  activeTabContext?: import("@contracts/active-tab-context").ActiveTabContext;
+  activeTabContent?: import("@contracts/sql-editor-content-context").SqlEditorContentContext;
   runId?: Run["id"];
   conversationId?: ConversationId;
   userMessageId?: MessageId;
@@ -94,11 +96,12 @@ export interface RunRequest {
 }
 
 export type RunRequestInputPart =
-  | { type: "text"; text: string; command?: import("../../../../shared/composer-commands").CommandBinding; commandPrompt?: string; references?: import("../../../../shared/composer-references").TextReferences }
+  | { type: "text"; text: string; command?: import("@contracts/composer-commands").CommandBinding; commandPrompt?: string; references?: import("@contracts/composer-references").TextReferences }
   | { type: "file"; attachmentId: AttachmentId };
 
 export interface NormalizedRunRequest {
-  activeTabContext?: import("../../../../shared/active-tab-context").ActiveTabContext;
+  activeTabContext?: import("@contracts/active-tab-context").ActiveTabContext;
+  activeTabContent?: import("@contracts/sql-editor-content-context").SqlEditorContentContext;
   runId?: Run["id"];
   conversationId?: ConversationId;
   userMessageId?: MessageId;
@@ -323,6 +326,7 @@ export function normalizeRunRequest(request: RunRequest): NormalizedRunRequest {
     executionPolicy,
     metadata: request.metadata,
     activeTabContext: request.activeTabContext === undefined ? undefined : parseActiveTabContext(request.activeTabContext),
+    activeTabContent: request.activeTabContent === undefined ? undefined : parseSqlEditorContentContext(request.activeTabContent),
   };
 }
 

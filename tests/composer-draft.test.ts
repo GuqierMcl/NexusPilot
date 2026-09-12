@@ -10,7 +10,7 @@ import {
 import {
     referenceKey,
     validateTextReferences,
-} from "../shared/composer-references";
+} from "@contracts/composer-references";
 import {
     createCommandRegistry,
     createSourceRegistry,

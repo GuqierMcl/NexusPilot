@@ -4,11 +4,17 @@ import { flushTapSync } from "@assistant-ui/tap";
 import { useWorkbenchTabsStore } from "@/store/slices/workbench-tabs-slice";
 import { useTabRuntimeStateStore } from "@/store/slices/tab-runtime-state-slice";
 import { useExplorerStore } from "@/store/slices/explorer-slice";
-import { parseActiveTabContext, type ActiveTabContext } from "../../../../../shared/active-tab-context";
+import { parseActiveTabContext, type ActiveTabContext } from "@contracts/active-tab-context";
+import { type SqlEditorContentContext } from "@contracts/sql-editor-content-context";
 import { aiTabRegistry } from "./active-tab-registry";
 
-export interface ActiveTabSource { capture: () => ActiveTabContext | undefined }
-const EMPTY_SOURCE: ActiveTabSource = { capture: () => undefined };
+export interface ActiveTabCapture {
+  metadata?: ActiveTabContext;
+  content?: SqlEditorContentContext;
+  contentWarning?: string;
+}
+export interface ActiveTabSource { capture: () => ActiveTabCapture }
+const EMPTY_SOURCE: ActiveTabSource = { capture: () => ({}) };
 const ActiveTabSourceContext = createContext<ActiveTabSource>(EMPTY_SOURCE);
 export const ActiveTabSourceProvider = ActiveTabSourceContext.Provider;
 
@@ -21,8 +27,20 @@ export function captureWorkbenchTab(tabId: string | null): ActiveTabContext | un
   });
 }
 
-function captureActiveTab(): ActiveTabContext | undefined {
-  return captureWorkbenchTab(useWorkbenchTabsStore.getState().activeTabId);
+function captureActiveTab(): ActiveTabCapture {
+  const { tabs, activeTabId } = useWorkbenchTabsStore.getState();
+  const tab = tabs.find((item) => item.id === activeTabId);
+  const runtimeState = tab && useTabRuntimeStateStore.getState().sqlEditorByTabId[tab.id];
+  const input = {
+    connections: useExplorerStore.getState().connections.map(({ id, driver }) => ({ id, driver })),
+    sqlContexts: tab && runtimeState ? { [tab.id]: runtimeState.context } : {},
+    sqlEditors: tab && runtimeState ? { [tab.id]: { sqlText: runtimeState.sqlText, editorSelection: runtimeState.editorSelection } } : {},
+  };
+  const metadata = aiTabRegistry.capture(tab, input);
+  const content = aiTabRegistry.captureContent(tab, input);
+  if (!content || content.status === "empty") return { metadata };
+  if (content.status === "oversized") return { metadata, contentWarning: `SQL 内容过长（${content.byteLength} 字节），本条消息仅附加标签页信息` };
+  return { metadata, content: content.context };
 }
 
 export const WorkbenchActiveTabProvider: FC<PropsWithChildren> = ({ children }) => {
@@ -30,21 +48,24 @@ export const WorkbenchActiveTabProvider: FC<PropsWithChildren> = ({ children }) 
   const activeTabId = useWorkbenchTabsStore((state) => state.activeTabId);
   const sqlContext = useTabRuntimeStateStore((state) => activeTabId ? state.sqlEditorByTabId[activeTabId]?.context : undefined);
   const connections = useExplorerStore((state) => state.connections);
+  const sqlEditor = useTabRuntimeStateStore((state) => activeTabId ? state.sqlEditorByTabId[activeTabId] : undefined);
   // The function reads fresh stores during submit; metadata changes update the preview.
-  const source = useMemo(() => ({ capture: captureActiveTab }), [tabs, activeTabId, sqlContext, connections]);
+  const source = useMemo(() => ({ capture: captureActiveTab }), [tabs, activeTabId, sqlContext, sqlEditor, connections]);
   return <ActiveTabSourceProvider value={source}>{children}</ActiveTabSourceProvider>;
 };
 
-export type ActiveTabDraft = { mode: "follow" } | { mode: "omit" } | { mode: "snapshot"; snapshot: ActiveTabContext };
-export function resolveActiveTabDraft(draft: ActiveTabDraft, capture: ActiveTabSource["capture"]): ActiveTabContext | undefined {
-  return draft.mode === "omit" ? undefined : draft.mode === "snapshot" ? parseActiveTabContext(draft.snapshot) : capture();
+export type ActiveTabDraft = { mode: "follow" } | { mode: "omit" } | { mode: "snapshot"; snapshot: ActiveTabContext; content?: SqlEditorContentContext };
+export function resolveActiveTabDraft(draft: ActiveTabDraft, capture: ActiveTabSource["capture"]): ActiveTabCapture {
+  if (draft.mode === "omit") return {};
+  if (draft.mode === "snapshot") return { metadata: parseActiveTabContext(draft.snapshot), content: draft.content };
+  return capture();
 }
 
-export function useActiveTabDraft(input: { editing?: boolean; initial?: ActiveTabContext; text: string; attachmentCount: number }) {
+export function useActiveTabDraft(input: { editing?: boolean; initial?: ActiveTabContext; initialContent?: SqlEditorContentContext; text: string; attachmentCount: number }) {
   const aui = useAui();
   const source = useContext(ActiveTabSourceContext);
   const [draft, setDraft] = useState<ActiveTabDraft>(() => {
-    if (input.editing) return input.initial ? { mode: "snapshot", snapshot: input.initial } : { mode: "omit" };
+    if (input.editing) return input.initial ? { mode: "snapshot", snapshot: input.initial, content: input.initialContent } : { mode: "omit" };
     return (aui.composer().getState().runConfig.custom?.activeTabDraft as ActiveTabDraft | undefined) ?? { mode: "follow" };
   });
   const current = useRef(draft);
@@ -63,14 +84,14 @@ export function useActiveTabDraft(input: { editing?: boolean; initial?: ActiveTa
     if (!input.editing && previousContent.current && !hasContent) update({ mode: "follow" });
     previousContent.current = hasContent;
   }, [hasContent, input.editing, update]);
-  let snapshot: ActiveTabContext | undefined;
+  let capture: ActiveTabCapture = {};
   let error: string | undefined;
-  try { snapshot = resolveActiveTabDraft(draft, source.capture); }
+  try { capture = resolveActiveTabDraft(draft, source.capture); }
   catch (cause) { error = cause instanceof Error ? cause.message : "无法获取标签页信息"; }
   return {
-    snapshot, error,
+    snapshot: capture.metadata, content: capture.content, contentWarning: capture.contentWarning, error,
     remove: (): void => update({ mode: "omit" }),
-    restore: (value: ActiveTabContext | undefined): void => update(value ? { mode: "snapshot", snapshot: value } : { mode: "omit" }),
-    capture: (): ActiveTabContext | undefined => resolveActiveTabDraft(current.current, source.capture),
+    restore: (value: ActiveTabCapture): void => update(value.metadata ? { mode: "snapshot", snapshot: value.metadata, content: value.content } : { mode: "omit" }),
+    capture: (): ActiveTabCapture => resolveActiveTabDraft(current.current, source.capture),
   };
 }

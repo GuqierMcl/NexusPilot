@@ -1,4 +1,4 @@
-import { type ReferenceTarget } from "../../../../../shared/composer-references";
+import { type ReferenceTarget } from "@contracts/composer-references";
 
 export interface SourceCandidate {
   id: string;

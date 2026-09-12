@@ -1,5 +1,6 @@
-import { projectReferencedText } from "../../../../shared/composer-references";
-import { projectActiveTabContext } from "../../../../shared/active-tab-context";
+import { projectReferencedText } from "../context/reference-projection";
+import { projectActiveTabContext } from "../context/active-tab-projection";
+import { projectSqlEditorContent } from "../context/sql-editor-content-projection";
 import type {
   AssistantContent,
   ModelMessage,
@@ -100,6 +101,9 @@ export async function projectModelHistory(
       }
       if (message.activeTabContext) {
         content.push({ type: "text", text: projectActiveTabContext(message.activeTabContext) });
+      }
+      if (message.activeTabContent) {
+        content.push({ type: "text", text: projectSqlEditorContent(message.activeTabContent) });
       }
       if (content.length > 0) {
         projected.push({ role: "user", content });

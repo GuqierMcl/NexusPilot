@@ -34,7 +34,7 @@ Status: **Current**
 | [provider-model.md](./provider-model.md) | models.dev catalog, provider configuration, credentials, and model resolution. |
 | [attachment-storage.md](./attachment-storage.md) | Current Runtime-owned chat attachment storage, upload, lifecycle, and multimodal model-input contract. |
 | [composer-references.md](./composer-references.md) | Typed composer references, local commands, extension registries, persistence, projections, and failure recovery. |
-| [active-tab-context.md](./active-tab-context.md) | Selected-tab metadata snapshots, draft controls, native data parts, registration and model context. |
+| [active-tab-context.md](./active-tab-context.md) | Selected-tab metadata and SQL editor content snapshots, draft controls, native data parts, registration and model context. |
 | [Context-compaction specification](../comet/specs/agent-context-compaction/spec.md) | Binding current behavior for branch-aware context planning, checkpoints, Safety State, and overflow recovery. |
 | [live-eventbus-sse.md](./live-eventbus-sse.md) | Live-only EventBus and scoped SSE. |
 | [communication-boundaries.md](./communication-boundaries.md) | Frontend HTTP/SSE, backend bridge, and health responsibilities. |

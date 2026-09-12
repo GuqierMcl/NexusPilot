@@ -20,8 +20,11 @@ const assert = require("node:assert/strict");
         payload: { profileId: "p-1", tabRuntimeId: `runtime-${i}`, runtime: {}, initialContext: { database: "sales", schema: null }, sqlText: "NEVER_SEND_THIS_SQL" },
       }));
       window.tabsStore.setState({ tabs, activeTabId: "tab-0" });
+      window.tabRuntimeStore.setState({ sqlEditorByTabId: {
+        "tab-0": { sqlText: "SELECT * FROM monthly_sales;", editorSelection: null, context: { database: "sales", schema: null } },
+      }});
     });
-    await expect(preview).toHaveText("查询 0本条消息携带标签页信息，未包含页面内容");
+    await expect(preview).toHaveText("查询 0本条消息携带标签页信息和 SQL 内容");
     await expect(preview.getByText("当前标签页：")).toHaveCount(0);
     await input.fill("first");
     await input.press("Enter");
@@ -30,6 +33,8 @@ const assert = require("node:assert/strict");
     const first = await page.evaluate(() => window.requests[0]);
     assert.equal(first.activeTabContext.tabId, "tab-0");
     assert.equal(first.activeTabContext.capabilities.content, false);
+    assert.equal(first.activeTabContent.source, "document");
+    assert.equal(first.activeTabContent.sql, "SELECT * FROM monthly_sales;");
     assert.deepEqual(first.input.parts, [{ type: "text", text: "first" }]);
     assert(!JSON.stringify(first).includes("NEVER_SEND_THIS_SQL"));
     assert(!JSON.stringify(first).includes("查询 99"));
@@ -57,7 +62,8 @@ const assert = require("node:assert/strict");
     await input.fill("");
     await expect(preview).toContainText("查询 2");
     // Native message content is a data part, and text-only copy sees only the text.
-    assert.deepEqual(await page.evaluate(() => window.messages[0].content.map(p => p.type)), ["text", "data"]);
+    assert.deepEqual(await page.evaluate(() => window.messages[0].content.map(p => p.type)), ["text", "data", "data"]);
+    assert.equal(await page.evaluate(() => window.messages[0].content[2].name), "sql-editor-content");
     await page.getByRole("button", { name: "切换渲染" }).click();
     await expect(markers).toHaveCount(1);
     await expect(preview).toContainText("查询 2");

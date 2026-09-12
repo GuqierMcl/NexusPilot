@@ -36,7 +36,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "ai-runtime:dev": "bun --cwd=ai-runtime run dev -- --host 0.0.0.0 --port 8787",
+    "ai-runtime:dev": "bun --env-file=ai-runtime/.env --watch ai-runtime/src/main.ts --host 0.0.0.0 --port 8787",
     "ai-runtime:start": "bun --cwd=ai-runtime run start",
     "ai-runtime:test": "bun --cwd=ai-runtime test",
     "ai-runtime:typecheck": "bun --cwd=ai-runtime run typecheck",

@@ -30,9 +30,9 @@ import {
 import {
   readComposerReferenceMetadata,
   referenceKey,
-  projectReferencedText,
   type TextReferences,
-} from "../../shared/composer-references";
+} from "@contracts/composer-references";
+import { projectReferencedText } from "../src/runtime/context/reference-projection";
 
 const target = {
   sourceId: "connections",

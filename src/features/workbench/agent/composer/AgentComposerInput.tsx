@@ -11,7 +11,8 @@ import {
   type FC,
 } from "react";
 import { cn } from "@/lib/utils";
-import { readActiveTabPart, parseActiveTabContext, type ActiveTabContext } from "../../../../../shared/active-tab-context";
+import { readActiveTabPart, parseActiveTabContext, type ActiveTabContext } from "@contracts/active-tab-context";
+import { readSqlEditorContentPart, type SqlEditorContentContext } from "@contracts/sql-editor-content-context";
 import { useActiveTabDraft } from "./active-tab-context";
 import { ActiveTabChip } from "./ActiveTabChip";
 import {
@@ -19,7 +20,7 @@ import {
   validateTextReferences,
   validateReferenceMessage,
   type ReferencedText,
-} from "../../../../../shared/composer-references";
+} from "@contracts/composer-references";
 import {
   ComposerDraftHistory,
   detectComposerTrigger,
@@ -63,13 +64,14 @@ const EditInput: FC<AgentComposerInputProps> = (props) => {
       {...props}
       initial={readComposerReferenceMetadata(metadata) ?? undefined}
       initialActiveTab={readActiveTabPart(content)}
+      initialActiveTabContent={readSqlEditorContentPart(content)}
     />
   );
 };
 
 const BoundInput: FC<
-  AgentComposerInputProps & { initial?: ReferencedText; initialActiveTab?: ActiveTabContext }
-> = ({ className, onKeyDown, editing: _editing, initial, initialActiveTab, ...props }) => {
+  AgentComposerInputProps & { initial?: ReferencedText; initialActiveTab?: ActiveTabContext; initialActiveTabContent?: SqlEditorContentContext }
+> = ({ className, onKeyDown, editing: _editing, initial, initialActiveTab, initialActiveTabContent, ...props }) => {
   const aui = useAui();
   const threadId = useAuiState((state) => state.threadListItem.id);
   const recovery = useComposerRecovery((state) => state.drafts[threadId]);
@@ -80,7 +82,7 @@ const BoundInput: FC<
   const { sources, commands } = useComposerRegistries();
   const operations = useComposerOperations();
   const text = useAuiState((state) => state.composer.text);
-  const activeTab = useActiveTabDraft({ editing: _editing, initial: initialActiveTab, text, attachmentCount });
+  const activeTab = useActiveTabDraft({ editing: _editing, initial: initialActiveTab, initialContent: initialActiveTabContent, text, attachmentCount });
   const [history] = useState(() => {
     const stored = _editing
       ? initial
@@ -189,6 +191,7 @@ const BoundInput: FC<
         recovery.message.metadata,
       );
       const restoredActiveTab = readActiveTabPart(recovery.message.parts);
+      const restoredActiveTabContent = readSqlEditorContentPart(recovery.message.parts);
       for (const part of recovery.message.parts) {
         if (part.type === "file")
           await aui.composer().addAttachment({
@@ -224,7 +227,7 @@ const BoundInput: FC<
         }),
       );
       useComposerRecovery.getState().clear(threadId);
-      activeTab.restore(restoredActiveTab);
+      activeTab.restore({ metadata: restoredActiveTab, content: restoredActiveTabContent });
     } catch (cause) {
       console.error("[composer] recovery failed", cause);
       setError("恢复草稿失败，请重试");
@@ -385,7 +388,9 @@ const BoundInput: FC<
           current.references?.targets ?? [],
         );
         if (errors.length) throw new Error(errors.join("\n"));
-        const submittedActiveTabContext = activeTab.capture() ?? null;
+        const capturedActiveTab = activeTab.capture();
+        const submittedActiveTabContext = capturedActiveTab.metadata ?? null;
+        const submittedActiveTabContent = capturedActiveTab.content ?? null;
         const recoveredEditMessageId = aui.composer().getState().runConfig
           .custom?.recoveredEditMessageId;
         publish(current);
@@ -401,6 +406,7 @@ const BoundInput: FC<
                 command: current.command,
               },
               submittedActiveTabContext,
+              submittedActiveTabContent,
               recoveredEditMessageId: undefined,
             },
           }),
@@ -540,9 +546,10 @@ const BoundInput: FC<
     <div className="relative min-w-0" data-slot="agent-composer-input">
       {activeTab.snapshot && (
         <div className="px-2 pt-1" data-slot="composer-active-tab">
-          <ActiveTabChip snapshot={activeTab.snapshot} onRemove={activeTab.remove} />
+          <ActiveTabChip snapshot={activeTab.snapshot} onRemove={activeTab.remove} content={Boolean(activeTab.content)} contentWarning={Boolean(activeTab.contentWarning)} />
         </div>
       )}
+      {activeTab.contentWarning && <div role="status" className="px-2 text-xs text-muted-foreground">{activeTab.contentWarning}</div>}
       {activeTab.error && <div role="alert" className="px-2 text-xs text-destructive">
         无法附加标签页信息
         <button type="button" className="ml-2 underline" onClick={activeTab.remove}>本条消息不附加</button>
@@ -869,6 +876,7 @@ export const AgentUserMessageContent: FC = () => {
     .map((part) => part.text)
     .join("\n\n");
   const annotated = readComposerReferenceMetadata(metadata);
+  const hasSqlEditorContent = Boolean(readSqlEditorContentPart(content));
   const references =
     annotated?.text === text ? annotated.references : undefined;
   return (
@@ -880,7 +888,7 @@ export const AgentUserMessageContent: FC = () => {
       />
       <MessagePrimitive.Parts>
         {({ part }) => part.type === "data" && part.name === "active-tab-context"
-          ? <span className="mt-1 block leading-none" data-slot="message-active-tab"><ActiveTabChip snapshot={parseActiveTabContext(part.data)} historical /></span>
+          ? <span className="mt-1 block leading-none" data-slot="message-active-tab"><ActiveTabChip snapshot={parseActiveTabContext(part.data)} historical content={hasSqlEditorContent} /></span>
           : null}
       </MessagePrimitive.Parts>
     </div>

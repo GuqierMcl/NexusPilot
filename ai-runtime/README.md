@@ -37,7 +37,7 @@ AI Runtime 将用户数据与可重建缓存分开：
 - `--data-dir` 或 `NEXUS_PILOT_DATA_DIR` 保存 `providers.json`、`runtime-settings.json` 和 `ai-runtime.sqlite3`。
 - `--cache-dir` 或 `NEXUS_PILOT_CACHE_DIR` 保存 models.dev 的 `catalog.json` 和 `catalog-metadata.json`。
 
-同类配置中命令行参数优先于环境变量。生产 sidecar 由 Tauri 使用应用专属的 `app_data_dir()/ai-runtime` 与 `app_cache_dir()/ai-runtime` 注入这两个目录；开发环境可以复制 `.env.example` 后分别设置。启动日志会分别输出已解析的 `dataDir` 与 `cacheDir`；缓存目录缺失时会记录 catalog 磁盘缓存不可用的警告，不会回退到数据目录，也不会读取或迁移旧数据目录中的 catalog 缓存。
+同类配置中命令行参数优先于环境变量。根目录的 `bun ai-runtime:dev` 会显式加载 `ai-runtime/.env`；其中相对路径以仓库根目录为基准。生产 sidecar 由 Tauri 使用应用专属的 `app_data_dir()/ai-runtime` 与 `app_cache_dir()/ai-runtime` 注入这两个目录；开发环境可以复制 `.env.example` 后分别设置。启动日志会分别输出已解析的 `dataDir` 与 `cacheDir`；缓存目录缺失时会记录 catalog 磁盘缓存不可用的警告，不会回退到数据目录，也不会读取或迁移旧数据目录中的 catalog 缓存。
 
 ## API 文档
 

@@ -279,6 +279,7 @@ export interface SqlExecutionTimelineEntry {
 
 export interface SqlEditorRuntimeState {
     sqlText: string;
+    editorSelection: { text: string; start: number; end: number } | null;
     context: SqlExecutionContext;
     savedSnapshot: SqlEditorSavedSnapshot | null;
     result: QueryResult | null;
@@ -379,6 +380,7 @@ function createSqlEditorRuntimeState(
 ): SqlEditorRuntimeState {
     return {
         sqlText: initial?.sqlText ?? "",
+        editorSelection: initial?.editorSelection ?? null,
         context: normalizeSqlExecutionContext(initial?.context),
         savedSnapshot: initial?.savedSnapshot ?? null,
         result: initial?.result ?? null,

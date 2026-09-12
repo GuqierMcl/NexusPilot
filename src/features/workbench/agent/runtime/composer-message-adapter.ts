@@ -1,7 +1,8 @@
 import type { AppendMessage } from "@assistant-ui/react";
 import type { CreateUIMessage, UIMessage } from "ai";
-import { readComposerReferenceMetadata } from "../../../../../shared/composer-references";
-import { ACTIVE_TAB_PART, parseActiveTabContext } from "../../../../../shared/active-tab-context";
+import { readComposerReferenceMetadata } from "@contracts/composer-references";
+import { ACTIVE_TAB_PART, parseActiveTabContext } from "@contracts/active-tab-context";
+import { SQL_EDITOR_CONTENT_PART, parseSqlEditorContentContext } from "@contracts/sql-editor-content-context";
 
 /** Keep annotations on the optimistic user message as well as its HTTP input. */
 export function createComposerMessage<T extends UIMessage = UIMessage>(
@@ -68,6 +69,14 @@ export function createComposerMessage<T extends UIMessage = UIMessage>(
     }
     if (custom.submittedActiveTabContext != null) {
       parts.push({ type: ACTIVE_TAB_PART, data: parseActiveTabContext(custom.submittedActiveTabContext) });
+    }
+  }
+  if (custom && "submittedActiveTabContent" in custom) {
+    for (let index = parts.length - 1; index >= 0; index--) {
+      if (parts[index]?.type === SQL_EDITOR_CONTENT_PART) parts.splice(index, 1);
+    }
+    if (custom.submittedActiveTabContent != null) {
+      parts.push({ type: SQL_EDITOR_CONTENT_PART, data: parseSqlEditorContentContext(custom.submittedActiveTabContent) });
     }
   }
   return {

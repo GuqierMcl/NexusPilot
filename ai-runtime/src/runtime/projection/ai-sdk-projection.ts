@@ -1,4 +1,4 @@
-import { combineReferencedTexts } from "../../../../shared/composer-references";
+import { combineReferencedTexts } from "@contracts/composer-references";
 import type {
   InterruptReason,
   Message,
@@ -69,7 +69,8 @@ export interface AiSdkUIMessageLike {
 }
 
 export type AiSdkUIPartLike =
-  | { type: "data-active-tab-context"; data: import("../../../../shared/active-tab-context").ActiveTabContext }
+  | { type: "data-active-tab-context"; data: import("@contracts/active-tab-context").ActiveTabContext }
+  | { type: "data-sql-editor-content"; data: import("@contracts/sql-editor-content-context").SqlEditorContentContext }
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "source-url"; sourceId: string; url: string; title?: string }
@@ -128,6 +129,8 @@ export function projectMessageToAiSdkUIMessage(
           ...message.parts.flatMap(projectPartToAiSdkUIParts),
           ...(message.role === "user" && message.activeTabContext
             ? [{ type: "data-active-tab-context" as const, data: message.activeTabContext }] : []),
+          ...(message.role === "user" && message.activeTabContent
+            ? [{ type: "data-sql-editor-content" as const, data: message.activeTabContent }] : []),
         ],
     metadata: buildMessageMetadata(message, derived),
   };

@@ -4,7 +4,7 @@ The workbench composer supports explicit connection references, local `/help`, p
 
 ## Public request and durable facts
 
-`POST /v1/runs` accepts an optional `references` field on each text input part. Existing plain text and file inputs remain valid. The shared schema and limits are defined in `shared/composer-references.ts`.
+`POST /v1/runs` accepts an optional `references` field on each text input part. Existing plain text and file inputs remain valid. The contract schema and limits are defined in `contracts/ai-runtime/composer-references.ts`.
 
 ```json
 {
@@ -65,7 +65,7 @@ Focused verification includes `tests/composer-*.test.ts`, `tests/frontend/compos
 
 ## Persisted message commands
 
-A text input part optionally carries `command: { id, commandId, version, name, start, end }`. Ranges use UTF-16 and must exactly match `/name`; one message may contain at most one command, with no reference intersection. `shared/composer-commands.ts` validates the public shape. `runtime/commands/message-commands.ts` independently resolves supported ID/version/name tuples. Unknown commands/versions and client-supplied `commandPrompt` fields are rejected before creating a Run.
+A text input part optionally carries `command: { id, commandId, version, name, start, end }`. Ranges use UTF-16 and must exactly match `/name`; one message may contain at most one command, with no reference intersection. `contracts/ai-runtime/composer-commands.ts` validates the public shape. `runtime/commands/message-commands.ts` independently resolves supported ID/version/name tuples. Unknown commands/versions and client-supplied `commandPrompt` fields are rejected before creating a Run.
 
 The Runtime snapshots the registered prompt into the durable TextPart's `commandPrompt`. UI projections emit only short text and the public binding; model projection substitutes the server-owned prompt and retains other text and reference descriptions. Token estimation uses that same model projection. Editing a historical message with the same command occurrence preserves its stored prompt snapshot. New semantic behavior must register a new command version; keep old versions supported for editing. Plain text and clipboard contents never become bindings through regex matching alone.
 

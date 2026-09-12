@@ -1,5 +1,5 @@
 import type { DiffArtifact, DiffLine, Message, Part } from "../core/types";
-import { combineReferencedTexts } from "../../../../shared/composer-references";
+import { combineReferencedTexts } from "@contracts/composer-references";
 
 export interface UiMessageLike {
   id: string;
@@ -9,7 +9,8 @@ export interface UiMessageLike {
 }
 
 export type UiPartLike =
-  | { type: "data"; name: "active-tab-context"; data: import("../../../../shared/active-tab-context").ActiveTabContext }
+  | { type: "data"; name: "active-tab-context"; data: import("@contracts/active-tab-context").ActiveTabContext }
+  | { type: "data"; name: "sql-editor-content"; data: import("@contracts/sql-editor-content-context").SqlEditorContentContext }
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "source"; sourceType: "url"; id?: string; url: string; title?: string }
@@ -34,6 +35,8 @@ export function projectMessageToUiMessage(message: Message): UiMessageLike {
       ...message.parts.flatMap(projectPartToUiParts),
       ...(message.role === "user" && message.activeTabContext
         ? [{ type: "data" as const, name: "active-tab-context" as const, data: message.activeTabContext }] : []),
+      ...(message.role === "user" && message.activeTabContent
+        ? [{ type: "data" as const, name: "sql-editor-content" as const, data: message.activeTabContent }] : []),
     ],
     metadata: {
       ...(message.role === "user" && message.parts.some((part) => part.type === "text" && (part.references || part.command))
