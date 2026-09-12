@@ -96,6 +96,7 @@ Release metadata is a public, versioned data boundary shared by the website, doc
 ## Authoritative follow-up documents
 
 - [Architecture index](./README.md)
+- [AI Runtime contract boundary](./ai-runtime-contract-boundary.md)
 - [Contracts](../contracts/README.md)
 - [AI Runtime](../ai-runtime/README.md)
 - [Contributor development guides](../development/README.md)

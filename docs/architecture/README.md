@@ -13,6 +13,7 @@ Files in this directory describe the current implemented system and its maintain
 | [explorer-actions.md](./explorer-actions.md) | Explorer action registry and context-menu composition. |
 | [explorer-tree.md](./explorer-tree.md) | Local and remote tree domains, containers, and lazy loading. |
 | [frontend-data-flow.md](./frontend-data-flow.md) | Frontend stores, query state, IPC access, and invalidation. |
+| [ai-runtime-contract-boundary.md](./ai-runtime-contract-boundary.md) | Single-repository source boundary and development watch scope for frontend/AI Runtime contracts. |
 | [network-boundaries.md](./network-boundaries.md) | Rules for frontend, Rust, AI Runtime, provider, and Cloud requests. |
 | [release-distribution.md](./release-distribution.md) | Release metadata, artifacts, updater, and public consumers. |
 | [sites-and-documentation.md](./sites-and-documentation.md) | Product site, documentation site, and knowledge-source separation. |
