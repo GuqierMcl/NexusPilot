@@ -20,6 +20,7 @@ description: NexusPilot 官方信息入口，包含产品信息、发布下载�
 - 开源范围：[查看开源项目说明](/project/open-source-plan/)
 - 参与贡献：[查看协作方式](/project/contributing/)
 - 安全策略：[SECURITY.md](https://github.com/GuqierMcl/NexusPilot/blob/main/SECURITY.md)
+- 隐私政策：[查看 NexusPilot 隐私政策](https://nexuspilot.dev/privacy/)
 
 ## 反馈与联系
 

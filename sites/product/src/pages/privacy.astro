@@ -1,0 +1,158 @@
+---
+import Footer from "../components/Footer.astro";
+import Header from "../components/Header.astro";
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { site } from "../shared/config/site";
+---
+
+<BaseLayout
+  locale="en"
+  title="NexusPilot Privacy Policy"
+  description="How NexusPilot processes local application data, AI interactions, optional Cloud synchronization, and website requests."
+>
+  <Header />
+  <main class="bg-[#09090b] py-24 text-white">
+    <article lang="en" class="mx-auto max-w-3xl px-6">
+      <header class="border-b border-white/[0.08] pb-10">
+        <p class="mb-3 font-mono text-xs text-zinc-600">PRIVACY</p>
+        <h1 class="text-3xl font-semibold tracking-tight sm:text-4xl">
+          NexusPilot Privacy Policy
+        </h1>
+        <p class="mt-4 text-sm leading-6 text-zinc-400">
+          Last updated: September 28, 2026
+        </p>
+        <p class="mt-6 max-w-2xl text-base leading-8 text-zinc-300">
+          This Privacy Policy explains how the NexusPilot project processes information when you use the NexusPilot desktop application, the product website at <a class="text-cyan-300 underline decoration-cyan-300/40 underline-offset-4 hover:text-cyan-200" href={site.url}>{site.url}</a>, or the optional NexusPilot Cloud features. NexusPilot is an open-source desktop database workbench. We designed it so that local connection and AI Runtime data stays on your device unless you choose to send information to an external provider or enable Cloud synchronization.
+        </p>
+      </header>
+
+      <div class="mt-10 space-y-12 text-sm leading-7 text-zinc-300">
+        <section>
+          <h2 class="text-xl font-semibold text-white">1. Data We Process</h2>
+          <p class="mt-4">
+            The information processed depends on the features you use. NexusPilot does not require an account for local database work, and you can use the local workbench without enabling AI or Cloud features.
+          </p>
+
+          <h3 class="mt-7 text-base font-semibold text-zinc-100">Connection profiles and database content</h3>
+          <p class="mt-3">
+            When you create a connection, the desktop application processes the connection details needed to reach your database or data service, such as a host, port, database or schema name, username, connection options, and credentials. It also processes the queries, objects, rows, keys, and other data that you explicitly browse or operate on. These values are handled by the local desktop application and its database connection runtime. NexusPilot Cloud does not receive connection credentials in plaintext.
+          </p>
+
+          <h3 class="mt-7 text-base font-semibold text-zinc-100">AI Runtime data</h3>
+          <p class="mt-3">
+            The local AI Runtime manages provider and model settings, provider credentials, conversations, prompts, assistant responses, tool calls and results, approval records, usage information, and local attachments. It keeps the information needed to restore local conversation history and to complete operations you start. The Runtime is separate from the frontend and the frontend does not store or call LLM credentials directly.
+          </p>
+
+          <h3 class="mt-7 text-base font-semibold text-zinc-100">Account, device, and synchronization data</h3>
+          <p class="mt-3">
+            If you sign in or enable NexusPilot Cloud, the service may process account identity, subscription and entitlement status, registered-device information, synchronization state, and the metadata required to coordinate encrypted synchronization. Cloud synchronization currently covers saved connections and folders. AI conversations and local attachment files are not included in that synchronization flow.
+          </p>
+
+          <h3 class="mt-7 text-base font-semibold text-zinc-100">Website request data</h3>
+          <p class="mt-3">
+            The product website is a static site and does not ask for database credentials, AI prompts, or connection profiles. Like other websites, its hosting provider and the third-party services used to deliver selected static assets may receive ordinary request information such as an IP address, user agent, requested resource, and request time. Those providers process that information under their own policies.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">2. How We Use Information</h2>
+          <p class="mt-4">We use information for the following purposes:</p>
+          <ul class="mt-4 list-disc space-y-2 pl-5 marker:text-cyan-300">
+            <li>To establish the database connections and perform the operations you request.</li>
+            <li>To provide AI-assisted exploration, query generation, explanation, and controlled tool execution.</li>
+            <li>To save local history, recover interrupted work, show approvals, and provide useful error messages.</li>
+            <li>To authenticate Cloud accounts, authorize devices, synchronize encrypted connection and folder data, and resolve synchronization conflicts.</li>
+            <li>To answer support requests, protect the application and services, diagnose failures, and publish documentation and releases.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">3. External AI Providers</h2>
+          <p class="mt-4">
+            NexusPilot uses a bring-your-own-provider model. You choose a provider and model in the local AI Runtime, and the Runtime sends a request when you submit an AI run. Depending on the request, that information can include your prompt, selected workbench context, database metadata, query results, tool results, conversation history, and attachments. An attachment added to a message is stored locally first and the interface warns that it will be sent to the selected external AI Provider.
+          </p>
+          <p class="mt-4">
+            The selected provider processes that information under its own privacy policy, terms, retention rules, and security practices. NexusPilot does not control or replace those practices. Review the provider's policy before sending confidential, regulated, or production data. You can choose not to configure a provider, use a local or private provider where supported, omit workbench context, or avoid sending sensitive information.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">4. NexusPilot Cloud</h2>
+          <p class="mt-4">
+            Cloud is optional. Signing in or viewing Cloud status does not initialize synchronization. To enable synchronization, you must explicitly start the setup flow, authorize the device, generate and save a Recovery Key, and confirm that synchronization should begin.
+          </p>
+          <p class="mt-4">
+            The desktop application generates and controls the Account Master Key, device keys, Recovery Key, and asset encryption. Cloud receives the encrypted envelopes, nonces, ciphertext, public-key material, and synchronization metadata required by the protocol. Cloud must not receive plaintext connection credentials, the Account Master Key, a Recovery Key, or device private keys.
+          </p>
+          <p class="mt-4">
+            You can pause or revoke synchronization and use the available Cloud controls to delete synchronized data. Confirmed Cloud-data deletion clears local synchronization-only state while preserving local connections and folders unless you separately delete those local items. Cloud account and service records may also be retained where needed for security, service operation, legal obligations, or support.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">5. Sharing and Third-Party Services</h2>
+          <p class="mt-4">
+            We share information only as needed for the feature you choose to use:
+          </p>
+          <ul class="mt-4 list-disc space-y-2 pl-5 marker:text-cyan-300">
+            <li>With the external AI Provider and model you select for an AI run.</li>
+            <li>With NexusPilot Cloud when you sign in and enable its account or synchronization features.</li>
+            <li>With hosting, content-delivery, and static-asset providers that serve the website and its resources.</li>
+            <li>With support personnel or service providers when you contact us and include information in your request.</li>
+            <li>When required to comply with law, protect users or services, investigate abuse, or enforce applicable terms.</li>
+          </ul>
+          <p class="mt-4">
+            We do not sell your database contents, credentials, prompts, conversation history, or attachments. Do not include secrets or production data in support requests unless it is necessary and has been appropriately redacted.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">6. Retention and Deletion</h2>
+          <p class="mt-4">
+            Local connection profiles, AI Runtime history, tool records, and attachments remain on your device for as long as the application needs them to provide the features you use, unless you delete them sooner. You control local storage through the application's available deletion controls and your operating system. An attachment that is still referenced by a conversation may need those references removed before its underlying local content can be deleted.
+          </p>
+          <p class="mt-4">
+            Cloud data is retained while the related account or synchronization feature is active and until you delete it through available controls or request help from support. External AI Providers and website infrastructure providers set their own retention periods for information they receive. Their policies govern those copies.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">7. Security</h2>
+          <p class="mt-4">
+            NexusPilot uses local access boundaries, operating-system credential storage where applicable, authenticated Runtime requests, client-side encryption for Cloud assets, HTTPS Cloud connections, and redacted diagnostics to reduce unnecessary exposure. Logs are designed to omit attachment contents, provider request bodies, access tokens, original file paths, and other sensitive values. No software or network transmission can be guaranteed to be completely secure, so keep the application, operating system, database servers, and selected providers up to date and use appropriate access controls.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">8. Your Choices and Rights</h2>
+          <p class="mt-4">You can:</p>
+          <ul class="mt-4 list-disc space-y-2 pl-5 marker:text-cyan-300">
+            <li>Use the local workbench without signing in or enabling NexusPilot Cloud.</li>
+            <li>Choose whether to configure an AI Provider and which provider receives each request.</li>
+            <li>Remove optional workbench context, prompts, attachments, or other sensitive information before sending an AI run.</li>
+            <li>Pause, revoke, or delete Cloud synchronization using the controls made available in the application.</li>
+            <li>Request help with information associated with a Cloud account by contacting support.</li>
+          </ul>
+          <p class="mt-4">
+            Depending on where you live, applicable law may give you rights to access, correct, delete, restrict, or object to certain processing. Much of the information described in this policy is stored locally on your device, so we may not be able to access or delete it for you. Contact us if you have a request and we will explain what we can do.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">9. Changes to This Policy</h2>
+          <p class="mt-4">
+            We may update this policy when NexusPilot's features, services, or data practices change. We will update the date at the top of this page and publish the revised policy at the same URL. Material changes should be reviewed before you continue using the affected feature.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-xl font-semibold text-white">10. Contact</h2>
+          <p class="mt-4">
+            Questions, privacy requests, or reports about this policy can be sent to <a class="text-cyan-300 underline decoration-cyan-300/40 underline-offset-4 hover:text-cyan-200" href="mailto:support@nexuspilot.dev">support@nexuspilot.dev</a>. You can also use the <a class="text-cyan-300 underline decoration-cyan-300/40 underline-offset-4 hover:text-cyan-200" href="https://docs.nexuspilot.dev/project/contact/">NexusPilot contact page</a> for the public project information and support routes.
+          </p>
+        </section>
+      </div>
+    </article>
+  </main>
+  <Footer />
+</BaseLayout>

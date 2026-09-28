@@ -32,6 +32,7 @@ export const footerLinks: NavLink[] = [
   { label: "支持数据库", href: "/#databases" },
   { label: "开源项目", href: `${site.docsUrl}/project/open-source-plan/` },
   { label: "联系我们", href: `${site.docsUrl}/project/contact/` },
+  { label: "隐私政策", href: site.privacyUrl },
 ];
 
 export const openSource: OpenSourceConfig = {

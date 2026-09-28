@@ -5,11 +5,13 @@ import { repository } from "../shared/config/repository";
 interface Props {
   title?: string;
   description?: string;
+  locale?: string;
 }
 
 const {
   title = site.title,
   description = site.description,
+  locale = site.defaultLocale,
 } = Astro.props;
 const canonicalUrl = new URL(Astro.url.pathname, site.url).toString();
 const structuredData = {
@@ -27,7 +29,7 @@ const structuredData = {
 ---
 
 <!doctype html>
-<html lang="zh-CN" class="scroll-smooth dark">
+<html lang={locale} class="scroll-smooth dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
