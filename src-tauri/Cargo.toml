@@ -53,7 +53,7 @@ redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["sync", "net", "io-util", "time", "rt-multi-thread"] }
 sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-rustls-ring-native-roots", "macros", "postgres", "mysql", "migrate", "sqlite", "bigdecimal", "time"] }
-russh = "0.62.1"
+russh = "0.63.2"
 tauri-plugin-http = "2"
 oracle-rs = "0.1.7"
 deadpool-oracle = "0.1.1"
