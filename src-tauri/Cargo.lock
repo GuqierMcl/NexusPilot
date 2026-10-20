@@ -3179,18 +3179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "internal-russh-num-bigint"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae8e22120c32fb4d19ec55fba35015f57095cd95a2e3b732e44457f5915b2ee8"
-dependencies = [
- "num-integer",
- "num-traits",
- "rand 0.10.2",
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3850,6 +3838,8 @@ checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
 dependencies = [
  "num-integer",
  "num-traits",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -5447,9 +5437,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.62.7"
+version = "0.64.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9decb68e4e44e1079700e54f17c8f23806ec53d7e0db73ab1c71d9dabc666812"
+checksum = "ba61e87b9ec9a39a59a6bbed4c0b8ff7fb07073405b24a767a1f2c8560ac8f58"
 dependencies = [
  "aes 0.9.3",
  "aws-lc-rs",
@@ -5478,13 +5468,12 @@ dependencies = [
  "hex-literal",
  "hmac 0.13.0",
  "inout 0.2.2",
- "internal-russh-num-bigint",
  "keccak",
  "log",
  "md5",
  "ml-kem",
  "module-lattice",
- "num-bigint 0.4.8",
+ "num-bigint 0.5.1",
  "p256 0.14.0",
  "p384 0.14.0",
  "p521",
